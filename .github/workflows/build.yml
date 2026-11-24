@@ -101,20 +101,22 @@ jobs:
     name: linux ${{ matrix.arch }} ${{ matrix.kind }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    container: debian:bullseye   # glibc 2.31: Ubuntu 20.04+, Debian 11+, Steam Deck
+    # glibc 2.28 (AlmaLinux 8): Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck.
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.machine }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux, kind: release }
-          - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux,  kind: release }
-          - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux, kind: test }
-          - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux,  kind: test }
+          - { arch: x64,   runner: ubuntu-24.04,     machine: x86_64,  dir: x86-64-linux, kind: release }
+          - { arch: arm64, runner: ubuntu-24.04-arm, machine: aarch64, dir: arm64-linux,  kind: release }
+          - { arch: x64,   runner: ubuntu-24.04,     machine: x86_64,  dir: x86-64-linux, kind: test }
+          - { arch: arm64, runner: ubuntu-24.04-arm, machine: aarch64, dir: arm64-linux,  kind: test }
     steps:
       - name: Tools
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential cmake git python3 ca-certificates openjdk-17-jdk-headless
+          dnf install -y java-17-openjdk-devel git
+          /opt/python/cp312-cp312/bin/python -m pip install --no-cache-dir cmake==3.31.6
+          echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
         with:
@@ -123,8 +125,8 @@ jobs:
       - name: Build
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture)
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMEBET_BUILD_KIND=${{ matrix.kind }} -DMEBET_JAVA_HOME="$JAVA_HOME"
+          export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMEBET_BUILD_KIND=${{ matrix.kind }} -DMEBET_JAVA_HOME="$JAVA_HOME"                 -DPython3_EXECUTABLE=/opt/python/cp312-cp312/bin/python
           cmake --build build --parallel
 
       - name: Package
@@ -136,7 +138,7 @@ jobs:
       - name: Smoke test — the JVM starts through the guard
         if: matrix.kind == 'test'
         run: |
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture)
+          export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
           mkdir -p tests/out
           "$JAVA_HOME/bin/javac" -d tests/out tests/java/MebetSmoke.java
           dist/${{ matrix.dir }}/MebetGuard -XX:+DisableAttachMechanism -Dmebet.reports=false -cp tests/out MebetSmoke | tee smoke.out
@@ -149,7 +151,7 @@ jobs:
 
   macos:
     name: macos universal ${{ matrix.kind }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     strategy:
       fail-fast: false

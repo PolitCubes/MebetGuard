@@ -9,6 +9,7 @@
 #include "core/timing.hpp"
 #include "core/win_util.hpp"
 #include "json_writer.hpp"
+#include "mebet_trust_data.hpp"
 #include "report/cards.hpp"
 #include "strings.hpp"
 

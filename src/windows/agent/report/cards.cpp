@@ -13,6 +13,7 @@
 #include "core/module_table.hpp"
 #include "core/win_util.hpp"
 #include "json_writer.hpp"
+#include "mebet_trust_data.hpp"
 #include "strings.hpp"
 
 namespace mebet::cards {

@@ -30,7 +30,7 @@ using mebet::config::Reason;
 
 bool russian_ui() {
     const WORD lang = PRIMARYLANGID(GetUserDefaultUILanguage());
-    return lang == LANG_RUSSIAN || lang == LANG_UKRAINIAN || lang == LANG_BELARUSIAN || lang == LANG_KAZAKH;
+    return lang == LANG_RUSSIAN || lang == LANG_UKRAINIAN || lang == LANG_BELARUSIAN || lang == LANG_KAZAK;
 }
 
 [[noreturn]] void fail(Reason r, const std::wstring& detail) {

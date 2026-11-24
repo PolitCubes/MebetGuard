@@ -52,7 +52,7 @@ Core& core() {
 
 bool russian_ui() {
     const WORD lang = PRIMARYLANGID(GetUserDefaultUILanguage());
-    return lang == LANG_RUSSIAN || lang == LANG_UKRAINIAN || lang == LANG_BELARUSIAN || lang == LANG_KAZAKH;
+    return lang == LANG_RUSSIAN || lang == LANG_UKRAINIAN || lang == LANG_BELARUSIAN || lang == LANG_KAZAK;
 }
 
 BOOL CALLBACK hide_window(HWND hwnd, LPARAM) {
