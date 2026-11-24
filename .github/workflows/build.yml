@@ -38,7 +38,7 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release --parallel
 
-      - name: Check the wrapper imports (ТЗ §4: KnownDLLs only)
+      - name: "Check the wrapper imports (ТЗ §4, KnownDLLs only)"
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
