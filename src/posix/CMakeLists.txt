@@ -31,7 +31,7 @@ add_custom_target(mebet_exe_inputs DEPENDS "${MEBET_GEN}/agent_hash.hpp")
 
 add_executable(mebet_exe exe/main.cpp)
 add_dependencies(mebet_exe mebet_exe_inputs)
-set_target_properties(mebet_exe PROPERTIES OUTPUT_NAME MebetGuard)
+set_target_properties(mebet_exe PROPERTIES OUTPUT_NAME MebetGuard POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mebet_exe PRIVATE "${MEBET_GEN}")
 target_compile_options(mebet_exe PRIVATE ${MEBET_POSIX_CFLAGS})
 target_link_libraries(mebet_exe PRIVATE mebet_common ${CMAKE_DL_LIBS})

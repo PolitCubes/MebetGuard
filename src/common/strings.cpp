@@ -74,7 +74,7 @@ std::string to_utf8(std::wstring_view w) {
     out.reserve(w.size());
     for (std::size_t i = 0; i < w.size(); ++i) {
         char32_t cp = static_cast<char32_t>(w[i]);
-        if (sizeof(wchar_t) == 2) {
+        if constexpr (sizeof(wchar_t) == 2) {
             cp &= 0xFFFF;
             if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < w.size()) {
                 const char32_t lo = static_cast<char32_t>(w[i + 1]) & 0xFFFF;
@@ -96,7 +96,7 @@ std::wstring from_utf8(std::string_view s) {
     std::size_t i = 0;
     while (i < s.size()) {
         const char32_t cp = next_utf8(s, i);
-        if (sizeof(wchar_t) == 2 && cp >= 0x10000) {
+        if (sizeof(wchar_t) == 2 && cp >= 0x10000) {  // NOLINT: UTF-16 surrogates on Windows only
             const char32_t v = cp - 0x10000;
             out.push_back(static_cast<wchar_t>(0xD800 + (v >> 10)));
             out.push_back(static_cast<wchar_t>(0xDC00 + (v & 0x3FF)));

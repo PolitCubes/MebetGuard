@@ -238,7 +238,20 @@ void check_dev_mode() {
     w.end_object();
     ev.extra_json = w.take();
     ev.fingerprint = {"close.dev_mode", raw};
-    guard::close_now(config::Reason::dev_mode, std::wstring(), std::move(ev));
+    // The flags go into the launcher log line too: the player and support see which one.
+    std::wstring which;
+    auto add = [&](bool on, const wchar_t* name) {
+        if (!on) return;
+        if (!which.empty()) which += L", ";
+        which += name;
+    };
+    add(test_sign, L"testsigning");
+    add(debug_mode, L"debug mode");
+    add(ci_off, L"code integrity off");
+    add(kd_enabled, L"kernel debugger enabled");
+    add(kd_present, L"kernel debugger attached");
+    which += L" (CodeIntegrityOptions " + win::wide(raw) + L")";
+    guard::close_now(config::Reason::dev_mode, which, std::move(ev));
 }
 
 std::string vm_class() { return g_vm_class; }
