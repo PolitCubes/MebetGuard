@@ -66,7 +66,11 @@ jobs:
           java-version: "25"
           architecture: x64
 
-      - name: Smoke test — the JVM starts through the guard
+      # GitHub's Windows images boot with test signing on. The dev-mode check closes the
+      # client in every build (ТЗ §8, not switchable), so on these runners the smoke test
+      # proves that check; the JVM path runs on Linux/macOS here and on the Windows stand.
+      - name: Smoke test — the JVM starts through the guard (or dev mode is caught)
+        id: smoke
         if: matrix.kind == 'test' && matrix.arch == 'x64'
         shell: pwsh
         env:
@@ -74,13 +78,19 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force tests\out | Out-Null
           & "$env:JAVA_HOME\bin\javac.exe" -d tests\out tests\java\MebetSmoke.java
+          Copy-Item tests\out\MebetSmoke.class dist\
           $p = Start-Process -FilePath dist\${{ matrix.dir }}\MebetGuard.exe -ArgumentList '-XX:+DisableAttachMechanism', '-Dmebet.reports=false', '-Dmebet.errors=false', '-cp', 'tests\out', 'MebetSmoke' -NoNewWindow -PassThru -Wait -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
           Get-Content smoke.out, smoke.err
+          if ($p.ExitCode -eq 203 -and (Select-String -Path smoke.err -Pattern 'testsigning' -Quiet)) {
+            Write-Output '::notice::runner boots with test signing: dev-mode check closed the client (203) as required'
+            "devmode=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
           if (-not (Select-String -Path smoke.out -Pattern 'mebet-smoke-ok' -Quiet)) { throw 'smoke marker missing' }
 
       - name: Smoke test — an unlisted DLL closes the client (210)
-        if: matrix.kind == 'test' && matrix.arch == 'x64'
+        if: matrix.kind == 'test' && matrix.arch == 'x64' && steps.smoke.outputs.devmode != 'true'
         shell: pwsh
         env:
           MEBET_TEST_NO_UI: "1"
@@ -93,6 +103,7 @@ jobs:
           if ($p.ExitCode -ne 210) { throw "expected exit code 210 (untrusted_module), got $($p.ExitCode)" }
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: mebet-windows-${{ matrix.arch }}-${{ matrix.kind }}
           path: dist/
