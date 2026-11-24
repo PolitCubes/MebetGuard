@@ -1,0 +1,66 @@
+{
+  "$comment": "Уровни модулей стража (ТЗ §3, §7). Файл — вход сборки: генератор tools/gen_config.py превращает его в таблицу внутри exe/dll; во время работы с диска не читается. Уровни: on — работает всегда, без вердикта; close — закрыть + отчёт; report — только отчёт; off — выключен (только в тестовой сборке). Релизная сборка не может содержать off; dev_mode не выключается ни в какой сборке.",
+  "modules": [
+    { "id": "env_hardening",           "title": "Закалка окружения",                     "section": "4",  "release": "on",     "test": "on" },
+    { "id": "jvm_launch",              "title": "Порядок запуска JVM",                   "section": "4",  "release": "on",     "test": "on" },
+    { "id": "startup_self_check",      "title": "Самопроверка при старте",               "section": "5",  "release": "close",  "test": "close" },
+    { "id": "proxy_dll",               "title": "Прокси-DLL и лишние файлы",             "section": "4",  "release": "close",  "test": "close" },
+    { "id": "module_trust",            "title": "Доверие модулей (собранный список)",    "section": "6",  "release": "close",  "test": "close" },
+    { "id": "foreign_threads",         "title": "Чужие потоки (шелл-код)",               "section": "5",  "release": "close",  "test": "close" },
+    { "id": "hidden_images",           "title": "Скрытые образы",                        "section": "5",  "release": "close",  "test": "close" },
+    { "id": "foreign_exec_memory",     "title": "Чужой код в памяти",                    "section": "5",  "release": "close",  "test": "close" },
+    { "id": "jvm_agents",              "title": "JVM: внешний attach и чужой агент",     "section": "10", "release": "close",  "test": "close" },
+    { "id": "jvm_classes",             "title": "JVM: классы, DefineClass",              "section": "10", "release": "report", "test": "report" },
+    { "id": "hook_self_check",         "title": "Самопроверка хуков",                    "section": "7",  "release": "close",  "test": "close" },
+    { "id": "virtual_machine",         "title": "Виртуальная машина",                    "section": "8",  "release": "close",  "test": "off" },
+    { "id": "dev_mode",                "title": "Дев-режим Windows",                     "section": "8",  "release": "close",  "test": "close", "locked": true },
+    { "id": "kernel_state",            "title": "Secure Boot, HVCI",                     "section": "8",  "release": "report", "test": "report" },
+    { "id": "driver_names",            "title": "Имена драйверов",                       "section": "7",  "release": "report", "test": "report" },
+    { "id": "wine",                    "title": "Wine/Proton",                           "section": "7",  "release": "report", "test": "report" },
+    { "id": "input_source",            "title": "Источник ввода (отбрасывание + отчёт)", "section": "9",  "release": "on",     "test": "on" },
+    { "id": "debugger",                "title": "Отладчик пользовательского режима",     "section": "7",  "release": "close",  "test": "close" },
+    { "id": "time_check",              "title": "Сверка времени",                        "section": "7",  "release": "report", "test": "report" },
+    { "id": "extension_points",        "title": "Точки расширения ОС (отчёт)",           "section": "7",  "release": "report", "test": "report" },
+    { "id": "extension_point_disable", "title": "Отключение точек расширения",           "section": "7",  "release": "on",     "test": "on" },
+    { "id": "process_dacl",            "title": "DACL процесса",                         "section": "7",  "release": "on",     "test": "on" },
+    { "id": "splash",                  "title": "Заставка при запуске",                  "section": "4",  "release": "on",     "test": "on" },
+    { "id": "window_identity",         "title": "Заголовок и значок окна",               "section": "4",  "release": "on",     "test": "on" },
+    { "id": "linux_wsl",               "title": "Linux-клиент в WSL2",                   "section": "11", "release": "close",  "test": "close" },
+    { "id": "posix_preload",           "title": "LD_PRELOAD / LD_AUDIT и чужие библиотеки (Linux/macOS)", "section": "11", "release": "report", "test": "report" }
+  ],
+  "options": {
+    "$comment": "Под-правила, которые ТЗ откладывает до замера на стенде (§8, §14). Меняются только пересборкой.",
+    "vm_close_hyperv_guest": {
+      "value": false,
+      "why": "ТЗ §8: гостя Hyper-V закрываем только после замера ПК с одной «Целостностью памяти» и при втором признаке (SMBIOS/драйвер гостя). До замера — отчёт."
+    },
+    "devmode_require_ci_on_x86": {
+      "value": false,
+      "why": "ТЗ §8: на 32-битной Windows значение CodeIntegrityOptions 0x01 по умолчанию не снято. Тест-режим, режим отладки и отладка ядра закрывают и там; правило «нет 0x01» включаем после замера."
+    },
+    "sweep_interval_ms": {
+      "value": 5000,
+      "why": "ТЗ §5: обходы памяти и потоков — раз в несколько секунд."
+    },
+    "verify_timeout_ms": {
+      "value": 10000,
+      "why": "ТЗ §5: таймаут проверки подписи — закрыть + отчёт. Медиана ~4 мс, p99 ~25 мс; запас на 86-мегабайтные драйверы видеокарт."
+    },
+    "close_report_wait_ms": {
+      "value": 3000,
+      "why": "ТЗ §12: при закрытии клиент закрывается после отправки отчёта или через 3 с."
+    },
+    "splash_min_ms": {
+      "value": 2000,
+      "why": "ТЗ §4: заставка видна минимум 2 с."
+    },
+    "splash_fade_ms": {
+      "value": 200,
+      "why": "ТЗ §4: плавное появление и исчезновение — около 200 мс."
+    },
+    "nvidia_shim_mccompat": {
+      "value": true,
+      "why": "ТЗ §4: переменная SHIM_MCCOMPAT=0x800000001, как делает Sodium 0.5.x."
+    }
+  }
+}

@@ -1,0 +1,33 @@
+// Resources of the agent DLL (ТЗ §13 metadata: same ProductName and ProductVersion as the exe).
+#pragma code_page(65001)
+#include <winresrc.h>
+#include "mebet_version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MEBET_VERSION_MAJOR, MEBET_VERSION_MINOR, MEBET_VERSION_PATCH, 0
+ PRODUCTVERSION MEBET_VERSION_MAJOR, MEBET_VERSION_MINOR, MEBET_VERSION_PATCH, 0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "PolitCubes"
+            VALUE "FileDescription", "Mebet Anticheat agent"
+            VALUE "FileVersion", MEBET_VERSION_STR
+            VALUE "InternalName", "MebetGuard"
+            VALUE "LegalCopyright", "Copyright (c) 2026 PolitCubes. MIT License."
+            VALUE "OriginalFilename", "MebetGuard.dll"
+            VALUE "ProductName", "Mebet Anticheat"
+            VALUE "ProductVersion", MEBET_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

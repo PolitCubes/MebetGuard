@@ -1,0 +1,45 @@
+// Resources of the wrapper (ТЗ §4 «PE, манифест, ресурсы», §13 metadata).
+#pragma code_page(65001)
+#include <winresrc.h>
+#include "mebet_version.h"
+
+// First icon: Explorer, taskbar and SDL3 (Modern) take it as the window class icon.
+1 ICON "icon.ico"
+// GLFW (Classic) loads this name from the executable for every window it creates.
+GLFW_ICON ICON "icon.ico"
+
+// Splash bitmaps rendered from assets/logo.svg at build time (premultiplied BGRA).
+MEBET_SPLASH_100 RCDATA "splash_100.bin"
+MEBET_SPLASH_150 RCDATA "splash_150.bin"
+MEBET_SPLASH_200 RCDATA "splash_200.bin"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MEBET_VERSION_MAJOR, MEBET_VERSION_MINOR, MEBET_VERSION_PATCH, 0
+ PRODUCTVERSION MEBET_VERSION_MAJOR, MEBET_VERSION_MINOR, MEBET_VERSION_PATCH, 0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "PolitCubes"
+            // Name in Task Manager and in the firewall prompt: one for every server (ТЗ §4).
+            VALUE "FileDescription", "PolitCubes"
+            VALUE "FileVersion", MEBET_VERSION_STR
+            VALUE "InternalName", "MebetGuard"
+            VALUE "LegalCopyright", "Copyright (c) 2026 PolitCubes. MIT License."
+            VALUE "OriginalFilename", "MebetGuard.exe"
+            // SignPath metadata rule: ProductName is the project name (ТЗ §13).
+            VALUE "ProductName", "Mebet Anticheat"
+            VALUE "ProductVersion", MEBET_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

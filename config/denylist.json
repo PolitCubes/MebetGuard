@@ -1,0 +1,9 @@
+{
+  "$comment": "Денилист (ТЗ §6 «Модель записи, список, денилист»): единственная авто-реакция в сторону запрета. Проверяется первым, до собранного списка и подписи. Виды: leaf_sha256 — отпечаток SHA-256 листового сертификата (украденная подпись); issuer_serial — выпускающий CA + серийник листа (утёкшие сертификаты, для которых известен только серийник); publisher_file — издатель (CN + O) + имя файла (точечный отзыв); file_sha256 — хэш файла.",
+  "entries": [
+    { "id": "nvidia-lapsus-2022-a", "kind": "issuer_serial", "issuer_cn": "VeriSign Class 3 Code Signing 2010 CA", "serial": "43BB437D609866286DD839E1D00309F5",
+      "reason": "Сертификат NVIDIA, украденный LAPSUS$ в 2022 г.; им подписаны Quasar RAT, Cobalt Strike, Mimikatz (vendors.md, BleepingComputer)." },
+    { "id": "nvidia-lapsus-2022-b", "kind": "issuer_serial", "issuer_cn": "VeriSign Class 3 Code Signing 2010 CA", "serial": "14781BC862E8DC503A559346F5DCC518",
+      "reason": "Второй сертификат NVIDIA из той же утечки 2022 г." }
+  ]
+}

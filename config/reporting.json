@@ -1,0 +1,14 @@
+{
+  "$comment": "Два канала GlitchTip (ТЗ §12). DSN публичен по природе: он лежит в клиенте. Пустой DSN = канал в этой сборке ничего не отправляет. Проекты: «Mebet — ошибки» (errors_dsn) и «Mebet — отчёты» (reports_dsn); заводит владелец инстанса GlitchTip, срок хранения 90 дней, хранение IP выключить.",
+  "errors_dsn": "",
+  "reports_dsn": "",
+  "limits": {
+    "events_per_session": 100,
+    "inventory_per_session": 50,
+    "event_bytes": 65536,
+    "string_chars": 512,
+    "list_items": 50,
+    "memory_bytes": 256,
+    "input_report_interval_s": 1800
+  }
+}
