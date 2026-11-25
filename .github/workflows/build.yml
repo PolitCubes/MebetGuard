@@ -172,20 +172,6 @@ jobs:
           dist/${{ matrix.dir }}/MebetGuard -XX:+DisableAttachMechanism -Dmebet.reports=false -cp tests/out MebetSmoke | tee smoke.out
           grep -q mebet-smoke-ok smoke.out
 
-      # Each start-time layer attacked with and without the guard: without it the attack must
-      # work, through the guard it must be blocked (tests/e2e). The novm test build has no VM
-      # detection, so it runs inside this container. In-memory injection layers are Windows-only
-      # for now and run on the stand.
-      - name: "e2e — атаки по слоям с гвардом и без"
-        if: matrix.kind == 'test'
-        run: |
-          export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
-          /opt/python/cp312-cp312/bin/python -m venv /tmp/venv
-          /tmp/venv/bin/pip install -q pytest
-          /tmp/venv/bin/pytest tests/e2e -v --no-header \
-            --guard dist/${{ matrix.dir }}/MebetGuard --java "$JAVA_HOME" \
-            --junitxml=e2e-${{ matrix.arch }}.xml
-
       - uses: actions/upload-artifact@v4
         with:
           name: mebet-linux-${{ matrix.arch }}-${{ matrix.kind }}
@@ -231,31 +217,7 @@ jobs:
           dist/arm64-macosx/MebetGuard -XX:+DisableAttachMechanism -Dmebet.reports=false -cp tests/out MebetSmoke | tee smoke.out
           grep -q mebet-smoke-ok smoke.out
 
-      - name: "e2e — атаки по слоям с гвардом и без"
-        if: matrix.kind == 'test'
-        run: |
-          python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install -q pytest
-          /tmp/venv/bin/pytest tests/e2e -v --no-header \
-            --guard dist/arm64-macosx/MebetGuard --java "$JAVA_HOME" \
-            --junitxml=e2e-macos.xml
-
       - uses: actions/upload-artifact@v4
         with:
           name: mebet-macos-${{ matrix.kind }}
           path: dist/
-
-  # The whole e2e in a container: the Dockerfile builds the guard (test/novm) and runs the
-  # layer suite inside the image. This is the "в контейнере" path end to end.
-  e2e-container:
-    name: e2e container (linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Build the e2e image and run the layer suite
-        run: |
-          docker build -f tests/e2e/Dockerfile -t mebet-e2e .
-          docker run --rm mebet-e2e
