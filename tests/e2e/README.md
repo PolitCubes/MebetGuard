@@ -41,31 +41,30 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
 
 ## В GitHub Actions
 
-Один workflow `.github/workflows/ci.yml`. Компиляции — **три джоба** (`windows`, `linux`,
-`macos`); внутри каждого по шагу на собираемый экземпляр, видно что собирается:
+Один workflow `.github/workflows/ci.yml`, четыре стадии:
 
 ```
-windows → build x64 release · build x64 test · build x86 release · build x86 test · build arm64 …
-linux   → build x64 release · build x64 test
-macos   → build universal release · build universal test
+1. сборка   Matrix: build-windows-binaries   windows x64 prod · x64 dev · x86 prod · x86 dev · arm64 prod · arm64 dev
+            Matrix: build-linux-binaries     linux x64 prod · x64 dev · arm64 prod · arm64 dev
+            Matrix: build-macos-binaries     macos x64 prod · x64 dev · arm64 prod · arm64 dev
+2. e2e      (только если ВСЕ джобы сборки зелёные)
+            Matrix: e2e-windows   env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent ·
+                                  jvm_agents_agentpath · module_trust_load · dev_mode
+            Matrix: e2e-linux     env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent · jvm_agents_agentpath
+            Matrix: e2e-macos     то же, что linux
+3. ci-ok    зелёный, только если зелёные все сборки и все e2e (его требует правило ветки master)
+4. sign     только на тегах v* (на pull request всегда skipped)
 ```
 
-Дальше **на каждый тип атаки/защиты свой джоб** (имя = сценарий), гоняет свою атаку с гвардом и
-без:
+Каждая сборка — отдельный джоб матрицы со своей галочкой и своим артефактом
+`bin-<os>-<arch>-<variant>`; в саммари прогона у каждой раскрывающийся блок: чем и как собрано,
+файлы, размеры, sha256. **prod** = `release` (все модули включены), **dev** = `devtest`
+(выключены модули `virtual_machine`, `linux_wsl` и `dev_mode` — гвард стартует на ВМ и на
+dev-режимном раннере).
 
-```
-env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent · jvm_agents_agentpath   (Linux)
-dev_mode           — обычный тест-билд ДОЛЖЕН закрыться 203 на dev-режимном раннере GitHub
-module_trust_load  — на devtest-сборке (модуль dev_mode выключен)                      (Windows)
-```
-
-На Windows-раннерах GitHub включён test-signing, поэтому обычный тест-билд закрывается `dev_mode`
-кодом **203** (это проверяет джоб `dev_mode`). Чтобы гонять остальные Windows-слои там же, есть
-отдельная сборка **`devtest`** — это `test`, но с выключенным модулем `dev_mode` (через
-`config/modules.json` / `MEBET_BUILD_KIND=devtest`). Она неподписанная и игрокам не раздаётся;
-`release` и обычный `test` оставляют `dev_mode` залоченным на «закрыть».
-
-`ci-ok` — итоговый джоб, зелёный только если все прошли (его и требует правило ветки master).
+e2e на Windows идёт на **dev**-сборке, кроме фичи `dev_mode`: она берёт **prod**-сборку и проверяет,
+что та закрывается кодом **203** — раннеры GitHub грузятся с test-signing. Java для Windows-e2e —
+Liberica (BellSoft): гвард доверяет издателю Java игры, DLL другой Java закрыл бы как недоверенные.
 
 Что тесты не фейковые: подставь вместо гварда обычную `java` — все такие тесты падают (атака
 проходит, защиты нет). Проверено.

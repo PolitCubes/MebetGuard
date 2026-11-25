@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 PolitCubes
 #
-# Build under each OS (one visible step per arch × variant), then run the e2e features of THAT
-# OS — one job (check) per feature — then sign (tags only). Two build variants per arch:
-#   prod = release (every module on), dev = devtest (VM, WSL and dev-mode modules off, so it
-#   runs on a VM / dev-mode CI runner). Both unsigned here; only a tag build gets signed.
+# 1. Build — one matrix per OS (build-windows-binaries / build-linux-binaries /
+#    build-macos-binaries). Every arch x variant is its own job and uploads its own artifact
+#    bin-<os>-<arch>-<variant>. prod = release (every module on); dev = devtest (VM, WSL and
+#    dev-mode modules off, so it runs on a VM / dev-mode CI runner). Both unsigned here.
+# 2. e2e — starts only when ALL build jobs passed; one matrix per OS, one job per feature,
+#    each runs the attack with the guard and without it.
+# 3. ci-ok — green only if every build and every e2e job is green (the master rule needs it).
+# 4. sign — release tags only (skipped on pull requests).
 name: CI
 
 on:
@@ -18,151 +22,141 @@ permissions:
   contents: read
 
 jobs:
-  # ================================ build: windows =================================
-  windows:
-    name: windows
+  # =================================== 1. build ===================================
+  build-windows-binaries:
+    name: windows ${{ matrix.arch }} ${{ matrix.variant }}
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   platform: x64,   dir: x86-64-mustdie, variant: prod, kind: release }
+          - { arch: x64,   platform: x64,   dir: x86-64-mustdie, variant: dev,  kind: devtest }
+          - { arch: x86,   platform: Win32, dir: x86-mustdie,    variant: prod, kind: release }
+          - { arch: x86,   platform: Win32, dir: x86-mustdie,    variant: dev,  kind: devtest }
+          - { arch: arm64, platform: ARM64, dir: arm64-mustdie,  variant: prod, kind: release }
+          - { arch: arm64, platform: ARM64, dir: arm64-mustdie,  variant: dev,  kind: devtest }
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - { name: x64 prod,   shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform x64   -Kind release -Dir x86-64-mustdie }
-      - { name: x64 dev,    shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform x64   -Kind devtest -Dir x86-64-mustdie }
-      - { name: x86 prod,   shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform Win32 -Kind release -Dir x86-mustdie }
-      - { name: x86 dev,    shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform Win32 -Kind devtest -Dir x86-mustdie }
-      - { name: arm64 prod, shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform ARM64 -Kind release -Dir arm64-mustdie }
-      - { name: arm64 dev,  shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform ARM64 -Kind devtest -Dir arm64-mustdie }
+      - name: build
+        shell: pwsh
+        run: ./tools/ci/build-win.ps1 -Platform ${{ matrix.platform }} -Kind ${{ matrix.kind }} -Dir ${{ matrix.dir }}
       - name: wrapper imports only kernel32
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe "$vs\VC\Tools\MSVC" | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          $deps = & $dumpbin.FullName /dependents build\x86-64-mustdie-release\src\windows\Release\MebetGuard.exe | Out-String
+          $deps = & $dumpbin.FullName /dependents build\${{ matrix.dir }}-${{ matrix.kind }}\src\windows\Release\MebetGuard.exe | Out-String
           $static = ($deps -split 'Image has the following delay load dependencies:')[0]
           $names = [regex]::Matches($static, '(?im)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLower() }
           $bad = $names | Where-Object { $_ -notin @('kernel32.dll', 'ntdll.dll') }
           if ($bad) { throw "wrapper imports more than kernel32: $($bad -join ', ')" }
-      - name: e2e fixture (unsigned native, marker only)
-        shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          New-Item -ItemType Directory -Force dist\fixtures | Out-Null
-          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fe:dist\fixtures\mebet_fake_cheat.dll"
-          Remove-Item dist\fixtures\*.obj, dist\fixtures\*.lib, dist\fixtures\*.exp -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@v4
-        with: { name: windows-dist, path: dist/ }
+        with:
+          name: bin-windows-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/${{ matrix.kind }}/
 
-  # ================================= build: linux ==================================
-  linux:
-    name: linux
+  build-linux-binaries:
+    name: linux ${{ matrix.arch }} ${{ matrix.variant }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   dir: x86-64-linux, variant: prod, kind: release }
+          - { arch: x64,   dir: x86-64-linux, variant: dev,  kind: devtest }
+          - { arch: arm64, dir: arm64-linux,  variant: prod, kind: release }
+          - { arch: arm64, dir: arm64-linux,  variant: dev,  kind: devtest }
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "25" }
+        with:
+          distribution: temurin
+          java-version: "25"
       - name: aarch64 cross toolchain
+        if: matrix.arch == 'arm64'
         run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu
-      - { name: x64 prod,   run: bash tools/ci/build-posix.sh release x86-64-linux }
-      - { name: x64 dev,    run: bash tools/ci/build-posix.sh devtest x86-64-linux }
-      - { name: arm64 prod, run: bash tools/ci/build-posix.sh release arm64-linux -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ }
-      - { name: arm64 dev,  run: bash tools/ci/build-posix.sh devtest arm64-linux -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ }
+      - name: build
+        run: |
+          CROSS=""
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            CROSS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"
+          fi
+          bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} $CROSS
       - uses: actions/upload-artifact@v4
-        with: { name: linux-dist, path: dist/ }
+        with:
+          name: bin-linux-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/${{ matrix.kind }}/
 
-  # ================================= build: macos ==================================
-  macos:
-    name: macos
+  build-macos-binaries:
+    name: macos ${{ matrix.arch }} ${{ matrix.variant }}
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   dir: x86-64-macosx, osx: x86_64, variant: prod, kind: release }
+          - { arch: x64,   dir: x86-64-macosx, osx: x86_64, variant: dev,  kind: devtest }
+          - { arch: arm64, dir: arm64-macosx,  osx: arm64,  variant: prod, kind: release }
+          - { arch: arm64, dir: arm64-macosx,  osx: arm64,  variant: dev,  kind: devtest }
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "25" }
-      - { name: x64 prod,   run: bash tools/ci/build-posix.sh release x86-64-macosx -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
-      - { name: x64 dev,    run: bash tools/ci/build-posix.sh devtest x86-64-macosx -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
-      - { name: arm64 prod, run: bash tools/ci/build-posix.sh release arm64-macosx -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
-      - { name: arm64 dev,  run: bash tools/ci/build-posix.sh devtest arm64-macosx -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: build
+        run: bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx }} -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
       - uses: actions/upload-artifact@v4
-        with: { name: macos-dist, path: dist/ }
+        with:
+          name: bin-macos-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/${{ matrix.kind }}/
 
-  # ============================= e2e: one check per feature ========================
-  e2e-linux:
-    needs: linux
-    name: ${{ matrix.feature }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "25" }
-      - uses: actions/download-artifact@v4
-        with: { name: linux-dist, path: dist }
-      - name: prepare
-        run: |
-          chmod +x dist/devtest/x86-64-linux/MebetGuard
-          sudo apt-get update && sudo apt-get install -y python3-pytest
-      - name: "attack ${{ matrix.feature }} with the guard and without it"
-        run: |
-          python3 -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
-            --guard "$PWD/dist/devtest/x86-64-linux/MebetGuard" --java "$JAVA_HOME"
-
-  e2e-macos:
-    needs: macos
-    name: ${{ matrix.feature }}
-    runs-on: macos-15
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "25" }
-      - uses: actions/download-artifact@v4
-        with: { name: macos-dist, path: dist }
-      - name: prepare
-        run: |
-          chmod +x dist/devtest/arm64-macosx/MebetGuard
-          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
-      - name: "attack ${{ matrix.feature }} with the guard and without it"
-        run: |
-          /tmp/venv/bin/pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
-            --guard "$PWD/dist/devtest/arm64-macosx/MebetGuard" --java "$JAVA_HOME"
-
+  # ==================== 2. e2e — only after every build job passed ===================
   e2e-windows:
-    needs: windows
-    name: ${{ matrix.feature }}
+    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries]
+    name: windows ${{ matrix.feature }}
     runs-on: windows-2022
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { feature: env_hardening_jto,    kind: devtest }
-          - { feature: env_hardening_jdk,    kind: devtest }
-          - { feature: jvm_agents_javaagent, kind: devtest }
-          - { feature: jvm_agents_agentpath, kind: devtest }
-          - { feature: module_trust_load,    kind: devtest }
-          - { feature: dev_mode,             kind: release }   # prod build must close (203) here
+          - { feature: env_hardening_jto,    variant: dev }
+          - { feature: env_hardening_jdk,    variant: dev }
+          - { feature: jvm_agents_javaagent, variant: dev }
+          - { feature: jvm_agents_agentpath, variant: dev }
+          - { feature: module_trust_load,    variant: dev }
+          - { feature: dev_mode,             variant: prod }   # the prod build must close here (203)
     steps:
       - uses: actions/checkout@v4
-      # Liberica (BellSoft): the Windows guard trusts the game Java's publisher, so the JVM's
-      # own DLLs are not seen as untrusted modules (Temurin would close the client with 210).
+      # Liberica (BellSoft): the guard trusts the game Java's publisher, so the JVM's own DLLs
+      # pass the load gate (Temurin's would be closed as untrusted modules, 210).
       - uses: actions/setup-java@v4
-        with: { distribution: liberica, java-version: "25", architecture: x64 }
+        with:
+          distribution: liberica
+          java-version: "25"
+          architecture: x64
       - uses: actions/download-artifact@v4
-        with: { name: windows-dist, path: dist }
+        with:
+          name: bin-windows-x64-${{ matrix.variant }}
+          path: guard
+      - name: e2e fixture (unsigned native, marker only)
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          New-Item -ItemType Directory -Force fixtures | Out-Null
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
+          if (-not (Test-Path fixtures\mebet_fake_cheat.dll)) { throw "fixture not built" }
       - name: install pytest
         shell: pwsh
         run: python -m pip install -q pytest
@@ -170,25 +164,83 @@ jobs:
         shell: pwsh
         run: |
           python -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' `
-            --guard "$pwd\dist\${{ matrix.kind }}\x86-64-mustdie\MebetGuard.exe" --java "$env:JAVA_HOME" `
-            --untrusted-native "$pwd\dist\fixtures\mebet_fake_cheat.dll"
+            --guard "$pwd\guard\x86-64-mustdie\MebetGuard.exe" --java "$env:JAVA_HOME" `
+            --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll"
 
-  # ================================ sign (tags only) ===============================
+  e2e-linux:
+    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries]
+    name: linux ${{ matrix.feature }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-x64-dev
+          path: guard
+      - name: prepare
+        run: |
+          chmod +x guard/x86-64-linux/MebetGuard
+          sudo apt-get update && sudo apt-get install -y python3-pytest
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        run: |
+          python3 -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
+            --guard "$PWD/guard/x86-64-linux/MebetGuard" --java "$JAVA_HOME"
+
+  e2e-macos:
+    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries]
+    name: macos ${{ matrix.feature }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-macos-arm64-dev
+          path: guard
+      - name: prepare
+        run: |
+          chmod +x guard/arm64-macosx/MebetGuard
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        run: |
+          /tmp/venv/bin/pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
+            --guard "$PWD/guard/arm64-macosx/MebetGuard" --java "$JAVA_HOME"
+
+  # ================= 3. ci-ok — green only if builds and e2e are all green ================
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries, e2e-windows, e2e-linux, e2e-macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: every build and e2e job must be green
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: exit 1
+      - name: all green
+        run: echo "all builds and all e2e features passed"
+
+  # ============================ 4. sign — release tags only ============================
   sign:
     name: sign
-    needs: [e2e-windows, e2e-linux, e2e-macos]
+    needs: ci-ok
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - run: echo "SignPath signing of MebetGuard.exe / .dll goes here (release tags only)."
-
-  # ================================= branch gate ===================================
-  ci-ok:
-    name: ci-ok
-    if: always()
-    needs: [windows, linux, macos, e2e-windows, e2e-linux, e2e-macos]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: fail if any required job did not pass
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-        run: exit 1
