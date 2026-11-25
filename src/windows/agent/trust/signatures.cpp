@@ -160,6 +160,52 @@ PCCERT_CONTEXT chain_root(PCCERT_CHAIN_CONTEXT chain) {
     return simple->rgpElement[simple->cElement - 1]->pCertContext;
 }
 
+// The pinned roots as certificate contexts, to recognise a root by identity — subject and public
+// key — in whichever certificate the chain engine picked: the self-signed one, or the same key
+// cross-signed by an older root. NVIDIA's chain ends "… → DigiCert Trusted Root G4 (cross-signed)
+// → DigiCert Assured ID Root CA": matched on the end's SHA-256 alone, it counted as Assured ID,
+// which NVIDIA's roots do not list, and every NVIDIA DLL was refused (210). Built in warm_up()
+// before the hooks exist, read-only after it: no function-local static on the hook path.
+constexpr std::size_t kRootCount = sizeof(config::kRoots) / sizeof(config::kRoots[0]);
+PCCERT_CONTEXT g_root_certs[kRootCount] = {};
+
+void build_root_certs() {
+    for (std::size_t i = 0; i < kRootCount; ++i) {
+        if (!g_root_certs[i])
+            g_root_certs[i] = CertCreateCertificateContext(X509_ASN_ENCODING, config::kRoots[i].der,
+                                                           static_cast<DWORD>(config::kRoots[i].der_len));
+        // Run once here, so nothing it needs is loaded later inside a hook (ТЗ §5).
+        if (PCCERT_CONTEXT c = g_root_certs[i])
+            CertComparePublicKeyInfo(X509_ASN_ENCODING, &c->pCertInfo->SubjectPublicKeyInfo,
+                                     &c->pCertInfo->SubjectPublicKeyInfo);
+    }
+}
+
+// Bit i set when the end certificate's chain holds kRoots[i]'s subject and public key: the
+// certificate below that element was verified with the pinned root's key, so the chain is
+// anchored on it, whichever certificate carries the key. Walked from the leaf up, no further than
+// an element whose own signature did not verify (nothing above it vouches for it). rgpChain[0]
+// only: the other simple chains belong to CTL signers, not to the file's signer.
+std::uint32_t pinned_mask_of(PCCERT_CHAIN_CONTEXT chain) {
+    std::uint32_t mask = 0;
+    if (!chain || chain->cChain == 0 || !chain->rgpChain[0]) return mask;
+    const CERT_SIMPLE_CHAIN* simple = chain->rgpChain[0];
+    for (DWORD e = 0; e < simple->cElement; ++e) {
+        const CERT_CHAIN_ELEMENT* el = simple->rgpElement[e];
+        if (!el || !el->pCertContext) break;
+        CERT_INFO* info = el->pCertContext->pCertInfo;
+        for (std::size_t i = 0; i < kRootCount; ++i) {
+            PCCERT_CONTEXT pin = g_root_certs[i];
+            if (pin && CertCompareCertificateName(X509_ASN_ENCODING, &info->Subject, &pin->pCertInfo->Subject) &&
+                CertComparePublicKeyInfo(X509_ASN_ENCODING, &info->SubjectPublicKeyInfo,
+                                         &pin->pCertInfo->SubjectPublicKeyInfo))
+                mask |= 1u << i;
+        }
+        if (el->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_SIGNATURE_VALID) break;
+    }
+    return mask;
+}
+
 // Chain engine whose only anchors are the roots pinned in config/roots.json. Used when
 // the system store does not know a root (Windows 7 without root updates, ТЗ §6).
 HCERTCHAINENGINE pinned_engine() {
@@ -183,22 +229,28 @@ HCERTCHAINENGINE pinned_engine() {
 
 // Builds the chain of the leaf against the pinned roots only. Time validity is not
 // required: an expired leaf with a valid timestamp is fine (ТЗ §6), WinVerifyTrust has
-// already judged the time against the timestamp.
-int pinned_root_by_own_chain(PCCERT_CONTEXT leaf, HCERTSTORE extra) {
+// already judged the time against the timestamp. Returns the pinned roots that chain is
+// anchored on (0 when it does not hold) and its end in *root.
+std::uint32_t pinned_by_own_chain(PCCERT_CONTEXT leaf, HCERTSTORE extra, int* root) {
+    *root = -1;
     HCERTCHAINENGINE engine = pinned_engine();
-    if (!engine) return -1;
+    if (!engine) return 0;
     CERT_CHAIN_PARA para{};
     para.cbSize = sizeof(para);
     PCCERT_CHAIN_CONTEXT chain = nullptr;
     if (!CertGetCertificateChain(engine, leaf, nullptr, extra, &para, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, nullptr,
                                  &chain))
-        return -1;
+        return 0;
     const DWORD ignore = CERT_TRUST_IS_NOT_TIME_VALID | CERT_TRUST_IS_NOT_TIME_NESTED | CERT_TRUST_REVOCATION_STATUS_UNKNOWN |
                          CERT_TRUST_IS_OFFLINE_REVOCATION | CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
-    int idx = -1;
-    if ((chain->TrustStatus.dwErrorStatus & ~ignore) == 0) idx = pinned_index(chain_root(chain));
+    std::uint32_t mask = 0;
+    if ((chain->TrustStatus.dwErrorStatus & ~ignore) == 0) {
+        *root = pinned_index(chain_root(chain));
+        mask = pinned_mask_of(chain);
+        if (*root >= 0) mask |= 1u << *root;
+    }
     CertFreeCertificateChain(chain);
-    return idx;
+    return mask;
 }
 
 void fill_signer(CRYPT_PROVIDER_DATA* prov, Signer& s) {
@@ -231,13 +283,15 @@ void fill_signer(CRYPT_PROVIDER_DATA* prov, Signer& s) {
         s.ms_app = !s.ms_os && microsoft_root(sgnr->pChainContext, kMicrosoftRootCheckApplicationRoot);
         s.pinned_root = pinned_index(root);
     }
-    if (!s.ms_os && !s.ms_app && s.pinned_root < 0) {
-        // The system chain did not reach a known root: try the pinned roots with the
+    s.pinned_mask = pinned_mask_of(sgnr->pChainContext);
+    if (s.pinned_root >= 0) s.pinned_mask |= 1u << s.pinned_root;
+    if (!s.ms_os && !s.ms_app && s.pinned_mask == 0) {
+        // The system chain holds no pinned root: try the pinned roots with the
         // certificates that came with the signature.
         HCERTSTORE collection = CertOpenStore(CERT_STORE_PROV_COLLECTION, 0, 0, 0, nullptr);
         if (collection) {
             for (DWORD i = 0; i < prov->chStores; ++i) CertAddStoreToCollection(collection, prov->pahStores[i], 0, 0);
-            s.pinned_root = pinned_root_by_own_chain(leaf, collection);
+            s.pinned_mask |= pinned_by_own_chain(leaf, collection, &s.pinned_root);
             if (s.pinned_root >= 0 && s.root_cn.empty()) s.root_cn = config::kRoots[s.pinned_root].name;
             CertCloseStore(collection, 0);
         }
@@ -398,6 +452,7 @@ Signatures read_catalog(HANDLE file, const std::wstring& path) {
 
 void warm_up(const std::wstring& sample_embedded, const std::wstring& sample_catalog) {
     cat_api();
+    build_root_certs();
     pinned_engine();
     if (!sample_catalog.empty()) {
         HANDLE f = CreateFileW(sample_catalog.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,

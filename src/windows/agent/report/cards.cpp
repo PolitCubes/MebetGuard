@@ -179,9 +179,10 @@ bool dir_writable(const std::wstring& dir) {
 const char* root_class_name(const trust::Signer& s) {
     if (s.ms_os) return "ms_os";
     if (s.ms_app) return "ms_app";
-    if (s.pinned_root >= 0) {
-        return config::kRoots[s.pinned_root].cls == config::RootClass::ms_ivr ? "ms_ivr" : "public";
-    }
+    int root = s.pinned_root;  // the chain's own end; else the first pinned root inside it
+    for (int i = 0; root < 0 && i < 32; ++i)
+        if (s.pinned_mask & (1u << i)) root = i;
+    if (root >= 0) return config::kRoots[root].cls == config::RootClass::ms_ivr ? "ms_ivr" : "public";
     return "unknown";
 }
 
@@ -197,6 +198,11 @@ void write_signer(JsonWriter& w, const trust::Signer& s) {
     w.field("root", s.root_cn);
     w.field("root_class", root_class_name(s));
     if (s.pinned_root >= 0) w.field("root_id", config::kRoots[s.pinned_root].id);
+    // Every pinned root whose key anchors the chain: what the publisher rule matched on.
+    w.key("pinned_roots").begin_array();
+    for (std::size_t i = 0; i < sizeof(config::kRoots) / sizeof(config::kRoots[0]); ++i)
+        if (s.pinned_mask & (1u << i)) w.value(config::kRoots[i].id);
+    w.end_array();
     w.key("eku").begin_array();
     for (const auto& e : s.ekus) w.value(e);
     w.end_array();

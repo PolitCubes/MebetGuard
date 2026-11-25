@@ -27,7 +27,10 @@ struct Signer {
     Sha256Digest root_sha256{};
     bool ms_os = false;   // CERT_CHAIN_POLICY_MICROSOFT_ROOT, flags 0
     bool ms_app = false;  // … with CHECK_APPLICATION_ROOT (Microsoft Root 2011)
-    int pinned_root = -1; // index into config::kRoots
+    int pinned_root = -1; // index into config::kRoots of the chain's own end (for the report card)
+    // Bit i: the chain is anchored on kRoots[i] — a certificate in it carries that root's subject
+    // and key, self-signed or cross-signed. The publisher rule matches on this, not on pinned_root.
+    std::uint32_t pinned_mask = 0;
     std::vector<std::string> ekus;
     std::int64_t not_before = 0, not_after = 0;  // unix seconds
     std::int64_t timestamp = 0;                  // from the countersignature, 0 if none

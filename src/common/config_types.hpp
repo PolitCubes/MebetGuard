@@ -35,7 +35,8 @@ struct ReasonDef {
 };
 
 // Root classes (ТЗ §6 «Корни, закреплённые в клиенте»). ms_os / ms_app are decided by
-// CERT_CHAIN_POLICY_MICROSOFT_ROOT, the others by the pinned SHA-256 of the root.
+// CERT_CHAIN_POLICY_MICROSOFT_ROOT, the others by the pinned root's identity (subject and public
+// key) anywhere in the validated chain, self-signed or cross-signed.
 enum class RootClass : unsigned char {
     ms_os,      // Microsoft Root 2010 and older product roots
     ms_app,     // Microsoft Root 2011 (application root)

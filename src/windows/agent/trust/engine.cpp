@@ -129,15 +129,15 @@ std::string product_version(const std::wstring& path) {
     return v;
 }
 
-// Trusted publisher: CN + O variant + pinned root class (ТЗ §6). Never by serial/thumbprint.
+// Trusted publisher: CN + O variant + one of its pinned roots anchoring the chain, by the root's
+// identity anywhere in it (ТЗ §6). Never by serial/thumbprint.
 int publisher_of(const Signer& s, const std::wstring& path, bool* new_cert) {
     *new_cert = false;
-    if (s.pinned_root < 0) return -1;
-    const std::uint32_t bit = 1u << s.pinned_root;
+    if (s.pinned_mask == 0) return -1;
     const std::string cn = normalize_name(s.cn), o = normalize_name(s.o), issuer = normalize_name(s.issuer_cn);
     for (const auto& d : config::kSigners) {
         const auto& p = config::kPublishers[d.publisher];
-        if ((p.root_mask & bit) == 0 || cn != d.cn || o != d.o) continue;
+        if ((p.root_mask & s.pinned_mask) == 0 || cn != d.cn || o != d.o) continue;
         if (d.issuer_cn && issuer != d.issuer_cn) continue;
         if (p.min_product_version && compare_versions(product_version(path), p.min_product_version) < 0) continue;
         bool seen = false;
