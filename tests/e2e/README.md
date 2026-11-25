@@ -47,11 +47,12 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
 1. сборка   Matrix: build-windows-binaries   windows x64 prod · x64 dev · x86 prod · x86 dev · arm64 prod · arm64 dev
             Matrix: build-linux-binaries     linux x64 prod · x64 dev · arm64 prod · arm64 dev
             Matrix: build-macos-binaries     macos x64 prod · x64 dev · arm64 prod · arm64 dev
-2. e2e      (каждая — после сборки своей ОС)
-            Matrix: e2e-windows   env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent ·
-                                  jvm_agents_agentpath · module_trust_load · dev_mode
-            Matrix: e2e-linux     env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent · jvm_agents_agentpath
-            Matrix: e2e-macos     то же, что linux
+2. e2e      (каждая — после сборки своей ОС; джоб на архитектуру × фичу)
+            Matrix: e2e-windows   x64 · x86 · arm64  ×  env_hardening_jto · env_hardening_jdk ·
+                                  jvm_agents_javaagent · jvm_agents_agentpath · module_trust_load · dev_mode
+            Matrix: e2e-linux     x64 · arm64  ×  env_hardening_jto · env_hardening_jdk ·
+                                  jvm_agents_javaagent · jvm_agents_agentpath
+            Matrix: e2e-macos     x64 · arm64  ×  то же, что linux
 3. ci-ok    зависит только от трёх e2e; красный, если любая упала, отменена или пропущена
             (пропущена = упала её сборка) — его требует правило ветки master
 4. sign     только на тегах v* (на pull request всегда skipped)
@@ -62,6 +63,13 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
 файлы, размеры, sha256. **prod** = `release` (все модули включены), **dev** = `devtest`
 (выключены модули `virtual_machine`, `linux_wsl` и `dev_mode` — гвард стартует на ВМ и на
 dev-режимном раннере).
+
+Каждая архитектура — на своём железе: Windows x64 и x86 на `windows-2022` (x86 — 32-битный
+процесс под WOW64, чистой 32-битной Windows у GitHub нет), Windows arm64 на `windows-11-arm`,
+Linux arm64 на `ubuntu-24.04-arm`, Mac Intel на `macos-15-intel`, Mac Apple Silicon на `macos-15`.
+Для x86 — 32-битная Java 21 от BellSoft: 32-битной Java 25 под Windows не выпускает ни один
+вендор. В CI тесты идут с `--no-skip`: сценарий, который здесь не может выполниться (например,
+нет компилятора для натива), валит джоб, а не пропускается молча.
 
 e2e на Windows идёт на **dev**-сборке, кроме фичи `dev_mode`: она берёт **prod**-сборку и проверяет,
 что та закрывается кодом **203** — раннеры GitHub грузятся с test-signing. Java для Windows-e2e —

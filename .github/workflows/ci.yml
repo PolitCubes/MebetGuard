@@ -5,8 +5,8 @@
 #    build-macos-binaries). Every arch x variant is its own job and uploads its own artifact
 #    bin-<os>-<arch>-<variant>. prod = release (every module on); dev = devtest (VM, WSL and
 #    dev-mode modules off, so it runs on a VM / dev-mode CI runner). Both unsigned here.
-# 2. e2e — one matrix per OS, after that OS's build matrix passed; one job per feature, each
-#    runs the attack with the guard and without it.
+# 2. e2e — one matrix per OS, after that OS's build matrix passed; one job per arch x feature,
+#    each on that arch's own hardware, runs the attack with the guard and without it.
 # 3. ci-ok — needs only the three e2e matrices and fails if any of them failed, was cancelled
 #    or skipped (an e2e is skipped when its build failed), so a failed build fails it too.
 # 4. sign — release tags only (skipped on pull requests).
@@ -122,41 +122,48 @@ jobs:
           name: bin-macos-${{ matrix.arch }}-${{ matrix.variant }}
           path: dist/${{ matrix.kind }}/
 
-  # ====================== 2. e2e — after the build of the same OS ======================
+  # ========= 2. e2e — every arch of every OS, after the build of the same OS ==========
+  # One job per arch x feature, each arch on its own hardware: Windows x64 and x86 (a 32-bit
+  # process under WOW64; GitHub has no 32-bit Windows) on windows-2022, arm64 on windows-11-arm /
+  # ubuntu-24.04-arm / macos-15, Intel Mac on macos-15-intel. x86 runs 32-bit Java 21: no vendor
+  # ships a 32-bit Windows Java 25. --no-skip: a scenario that cannot run fails the job.
   e2e-windows:
     needs: build-windows-binaries
-    name: windows ${{ matrix.feature }}
-    runs-on: windows-2022
+    name: windows ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, x86, arm64]
+        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath, module_trust_load, dev_mode]
         include:
-          - { feature: env_hardening_jto,    variant: dev }
-          - { feature: env_hardening_jdk,    variant: dev }
-          - { feature: jvm_agents_javaagent, variant: dev }
-          - { feature: jvm_agents_agentpath, variant: dev }
-          - { feature: module_trust_load,    variant: dev }
-          - { feature: dev_mode,             variant: prod }   # the prod build must close here (203)
+          - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     vc: x64,     dir: x86-64-mustdie }
+          - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     vc: x64_x86, dir: x86-mustdie }
+          - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
+          - { feature: dev_mode, variant: prod }   # the prod build must close on a dev-mode runner (203)
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       # Liberica (BellSoft): the guard trusts the game Java's publisher, so the JVM's own DLLs
       # pass the load gate (Temurin's would be closed as untrusted modules, 210).
       - uses: actions/setup-java@v4
         with:
           distribution: liberica
-          java-version: "25"
-          architecture: x64
+          java-version: ${{ matrix.java }}
+          architecture: ${{ matrix.java_arch }}
       - uses: actions/download-artifact@v4
         with:
-          name: bin-windows-x64-${{ matrix.variant }}
+          name: bin-windows-${{ matrix.arch }}-${{ matrix.variant || 'dev' }}
           path: guard
       - name: e2e fixture (unsigned native, marker only)
         shell: pwsh
         run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           New-Item -ItemType Directory -Force fixtures | Out-Null
-          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vc }} && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
           if (-not (Test-Path fixtures\mebet_fake_cheat.dll)) { throw "fixture not built" }
       - name: install pytest
         shell: pwsh
@@ -164,19 +171,23 @@ jobs:
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         shell: pwsh
         run: |
-          python -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' `
-            --guard "$pwd\guard\x86-64-mustdie\MebetGuard.exe" --java "$env:JAVA_HOME" `
+          python -m pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' `
+            --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
             --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll"
 
   e2e-linux:
     needs: build-linux-binaries
-    name: linux ${{ matrix.feature }}
-    runs-on: ubuntu-24.04
+    name: linux ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, arm64]
         feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+        include:
+          - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
+          - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -185,26 +196,30 @@ jobs:
           java-version: "25"
       - uses: actions/download-artifact@v4
         with:
-          name: bin-linux-x64-dev
+          name: bin-linux-${{ matrix.arch }}-dev
           path: guard
       - name: prepare
         run: |
-          chmod +x guard/x86-64-linux/MebetGuard
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
           sudo apt-get update && sudo apt-get install -y python3-pytest
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          python3 -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
-            --guard "$PWD/guard/x86-64-linux/MebetGuard" --java "$JAVA_HOME"
+          python3 -m pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' \
+            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME"
 
   e2e-macos:
     needs: build-macos-binaries
-    name: macos ${{ matrix.feature }}
-    runs-on: macos-15
+    name: macos ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, arm64]
         feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+        include:
+          - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
+          - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -213,16 +228,16 @@ jobs:
           java-version: "25"
       - uses: actions/download-artifact@v4
         with:
-          name: bin-macos-arm64-dev
+          name: bin-macos-${{ matrix.arch }}-dev
           path: guard
       - name: prepare
         run: |
-          chmod +x guard/arm64-macosx/MebetGuard
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
           python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          /tmp/venv/bin/pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
-            --guard "$PWD/guard/arm64-macosx/MebetGuard" --java "$JAVA_HOME"
+          /tmp/venv/bin/pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' \
+            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME"
 
   # ======== 3. ci-ok — red if any e2e failed / was cancelled / skipped (= build failed) ======
   ci-ok:

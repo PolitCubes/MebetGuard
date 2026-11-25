@@ -11,6 +11,8 @@ def pytest_addoption(parser):
     g.addoption("--java", default=None, help="JAVA_HOME of the game Java")
     g.addoption("--work", default=None, help="work directory for built fixtures")
     g.addoption("--untrusted-native", default=None, help="prebuilt unsigned native (no compiler)")
+    g.addoption("--no-skip", action="store_true",
+                help="fail instead of skipping a scenario that cannot run here (CI)")
 
 
 @pytest.fixture(scope="session")
@@ -25,5 +27,6 @@ def ctx(request):
         pytest.fail("нет стража: %s" % c.guard)
     if not c.java.exists():
         pytest.fail("нет java: %s" % c.java)
+    c.no_skip = request.config.getoption("--no-skip")
     harness.build_fixtures(c)
     return c

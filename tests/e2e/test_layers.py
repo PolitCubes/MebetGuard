@@ -20,6 +20,9 @@ import harness
 def test_layer(ctx, sc):
     skip = harness.applies(sc, ctx)
     if skip:
+        # In CI every selected scenario must really run: a skip there would show green.
+        if ctx.no_skip:
+            pytest.fail("[%s] не может выполниться здесь: %s" % (sc["id"], skip))
         pytest.skip(skip)
 
     # 1. Without the guard the attack must work.
