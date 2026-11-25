@@ -11,10 +11,28 @@
 Слой засчитан, только если **и** без гварда атака воспроизвелась, **и** через гвард она больше
 не проходит. Это и есть пруф «было уязвимо → стало закрыто» через наш исполняемый файл.
 
+Один тест на каждый сценарий (pytest — видно каждый сценарий отдельно):
+
 ```
-python tests/e2e/run.py --guard <MebetGuard.exe> --java <JAVA_HOME> [--only id,id]
+pytest tests/e2e -v --guard <MebetGuard> --java <JAVA_HOME> [--untrusted-native <lib>]
+```
+
+```
+tests/e2e/test_layers.py::test_layer[env_hardening_jto]     PASSED
+tests/e2e/test_layers.py::test_layer[jvm_agents_javaagent]  PASSED
+tests/e2e/test_layers.py::test_layer[module_trust_load]     PASSED
+```
+
+Быстрая таблица без зависимостей (та же логика, одна строка на сценарий):
+
+```
+python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
                         [--untrusted-native <lib>] [--work <dir>] [--json <out>]
 ```
+
+Сценарии описаны в `harness.py` (`SCENARIOS`); добавить слой = добавить одну запись, тест на
+него появляется сам. Оракул разделён на «без гварда сработало» и «через гвард заблокировано»,
+поэтому упавший тест прямо говорит, какая половина сломалась.
 
 ## В контейнере
 

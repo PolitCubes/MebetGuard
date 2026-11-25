@@ -15,7 +15,7 @@
 FROM eclipse-temurin:25-jdk
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential cmake python3 git \
+ && apt-get install -y --no-install-recommends build-essential cmake python3 python3-pytest git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /mebet
@@ -27,7 +27,8 @@ RUN git config --global --add safe.directory /mebet \
  && cmake --build build --parallel \
  && test -x build/src/posix/MebetGuard
 
-ENTRYPOINT ["python3", "tests/e2e/run.py", \
+# One pytest test per layer scenario (pass extra args to docker run, e.g. -k jvm_agents).
+ENTRYPOINT ["python3", "-m", "pytest", "tests/e2e", "-v", "--no-header", \
             "--guard", "/mebet/build/src/posix/MebetGuard", \
             "--java", "/opt/java/openjdk", \
             "--work", "/tmp/e2e"]

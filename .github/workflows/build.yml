@@ -180,9 +180,11 @@ jobs:
         if: matrix.kind == 'test'
         run: |
           export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
-          /opt/python/cp312-cp312/bin/python tests/e2e/run.py \
+          /opt/python/cp312-cp312/bin/python -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q pytest
+          /tmp/venv/bin/pytest tests/e2e -v --no-header \
             --guard dist/${{ matrix.dir }}/MebetGuard --java "$JAVA_HOME" \
-            --json e2e-${{ matrix.arch }}.json
+            --junitxml=e2e-${{ matrix.arch }}.xml
 
       - uses: actions/upload-artifact@v4
         with:
@@ -232,9 +234,11 @@ jobs:
       - name: "e2e — атаки по слоям с гвардом и без"
         if: matrix.kind == 'test'
         run: |
-          python3 tests/e2e/run.py \
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q pytest
+          /tmp/venv/bin/pytest tests/e2e -v --no-header \
             --guard dist/arm64-macosx/MebetGuard --java "$JAVA_HOME" \
-            --json e2e-macos.json
+            --junitxml=e2e-macos.xml
 
       - uses: actions/upload-artifact@v4
         with:
