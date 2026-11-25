@@ -10,6 +10,7 @@
 
 #include "config.hpp"
 #include "core/win_util.hpp"
+#include "hooks/load_gate.hpp"
 #include "mebet_trust_data.hpp"
 #include "strings.hpp"
 
@@ -111,6 +112,7 @@ bool in_display_driver_dir(const std::wstring& path) {
 }
 
 std::string product_version(const std::wstring& path) {
+    gate::OwnReadScope own;
     DWORD dummy = 0;
     const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);
     if (!size) return std::string();

@@ -81,6 +81,10 @@ std::wstring system_dir() {
     return n && n < MAX_PATH ? std::wstring(buf, n) : std::wstring(L"C:\\Windows\\System32");
 }
 
+std::wstring image_system_dir() {
+    return is_wow64() ? windows_dir() + L"\\SysWOW64" : system_dir();
+}
+
 std::wstring windows_dir() {
     wchar_t buf[MAX_PATH];
     const UINT n = GetSystemWindowsDirectoryW(buf, MAX_PATH);

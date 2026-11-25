@@ -5,8 +5,10 @@
 #include <detours.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstring>
 #include <map>
+#include <thread>
 #include <vector>
 
 #include "config.hpp"
@@ -294,25 +296,67 @@ bool allowed_code(std::uintptr_t address) {
     return false;
 }
 
+namespace {
+
+// KnownDLLs: section objects the system builds at boot from System32 (\KnownDlls) or
+// SysWOW64 (\KnownDlls32). A module with such a name that sits in that folder came from
+// there; only an administrator can change the list or the files.
+std::vector<std::wstring> known_dll_names() {
+    std::vector<std::wstring> out{L"ntdll.dll"};
+    const wchar_t* key = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\KnownDLLs";
+    for (const auto& value : win::reg_value_names(HKEY_LOCAL_MACHINE, key)) {
+        const std::wstring name = lower_ascii(win::reg_string(HKEY_LOCAL_MACHINE, key, value.c_str()));
+        if (iends_with(name, L".dll")) out.push_back(name);
+    }
+    return out;
+}
+
+void check_loaded_module(HMODULE m, const std::vector<std::wstring>& known) {
+    const auto base = reinterpret_cast<std::uintptr_t>(m);
+    if (modules::find(base)) return;  // mapped through the hook already
+    MODULEINFO mi{};
+    if (!GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof(mi))) return;
+    const std::wstring path = win::mapped_file_name(m);  // from the kernel, not the PEB
+    const std::wstring name = lower_ascii(win::file_name_of(path));
+    if (win::same_path(win::dir_of(path), win::image_system_dir())) {
+        for (const auto& k : known) {
+            if (name == k) {
+                modules::add(base, mi.SizeOfImage, trust::Trust::known_dll, path);
+                return;
+            }
+        }
+    }
+    const trust::Decision d = gate::decide_loaded_module(base, mi.SizeOfImage, win::module_path(m));
+    if (d.verdict.allowed) {
+        modules::add(base, mi.SizeOfImage, d.verdict.trust, d.facts.path);
+    } else if (config::enabled(config::Module::startup_self_check)) {
+        modules::add(base, mi.SizeOfImage, trust::Trust::unknown, d.facts.path);
+        gate::deny_module(d, config::Reason::early_module, "startup");
+    }
+}
+
+}  // namespace
+
 void startup_check() {
-    // 1. Every module in the loader list, by the same rule as new loads (ТЗ §5).
+    // 1. Every module in the loader list, by the same rule as new loads (ТЗ §5). The
+    //    signature checks are independent, so they run on a few threads (ТЗ §2: speed).
     HMODULE mods[1024];
     DWORD needed = 0;
     if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) {
         const DWORD n = needed / sizeof(HMODULE) < 1024 ? needed / sizeof(HMODULE) : 1024;
-        for (DWORD i = 0; i < n && !guard::closing(); ++i) {
-            const auto base = reinterpret_cast<std::uintptr_t>(mods[i]);
-            if (modules::find(base)) continue;  // mapped through the hook already
-            MODULEINFO mi{};
-            if (!GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi))) continue;
-            const trust::Decision d = gate::decide_loaded_module(base, mi.SizeOfImage, win::module_path(mods[i]));
-            if (d.verdict.allowed) {
-                modules::add(base, mi.SizeOfImage, d.verdict.trust, d.facts.path);
-            } else if (config::enabled(config::Module::startup_self_check)) {
-                modules::add(base, mi.SizeOfImage, trust::Trust::unknown, d.facts.path);
-                gate::deny_module(d, config::Reason::early_module, "startup");
-            }
-        }
+        const std::vector<std::wstring> known = known_dll_names();
+        std::atomic<DWORD> next{0};
+        auto work = [&]() {
+            for (DWORD i = next.fetch_add(1); i < n && !guard::closing(); i = next.fetch_add(1))
+                check_loaded_module(mods[i], known);
+        };
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const unsigned helpers = si.dwNumberOfProcessors > 4 ? 3u : si.dwNumberOfProcessors > 1 ? si.dwNumberOfProcessors - 1 : 0u;
+        std::vector<std::thread> pool;
+        for (unsigned h = 0; h < helpers; ++h) pool.emplace_back(work);
+        work();
+        for (auto& t : pool) t.join();
     }
     // 2. One full pass over memory and threads (ТЗ §5): early injections before the agent.
     execguard::judge_pending();

@@ -25,6 +25,7 @@ struct ThreadState {
     std::wstring* last_path;     // owned
 };
 thread_local ThreadState t_gate = {false, nullptr, trust::Trust::unknown, nullptr};
+thread_local int t_own_read = 0;
 
 std::atomic<bool> g_jvm_started{false};
 PVOID g_cookie = nullptr;
@@ -174,6 +175,10 @@ VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data,
 
 }  // namespace
 
+OwnReadScope::OwnReadScope() { ++t_own_read; }
+OwnReadScope::~OwnReadScope() { --t_own_read; }
+bool own_read_on_this_thread() { return t_own_read > 0; }
+
 bool jvm_started() { return g_jvm_started.load(std::memory_order_acquire); }
 void set_jvm_started() { g_jvm_started.store(true, std::memory_order_release); }
 
@@ -213,6 +218,12 @@ void on_section_created(HANDLE section) { t_gate.last_section = section; }
 
 bool on_image_view(HANDLE section, void* base, SIZE_T size) {
     const auto b = reinterpret_cast<std::uintptr_t>(base);
+    if (t_own_read > 0) {
+        // Resource view opened by the guard itself: registered (so the sweep does not call
+        // it hidden) but never trusted as code.
+        modules::add(b, size, trust::Trust::unknown, std::wstring());
+        return true;
+    }
     if (section && section == t_gate.last_section) {
         modules::add(b, size, t_gate.last_trust, t_gate.last_path ? *t_gate.last_path : std::wstring());
         clear_last();

@@ -33,4 +33,17 @@ void deny_module(const trust::Decision& d, config::Reason reason, const char* ph
 bool jvm_started();
 void set_jvm_started();
 
+// The guard's own reading of a file through Windows APIs (VERSIONINFO for a report card,
+// a version floor) may map that file as an image resource. Inside this scope such
+// mappings belong to the guard itself and pass the gate — otherwise building the report
+// about a refused file would ask the gate about the same file again, forever.
+class OwnReadScope {
+public:
+    OwnReadScope();
+    ~OwnReadScope();
+    OwnReadScope(const OwnReadScope&) = delete;
+    OwnReadScope& operator=(const OwnReadScope&) = delete;
+};
+bool own_read_on_this_thread();
+
 }  // namespace mebet::gate

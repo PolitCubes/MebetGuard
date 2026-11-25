@@ -12,6 +12,7 @@
 #include "core/exec_table.hpp"
 #include "core/module_table.hpp"
 #include "core/win_util.hpp"
+#include "hooks/load_gate.hpp"
 #include "json_writer.hpp"
 #include "mebet_trust_data.hpp"
 #include "strings.hpp"
@@ -76,6 +77,7 @@ struct VersionStrings {
 };
 
 VersionStrings version_strings(const std::wstring& path) {
+    gate::OwnReadScope own;  // GetFileVersionInfo maps the file; it may be the refused one
     VersionStrings v;
     DWORD dummy = 0;
     const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);

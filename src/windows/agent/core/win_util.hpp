@@ -24,7 +24,8 @@ std::wstring from_ansi(const std::string& s);  // JLI arguments are in the ANSI 
 std::string to_ansi(const std::wstring& w, bool* lossless);
 
 std::wstring module_path(HMODULE m);
-std::wstring system_dir();   // System32 (SysWOW64 for a 32-bit process on 64-bit Windows)
+std::wstring system_dir();        // GetSystemDirectoryW (file access is redirected under WOW64)
+std::wstring image_system_dir();  // the folder our system DLLs really come from: SysWOW64 under WOW64
 std::wstring windows_dir();
 std::wstring env(const wchar_t* name);
 std::wstring dir_of(const std::wstring& path);

@@ -45,7 +45,7 @@ NTSTATUS NTAPI hook_NtCreateSection(PHANDLE section, ACCESS_MASK access, POBJECT
                                     PLARGE_INTEGER max_size, ULONG page_protection, ULONG allocation, HANDLE file) {
     if (is_token(section, 0)) return canary(0);
     const bool image = (allocation & nt::kSecImage) != 0 && (allocation & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
-    if (!image || !file || guard::shutting_down()) {  // fast path: one check
+    if (!image || !file || guard::shutting_down() || gate::own_read_on_this_thread()) {  // fast path
         return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
     }
     if (!gate::on_image_section(file)) return kAccessDenied;
