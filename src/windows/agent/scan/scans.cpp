@@ -120,6 +120,48 @@ bool loader_knows(std::uintptr_t addr) {
                               reinterpret_cast<LPCWSTR>(addr), &m) != 0;
 }
 
+// Machine type and SizeOfImage from a mapped image's headers (SizeOfImage sits at the same
+// offset in PE32 and PE32+). False when the headers are not readable.
+bool image_header(std::uintptr_t base, USHORT* machine, DWORD* size) {
+    __try {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x800) return false;
+        const auto* nth = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<std::uintptr_t>(dos->e_lfanew));
+        if (nth->Signature != IMAGE_NT_SIGNATURE) return false;
+        *machine = nth->FileHeader.Machine;
+        *size = nth->OptionalHeader.SizeOfImage;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// M-01. Under WOW64 the system maps its own native images into every 32-bit process before
+// any of our code runs: the native ntdll and the WOW64 layer (wow64*.dll; xtajit.dll on ARM64).
+// The 32-bit loader list does not have them, so they looked like images mapped around the
+// loader and the x86 build closed itself (hidden_image, 214) on every 64-bit Windows. Accept
+// exactly those: the OS's native machine type, a WOW64-layer name, mapped from the native
+// System32 (the kernel reports the real path) and Microsoft-signed, checked through Sysnative
+// because a 32-bit process opening System32 is redirected to SysWOW64.
+bool wow64_layer_image(std::uintptr_t base) {
+    static const USHORT native = win::wow64_native_machine();
+    if (native == IMAGE_FILE_MACHINE_UNKNOWN) return false;
+    USHORT machine = 0;
+    DWORD size = 0;
+    if (!image_header(base, &machine, &size) || machine != native || size == 0) return false;
+    const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(base));
+    const std::wstring name = win::file_name_of(path);
+    static const wchar_t* const kLayer[] = {L"ntdll.dll",    L"wow64.dll",    L"wow64base.dll", L"wow64con.dll",
+                                            L"wow64win.dll", L"wow64cpu.dll", L"xtajit.dll",    L"wowarmhw.dll"};
+    bool layer = false;
+    for (const wchar_t* k : kLayer) layer = layer || iequals_ascii(name, k);
+    if (!layer || !win::same_path(path, win::windows_dir() + L"\\System32\\" + name)) return false;
+    const trust::Decision d = trust::decide_path(win::windows_dir() + L"\\Sysnative\\" + name);
+    if (!d.verdict.allowed || d.verdict.trust != trust::Trust::os) return false;
+    modules::add(base, size, trust::Trust::os, path);
+    return true;
+}
+
 bool committed_exec(std::uintptr_t a) {
     MEMORY_BASIC_INFORMATION m{};
     return VirtualQuery(reinterpret_cast<void*>(a), &m, sizeof(m)) && m.State == MEM_COMMIT && (m.Protect & 0xF0) &&
@@ -241,6 +283,7 @@ void sweep_memory(SweepMode mode) {
                 }
                 continue;
             }
+            if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
             close_hidden_image(alloc);
             continue;
         }

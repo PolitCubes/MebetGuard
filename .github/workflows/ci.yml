@@ -168,12 +168,42 @@ jobs:
       - name: install pytest
         shell: pwsh
         run: python -m pip install -q pytest
+      # A crash leaves a minidump, so a failed job shows where it crashed, not only an exit code.
+      - name: crash dumps on
+        shell: pwsh
+        run: |
+          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Path $k -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpFolder -Value "$env:RUNNER_TEMP\dumps" -PropertyType ExpandString -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpType -Value 1 -PropertyType DWord -Force | Out-Null
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         shell: pwsh
         run: |
           python -m pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' `
             --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
             --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll"
+      - name: crash report (faulting module, JVM hs_err, stack)
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error' } -MaxEvents 3 -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.TimeCreated; $_.Message; '-----' }
+          Get-ChildItem tests\e2e\_work -Filter 'hs_err_pid*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -TotalCount 80 }
+          $harch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $cdb = Get-Item "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\$harch\cdb.exe" -ErrorAction SilentlyContinue
+          $dumps = @(Get-ChildItem "$env:RUNNER_TEMP\dumps" -Filter *.dmp -ErrorAction SilentlyContinue)
+          "dumps: $($dumps.Count); cdb: $(if ($cdb) { $cdb.FullName } else { 'not found' })"
+          if ($cdb -and $dumps.Count) {
+            $sym = "$pwd\guard\symbols;srv*$env:RUNNER_TEMP\sym*https://msdl.microsoft.com/download/symbols"
+            & $cdb.FullName -z $dumps[0].FullName -y $sym -c '.ecxr; kn 40; q' 2>&1 | Select-Object -Last 70
+          }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-windows-${{ matrix.arch }}-${{ matrix.feature }}
+          path: ${{ runner.temp }}/dumps
+          if-no-files-found: ignore
 
   e2e-linux:
     needs: build-linux-binaries

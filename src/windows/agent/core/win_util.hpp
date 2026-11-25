@@ -19,6 +19,9 @@ const OsVersion& os_version();  // RtlGetVersion: not affected by compatibility 
 bool is_windows8_or_later();
 bool is_wow64();
 bool is_native_x86_os();  // 32-bit Windows (not WOW64)
+// The OS's own machine type when this process runs under WOW64 (IMAGE_FILE_MACHINE_AMD64 or
+// _ARM64), else IMAGE_FILE_MACHINE_UNKNOWN.
+USHORT wow64_native_machine();
 
 std::string utf8(const std::wstring& w);
 std::wstring wide(const std::string& s);       // from UTF-8

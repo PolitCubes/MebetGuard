@@ -41,6 +41,16 @@ bool is_native_x86_os() {
 #endif
 }
 
+USHORT wow64_native_machine() {
+    if (!is_wow64()) return IMAGE_FILE_MACHINE_UNKNOWN;
+    using Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+    static const Fn fn = reinterpret_cast<Fn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2")));
+    USHORT process = IMAGE_FILE_MACHINE_UNKNOWN, native = IMAGE_FILE_MACHINE_UNKNOWN;
+    if (fn && fn(GetCurrentProcess(), &process, &native) && native != IMAGE_FILE_MACHINE_UNKNOWN) return native;
+    return IMAGE_FILE_MACHINE_AMD64;  // IsWow64Process2 is Windows 10+; before it WOW64 ran only on x64
+}
+
 std::string utf8(const std::wstring& w) { return to_utf8(w); }
 std::wstring wide(const std::string& s) { return from_utf8(s); }
 
