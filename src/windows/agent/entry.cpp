@@ -186,8 +186,9 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
         gate::register_loader_notifications();
     }
 
-    // 4. Developer mode (locked) and virtual machine — before the start (ТЗ §8).
-    env::check_dev_mode();
+    // 4. Developer mode and virtual machine — before the start (ТЗ §8). Off only in the
+    //    unsigned devtest build, so its layers can be tested on a dev-mode CI runner.
+    if (config::enabled(config::Module::dev_mode)) env::check_dev_mode();
     if (config::enabled(config::Module::virtual_machine)) env::check_virtual_machine();
     env::tag_kernel_state();
 

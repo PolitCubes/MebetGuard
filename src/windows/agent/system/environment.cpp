@@ -201,10 +201,7 @@ report::Event make_event(const char* type, const char* title, report::Level leve
 }  // namespace
 
 void check_dev_mode() {
-    // Locked to close in every shipped build (ТЗ §8). Only the unsigned `devtest` build turns
-    // this module off (dev_mode level == off) so the other layers can be tested on a dev-mode
-    // CI runner; the release and the normal test build keep it at close and always enforce.
-    if (config::level(config::Module::dev_mode) == config::Level::off) return;
+    // Locked module: runs in every build (ТЗ §8).
     const auto& a = nt::api();
     if (!a.NtQuerySystemInformation) return;
     nt::CodeIntegrityInformation ci{sizeof(ci), 0};

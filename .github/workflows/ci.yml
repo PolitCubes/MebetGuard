@@ -221,11 +221,6 @@ jobs:
     needs: [windows, linux, macos, e2e-linux, dev_mode, e2e-windows]
     runs-on: ubuntu-24.04
     steps:
-      - name: all required jobs passed
-        run: |
-          results='${{ join(needs.*.result, ",") }}'
-          echo "results: $results"
-          case "$results" in
-            *failure*|*cancelled*) echo "a required job did not pass"; exit 1 ;;
-            *) echo "all green" ;;
-          esac
+      - name: fail if any required job did not pass
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1

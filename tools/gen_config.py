@@ -154,16 +154,13 @@ def gen_modules(cfg, kind):
             fail("%s: the release build enables every module (ТЗ §3); 'off' is only for test" % where)
         if m.get("locked") and (m["release"] != "close" or m["test"] != "close"):
             fail("%s: a locked module closes in every build" % where)
-        level = m[base]
-        if kind == "devtest" and mid == "dev_mode":
-            level = "off"
+        if mid == "dev_mode" and (not m.get("locked") or m["release"] != "close" or m["test"] != "close"):
+            fail("%s: dev_mode must be locked to close in release and test (ТЗ §8)" % where)
+        # devtest drops only dev_mode (its layers are tested on a dev-mode CI runner).
+        level = "off" if (kind == "devtest" and mid == "dev_mode") else m[base]
         mods.append((mid, m["title"], level, bool(m.get("locked"))))
     if "dev_mode" not in seen:
         fail("modules.json: dev_mode is mandatory")
-    for mid, _, level, locked in mods:
-        # dev_mode is locked to close in every shipped build; only the unsigned devtest turns it off.
-        if mid == "dev_mode" and kind != "devtest" and (level != "close" or not locked):
-            fail("modules.json: dev_mode must be locked to 'close' (ТЗ §8)")
     opts = []
     for name, o in cfg["options"].items():
         if name == "$comment":
