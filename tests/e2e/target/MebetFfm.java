@@ -13,9 +13,12 @@
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.StructLayout;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -274,9 +277,13 @@ public final class MebetFfm {
         tp.set(JAVA_INT, 4, luid.get(JAVA_INT, 0));
         tp.set(JAVA_INT, 8, luid.get(JAVA_INT, 4));
         tp.set(JAVA_INT, 12, 0x2 /*SE_PRIVILEGE_ENABLED*/);
-        int ok = (int) Win.AdjustTokenPrivileges.invokeExact(token, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
+        // AdjustTokenPrivileges succeeds even when the token does not hold the privilege; only
+        // GetLastError (ERROR_NOT_ALL_ASSIGNED) tells — a standard user's token has none.
+        MemorySegment state = ARENA.allocate(Win.CALL_STATE);
+        int ok = (int) Win.AdjustTokenPrivileges.invokeExact(state, token, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
+        int err = (int) Win.LAST_ERROR.get(state, 0L);
         int closed = (int) Win.CloseHandle.invokeExact(token);
-        return ok != 0;
+        return ok != 0 && err != 1300;
     }
 
     private static MethodHandle fn(SymbolLookup lib, String name, FunctionDescriptor d) {
@@ -328,8 +335,12 @@ public final class MebetFfm {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
         static final MethodHandle LookupPrivilegeValueW = fn(ADVAPI, "LookupPrivilegeValueW",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
-        static final MethodHandle AdjustTokenPrivileges = fn(ADVAPI, "AdjustTokenPrivileges",
-                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS));
+        static final StructLayout CALL_STATE = Linker.Option.captureStateLayout();
+        static final VarHandle LAST_ERROR = CALL_STATE.varHandle(MemoryLayout.PathElement.groupElement("GetLastError"));
+        static final MethodHandle AdjustTokenPrivileges = LINKER.downcallHandle(
+                ADVAPI.find("AdjustTokenPrivileges").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
+                Linker.Option.captureCallState("GetLastError"));
     }
 
     private static final class Posix {
