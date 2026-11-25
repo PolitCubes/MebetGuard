@@ -220,11 +220,33 @@ def gen_roots(cfg, config_dir):
     return roots
 
 
-def gen_publishers(cfg, roots):
+def gen_java(cfg):
+    """config/java.json: the publishers whose signature makes a file the game Java (Windows).
+
+    The game Java itself is chosen on the server (LaunchServer.json customJavaDownload);
+    this file only says which vendor signs it, so changing Java needs no code change.
+    """
+    check_keys(cfg, "java.json", ["publishers"], ["checked"])
+    ids = cfg["publishers"]
+    if not isinstance(ids, list) or not ids:
+        fail("java.json: publishers must list at least one id from publishers.json (group java)")
+    out = []
+    for i, pid in enumerate(ids):
+        where = "java.json publishers[%d]" % i
+        if not isinstance(pid, str):
+            fail("%s: expected a publisher id" % where)
+        if pid in out:
+            fail("%s: duplicate id '%s'" % (where, pid))
+        out.append(pid)
+    return out
+
+
+def gen_publishers(cfg, roots, java_ids):
     check_keys(cfg, "publishers.json", ["publishers"])
     root_index = {r["id"]: i for i, r in enumerate(roots)}
     pubs, signers = [], []
     seen = set()
+    groups = {}
     for i, p in enumerate(cfg["publishers"]):
         where = "publishers.json publishers[%d]" % i
         check_keys(p, where, ["id", "name", "group", "signers", "roots", "added", "review_by"],
@@ -233,6 +255,7 @@ def gen_publishers(cfg, roots):
         if pid in seen:
             fail("%s: duplicate id" % where)
         seen.add(pid)
+        groups[pid] = p["group"]
         mask = 0
         for rid in p["roots"]:
             if rid not in root_index:
@@ -243,20 +266,33 @@ def gen_publishers(cfg, roots):
             fail("%s: min_product_version must look like 1.2.3" % where)
         if not p["signers"]:
             fail("%s: at least one signer" % where)
+        own = []
         for j, s in enumerate(p["signers"]):
             sw = "%s signers[%d]" % (where, j)
-            check_keys(s, sw, ["cn", "o"], ["issuer_cn"])
+            check_keys(s, sw, ["cn", "o"], ["issuer_cn", "ou"])
             if norm_name(s["o"]) == norm_name("Open Source Developer") and "issuer_cn" not in s:
                 fail("%s: Certum Open Source signers need issuer_cn (ТЗ §6)" % sw)
-            signers.append((len(pubs), norm_name(s["cn"]), norm_name(s["o"]),
-                            norm_name(s["issuer_cn"]) if "issuer_cn" in s else None))
+            if "ou" in s and not norm_name(s["ou"]):
+                fail("%s: ou must not be empty" % sw)
+            own.append((norm_name(s["cn"]), norm_name(s["o"]),
+                        norm_name(s["issuer_cn"]) if "issuer_cn" in s else None,
+                        norm_name(s["ou"]) if "ou" in s else None))
         obs = []
         for o in p.get("cert_observations", []):
             o = o.strip().upper()
             if not re.fullmatch(r"[0-9A-F]{4,64}", o):
                 fail("%s: cert_observations entries are hex serial prefixes" % where)
             obs.append(o.lstrip("0") or "0")
+        # Validated above in any case; a Java vendor the game does not use is not trusted at all.
+        if p["group"] == "java" and pid not in java_ids:
+            continue
+        signers.extend((len(pubs),) + s for s in own)
         pubs.append({"id": pid, "name": p["name"], "group": p["group"], "mask": mask, "mpv": mpv, "obs": obs})
+    for pid in java_ids:
+        if pid not in groups:
+            fail("java.json: unknown publisher '%s' (not in publishers.json)" % pid)
+        if groups[pid] != "java":
+            fail("java.json: publisher '%s' has group '%s', expected 'java'" % (pid, groups[pid]))
     return pubs, signers
 
 
@@ -349,7 +385,8 @@ def main():
         if dsn and not re.fullmatch(r"https://[0-9a-f]+@[A-Za-z0-9.\-]+(:\d+)?/\d+", dsn):
             fail("reporting.json %s: expected https://<key>@<host>/<project id>" % dsn_key)
     roots = gen_roots(load(os.path.join(cfg_dir, "roots.json")), cfg_dir)
-    pubs, signers = gen_publishers(load(os.path.join(cfg_dir, "publishers.json")), roots)
+    java_ids = gen_java(load(os.path.join(cfg_dir, "java.json")))
+    pubs, signers = gen_publishers(load(os.path.join(cfg_dir, "publishers.json")), roots, java_ids)
     deny = gen_denylist(load(os.path.join(cfg_dir, "denylist.json")))
     hashes, profiles = gen_hashes(cfg_dir, a.os, a.arch)
 
@@ -426,8 +463,9 @@ def main():
         t.append("inline constexpr ObservationDef kObservations[1] = {};")
         t.append("inline constexpr unsigned kObservationCount = 0;")
     t.append("inline constexpr SignerDef kSigners[] = {")
-    for pi, cn, o, issuer in signers:
-        t.append("    { %d, %s, %s, %s }," % (pi, c_str(cn), c_str(o), c_str(issuer) if issuer else "nullptr"))
+    for pi, cn, o, issuer, ou in signers:
+        t.append("    { %d, %s, %s, %s, %s }," % (pi, c_str(cn), c_str(o), c_str(issuer) if issuer else "nullptr",
+                                                c_str(ou) if ou else "nullptr"))
     t.append("};")
     if deny:
         t.append("inline constexpr DenyDef kDenylist[] = {")

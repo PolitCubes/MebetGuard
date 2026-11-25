@@ -35,6 +35,11 @@ bool identity_of(HANDLE file, FileIdentity& out);
 // DOS path of an open file, from the kernel (GetFinalPathNameByHandleW), without "\\?\".
 std::wstring final_path(HANDLE file);
 
+// The same for a path (file or folder): junctions, symbolic links, SUBST drives and 8.3
+// names resolved, so it compares with final_path() of loaded files. The input when it
+// cannot be opened.
+std::wstring resolved_path(const std::wstring& path);
+
 // Opens a file for reading; shares everything so that a check never blocks another program.
 HANDLE open_read(const std::wstring& path);
 

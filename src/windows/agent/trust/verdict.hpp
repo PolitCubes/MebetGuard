@@ -14,7 +14,7 @@ enum class Trust : unsigned char {
     unknown,    // not allowed
     os,         // Microsoft: Windows components, Microsoft runtimes (rule, not a list entry)
     known_dll,  // mapped from \KnownDlls — created by the system at boot
-    java,       // our Java (Liberica, publisher BELLSOFT)
+    java,       // the game Java: publisher from config/java.json, file inside JAVA_HOME
     publisher,  // trusted publisher from config/publishers.json
     whql,       // WHQL-only file inside the active display driver folder
     hash,       // game / mod native library, by SHA-256

@@ -1,9 +1,15 @@
 {
-  "$comment": "Доверенные издатели (ТЗ §6). Матч: CN + O листового сертификата (без регистра и пунктуации, только по явному списку вариантов) + класс корня из roots.json. Отпечаток и серийник в матч не входят: cert_observations — только история, на решение не влияет. Для Certum Open Source поле O общее («Open Source Developer»), поэтому там сверяется полный CN и выпускающий CA (issuer_cn). Компоненты Windows и рантаймы Microsoft — правило в коде (trust/microsoft_rule), а не записи этого файла. Данные CN/O/корней сняты с реальных файлов (research_notes/Доверенные вендоры и подпись Windows/allowlist-2026-11-24). Чеклист [скан] из ТЗ §6 закрывается снятием подписей с установленного ПО; до этого релиз не выпускается.",
+  "$comment": "Доверенные издатели (ТЗ §6). Матч: CN + O (+ OU, если задан) листового сертификата (без регистра и пунктуации, только по явному списку вариантов) + класс корня из roots.json. Группа java действует только для издателей из config/java.json и только внутри JAVA_HOME. Отпечаток и серийник в матч не входят: cert_observations — только история, на решение не влияет. Для Certum Open Source поле O общее («Open Source Developer»), поэтому там сверяется полный CN и выпускающий CA (issuer_cn). Компоненты Windows и рантаймы Microsoft — правило в коде (trust/microsoft_rule), а не записи этого файла. Данные CN/O/корней сняты с реальных файлов (research_notes/Доверенные вендоры и подпись Windows/allowlist-2026-11-24). Чеклист [скан] из ТЗ §6 закрывается снятием подписей с установленного ПО; до этого релиз не выпускается.",
   "publishers": [
-    { "id": "bellsoft", "name": "BellSoft (Liberica JDK — наша Java)", "group": "java",
+    { "id": "bellsoft", "name": "BellSoft (Liberica JDK)", "group": "java",
       "signers": [ { "cn": "BELLSOFT", "o": "BELLSOFT" } ], "roots": ["sectigo_cs_r46"],
+      "covers": "Liberica JDK — Java игры, пока она в config/java.json",
       "cert_observations": ["00F6D749"], "added": "2026-11-24", "review_by": "2027-05-24" },
+    { "id": "amazon_corretto", "name": "Amazon Corretto", "group": "java",
+      "signers": [ { "cn": "Amazon.com Services LLC", "o": "Amazon.com Services LLC", "ou": "Amazon Corretto" } ],
+      "roots": ["digicert_trusted_g4"],
+      "covers": "Amazon Corretto (снято с updates/java25-launcher-windows-amd64, EV, выпускающий УЦ DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1); для игры — только если указан в config/java.json. OU обязателен: тот же CN и O подписывают и другие программы Amazon",
+      "cert_observations": ["048E6204"], "added": "2026-11-25", "review_by": "2027-05-25" },
 
     { "id": "nvidia", "name": "NVIDIA", "group": "gpu",
       "signers": [ { "cn": "NVIDIA Corporation", "o": "NVIDIA Corporation" } ], "roots": ["digicert_trusted_g4", "verisign_universal"],

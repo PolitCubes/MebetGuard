@@ -85,4 +85,15 @@ HANDLE open_read(const std::wstring& path) {
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
+std::wstring resolved_path(const std::wstring& path) {
+    if (path.empty()) return path;
+    // Attributes only: no data access, so no sharing conflict and no section is created.
+    HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return path;
+    std::wstring p = final_path(h);
+    CloseHandle(h);
+    return p.empty() ? path : p;
+}
+
 }  // namespace mebet::trust

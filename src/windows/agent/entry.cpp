@@ -102,8 +102,11 @@ bool jvm_code_allowed(const void* address) { return scan::allowed_code(reinterpr
 void check_jvm_library(const wchar_t* name, const std::wstring& expected_dir) {
     HMODULE m = GetModuleHandleW(name);
     if (!m) return;
-    const std::wstring path = win::mapped_file_name(m);
-    if (path.empty() || win::path_under(path, expected_dir)) return;
+    const std::wstring mapped = win::mapped_file_name(m);
+    if (mapped.empty()) return;
+    // Both sides resolved (junctions, SUBST, 8.3 names): a moved profile is not a foreign JVM.
+    const std::wstring path = trust::resolved_path(mapped);
+    if (win::path_under(path, expected_dir)) return;
     report::Event ev;
     ev.type = "close.jvm_path";
     ev.level = report::Level::error;

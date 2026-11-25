@@ -112,8 +112,9 @@ void report_inventory(const trust::Decision& d) {
     }
 }
 
-// ТЗ §10: the JVM's own debugging and instrumentation agents are signed by BellSoft like
-// the rest of our Java, so the publisher rule would let them in; they never belong in the game.
+// ТЗ §10: the JVM's own debugging and instrumentation agents are signed by the Java vendor
+// (config/java.json) like the rest of the game Java, so the publisher rule would let them in;
+// they never belong in the game.
 bool java_agent_module(const std::wstring& path) {
     static const wchar_t* const kNames[] = {L"instrument.dll", L"jdwp.dll", L"attach.dll", L"dt_socket.dll",
                                             L"dt_shmem.dll"};

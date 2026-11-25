@@ -129,16 +129,21 @@ std::string product_version(const std::wstring& path) {
     return v;
 }
 
-// Trusted publisher: CN + O variant + pinned root class (ТЗ §6). Never by serial/thumbprint.
+// Trusted publisher: CN + O (+ OU) variant + pinned root class (ТЗ §6). Never by serial/thumbprint.
+// The vendor of the game Java (group java, config/java.json) counts only inside JAVA_HOME:
+// the same signature anywhere else is some other program of that vendor, not our Java.
 int publisher_of(const Signer& s, const std::wstring& path, bool* new_cert) {
     *new_cert = false;
     if (s.pinned_root < 0) return -1;
     const std::uint32_t bit = 1u << s.pinned_root;
     const std::string cn = normalize_name(s.cn), o = normalize_name(s.o), issuer = normalize_name(s.issuer_cn);
+    const std::string ou = normalize_name(s.ou);
     for (const auto& d : config::kSigners) {
         const auto& p = config::kPublishers[d.publisher];
         if ((p.root_mask & bit) == 0 || cn != d.cn || o != d.o) continue;
         if (d.issuer_cn && issuer != d.issuer_cn) continue;
+        if (d.ou && ou != d.ou) continue;
+        if (std::strcmp(p.group, "java") == 0 && !is_java_dir_file(path)) continue;
         if (p.min_product_version && compare_versions(product_version(path), p.min_product_version) < 0) continue;
         bool seen = false;
         bool any_observation = false;
@@ -269,7 +274,10 @@ const char* trust_name(Trust t) {
 
 void init_engine(const std::wstring& java_home) {
     State& s = state();
-    s.java_home = win::full_path(java_home);
+    // As the file system resolves it: the paths it is compared with come from
+    // GetFinalPathNameByHandleW, so a profile moved with a junction, a SUBST drive or 8.3
+    // components in JAVA_HOME must not look like a foreign Java.
+    s.java_home = resolved_path(win::full_path(java_home));
     collect_display_dirs(s.display_dirs);
 
     HMODULE self = nullptr;
