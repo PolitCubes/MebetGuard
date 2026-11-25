@@ -20,6 +20,15 @@
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
+/* JNICALL from jni_md.h: the JVM calls these entry points as __stdcall on 32-bit Windows (and
+ * finds them as _JNI_OnLoad@8, _Agent_OnLoad@12). A cdecl body leaves the arguments on the stack
+ * and the 32-bit JVM crashes right after the call returns. */
+#if defined(_WIN32) && !defined(_WIN64)
+#define JNICALL_ __stdcall
+#else
+#define JNICALL_
+#endif
+
 static void mark(const char *how) {
     fprintf(stderr, "ATTACK native %s in the game process\n", how);
     fflush(stderr);
@@ -27,7 +36,7 @@ static void mark(const char *how) {
 
 /* jint JNI_OnLoad(JavaVM*, void*) without pulling in jni.h: the JVM only needs the symbol
  * and a JNI version return value. */
-EXPORT int JNI_OnLoad(void *vm, void *reserved) {
+EXPORT int JNICALL_ JNI_OnLoad(void *vm, void *reserved) {
     (void)vm;
     (void)reserved;
     mark("System.load");
@@ -36,7 +45,7 @@ EXPORT int JNI_OnLoad(void *vm, void *reserved) {
 
 /* jint Agent_OnLoad(JavaVM*, char* options, void* reserved): a JVMTI agent started with
  * -agentpath. Returning 0 is success, so the JVM keeps running (baseline). */
-EXPORT int Agent_OnLoad(void *vm, char *options, void *reserved) {
+EXPORT int JNICALL_ Agent_OnLoad(void *vm, char *options, void *reserved) {
     (void)vm;
     (void)options;
     (void)reserved;
@@ -44,7 +53,7 @@ EXPORT int Agent_OnLoad(void *vm, char *options, void *reserved) {
     return 0;
 }
 
-EXPORT int Agent_OnAttach(void *vm, char *options, void *reserved) {
+EXPORT int JNICALL_ Agent_OnAttach(void *vm, char *options, void *reserved) {
     (void)vm;
     (void)options;
     (void)reserved;
