@@ -1,5 +1,5 @@
 {
-  "$comment": "Уровни модулей стража (ТЗ §3, §7). Файл — вход сборки: генератор tools/gen_config.py превращает его в таблицу внутри exe/dll; во время работы с диска не читается. Уровни: on — работает всегда, без вердикта; close — закрыть + отчёт; report — только отчёт; off — выключен (только в тестовой сборке). Релизная сборка не может содержать off; dev_mode не выключается ни в какой сборке.",
+  "$comment": "Уровни модулей стража (ТЗ §3, §7). Файл — вход сборки: генератор tools/gen_config.py превращает его в таблицу внутри exe/dll; во время работы с диска не читается. Уровни: on — работает всегда, без вердикта; close — закрыть + отчёт; report — только отчёт; off — выключен (только в тестовой сборке). Релизная сборка не может содержать off; dev_mode не выключается ни в какой сборке. Две сборки стража: release — с блоками виртуализации (virtual_machine, linux_wsl включены), test — без них (обе off), чтобы страж запускался внутри ВМ/контейнера на стенде и в e2e; test неподписанная и игрокам не раздаётся.",
   "modules": [
     { "id": "env_hardening",           "title": "Закалка окружения",                     "section": "4",  "release": "on",     "test": "on" },
     { "id": "jvm_launch",              "title": "Порядок запуска JVM",                   "section": "4",  "release": "on",     "test": "on" },
@@ -25,7 +25,7 @@
     { "id": "process_dacl",            "title": "DACL процесса",                         "section": "7",  "release": "on",     "test": "on" },
     { "id": "splash",                  "title": "Заставка при запуске",                  "section": "4",  "release": "on",     "test": "on" },
     { "id": "window_identity",         "title": "Заголовок и значок окна",               "section": "4",  "release": "on",     "test": "on" },
-    { "id": "linux_wsl",               "title": "Linux-клиент в WSL2",                   "section": "11", "release": "close",  "test": "close" },
+    { "id": "linux_wsl",               "title": "Linux-клиент в WSL2",                   "section": "11", "release": "close",  "test": "off" },
     { "id": "posix_preload",           "title": "LD_PRELOAD / LD_AUDIT и чужие библиотеки (Linux/macOS)", "section": "11", "release": "report", "test": "report" }
   ],
   "options": {
