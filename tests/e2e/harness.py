@@ -10,8 +10,13 @@ Every SCENARIO runs twice: baseline (plain `java`) and guarded (through the guar
 - legit   — what the game itself does (threads, JIT, a JDK library, a plain native call).
             It must work in both runs: the guard must not get in the way.
 
-test_layers.py turns every scenario into two pytest tests (baseline / guarded); run.py prints
-them as a table. The oracle is split into baseline_ok() and guard_ok() so a failure says
+On Windows each scenario also runs at every privilege level that changes its outcome (winpriv):
+the game as a standard user or as an elevated admin, and — for an attack from another program —
+that program as a standard user or as an admin with SeDebugPrivilege. A variant may expect a
+different answer (an admin cheat can freeze guard threads, a standard one cannot even open them).
+
+test_layers.py turns every scenario × variant into two pytest tests (baseline / guarded); run.py
+prints them as a table. The oracle is split into baseline_ok() and guard_ok() so a failure says
 exactly which half broke.
 """
 import json
@@ -21,6 +26,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -33,6 +39,12 @@ WIN = {"windows"}
 def host_os():
     s = platform.system().lower()
     return {"windows": "windows", "linux": "linux", "darwin": "macos"}.get(s, s)
+
+
+if host_os() == "windows":
+    import winpriv  # noqa: E402  (Windows only: privilege levels)
+else:
+    winpriv = None
 
 
 def load_codes():
@@ -67,6 +79,7 @@ class Ctx:
         self.marker_jar = self.work / "mebet-marker.jar"
         self.native = None  # filled by build_fixtures()
         self.ffm = False    # Foreign Function & Memory API in the target (Java 22+)
+        self.admin = bool(winpriv and winpriv.is_admin())
         self.no_skip = False
 
     def tool(self, name):
@@ -74,7 +87,7 @@ class Ctx:
 
 
 def run_cmd(cmd, env, timeout, cwd=None):
-    """Run cmd, merging stderr into stdout. Returns (exit_code, output, timed_out)."""
+    """Run a build tool, merging stderr into stdout. Returns (exit_code, output, timed_out)."""
     p = subprocess.Popen([str(c) for c in cmd], env=env, cwd=cwd, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     try:
@@ -86,44 +99,43 @@ def run_cmd(cmd, env, timeout, cwd=None):
         return p.returncode, out, True
 
 
-def run_with_probe(cmd, env, timeout, cwd, probe):
-    """Like run_cmd, but once the target prints "TARGET up pid=N" the probe runs against that
-    process from the outside (as another program would) and its line joins the output."""
-    p = subprocess.Popen([str(c) for c in cmd], env=env, cwd=cwd, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    lines, up = [], threading.Event()
-    pid = [0]
+class Proc:
+    """A target started with the test's own token: output lines as they come, wait / kill /
+    finish (winpriv.UserProc has the same shape for the standard-user token)."""
 
-    def reader():
-        for line in p.stdout:
-            lines.append(line)
-            m = re.search(r"TARGET up pid=(\d+)", line)
-            if m and not up.is_set():
-                pid[0] = int(m.group(1))
-                up.set()
-        up.set()
+    def __init__(self, cmd, env, cwd):
+        self.lines = []
+        self._p = subprocess.Popen([str(c) for c in cmd], env=env, cwd=cwd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT)
+        self.pid = self._p.pid
+        self._t = threading.Thread(target=self._read, daemon=True)
+        self._t.start()
 
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
-    up.wait(timeout)
-    if pid[0]:
-        lines.append(probe(pid[0]) + "\n")
-    timed_out = False
-    try:
-        p.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.wait()
-        timed_out = True
-    t.join(5)
-    return p.returncode, "".join(lines), timed_out
+    def _read(self):
+        for raw in self._p.stdout:
+            self.lines.append(raw.decode("utf-8", "replace"))
+
+    def wait(self, timeout):
+        try:
+            self._p.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    def kill(self):
+        self._p.kill()
+        self._p.wait()
+
+    def finish(self):
+        self._t.join(5)
+        return self._p.returncode
 
 
-# --- external probes (run from the test process against the target) ---------------------------
+# --- external probes (another program acting on the target) ------------------------------------
 
 def probe_open_process(pid):
-    """Another program of the same user asks for the rights an injector needs. Only opens and
-    closes a handle — nothing is written into the target."""
+    """Another program asks for the rights an injector needs. Only opens and closes a handle —
+    nothing is written into the target. Its privilege level comes from winpriv.as_other()."""
     import ctypes
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.OpenProcess.restype = ctypes.c_void_p
@@ -200,8 +212,10 @@ def _build_native(ctx):
 
 # --- launching -----------------------------------------------------------------------------------
 
-def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout=None, probe=None):
-    """mode 'baseline' uses plain java; 'guarded' uses the guard wrapper. Returns the run dict."""
+def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout=None, probe=None,
+           game=None, other=None):
+    """mode 'baseline' uses plain java; 'guarded' uses the guard wrapper. game / other are the
+    privilege levels ("user" / "admin", Windows) of the game and of the probing program."""
     env = os.environ.copy()
     env["JAVA_HOME"] = str(ctx.java_home)
     env["MEBET_TEST_NO_UI"] = "1"
@@ -215,31 +229,52 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
     head = ctx.guard if mode == "guarded" else ctx.java
     cmd = [head] + pre + list(jvm_args) + ["-cp", ctx.classes, "MebetTarget"]
     limit = timeout or (10 + iters)
+    start = time.monotonic()
+    proc = winpriv.UserProc(cmd, env, str(ctx.work)) if game == "user" else Proc(cmd, env, str(ctx.work))
     if probe:
-        code, out, timed_out = run_with_probe(cmd, env, limit, str(ctx.work), PROBES[probe])
-    else:
-        code, out, timed_out = run_cmd(cmd, env, timeout=limit, cwd=str(ctx.work))
-    return {"exit": code, "out": out, "timed_out": timed_out, "cmd": [str(c) for c in cmd]}
+        pid = 0
+        while not pid and time.monotonic() - start < limit:
+            for line in list(proc.lines):
+                m = re.search(r"TARGET up pid=(\d+)", line)
+                if m:
+                    pid = int(m.group(1))
+                    break
+            else:
+                if proc.wait(0.05):
+                    break
+        if pid:
+            fn = lambda: PROBES[probe](pid)  # noqa: E731
+            proc.lines.append((winpriv.as_other(other, fn) if other else fn()) + "\n")
+    timed_out = not proc.wait(max(0.0, limit - (time.monotonic() - start)))
+    if timed_out:
+        proc.kill()
+    code = proc.finish()
+    return {"exit": code, "out": "".join(proc.lines), "timed_out": timed_out, "cmd": [str(c) for c in cmd]}
 
 
 def has(run, text):
     return text in run["out"]
 
 
-def run_scenario(ctx, sc, mode):
-    """Run one side (baseline|guarded) of a scenario."""
+def run_scenario(ctx, sc, mode, variant=(None, None)):
+    """Run one side (baseline|guarded) of a scenario at one privilege variant (game, other)."""
     s = sc["build"](ctx, ctx.native, ctx.marker_jar)
     return launch(ctx, mode, s.get("jvm_args", ()), s.get("extra_env"), s.get("action"),
-                  s.get("iters", 8), sc.get("timeout"), sc.get("probe"))
+                  s.get("iters", 8), sc.get("timeout"), sc.get("probe"), variant[0], variant[1])
 
 
 # --- scenarios -----------------------------------------------------------------------------------
 # kind:   "attack" or "legit".
 # guard:  "allow" (legit: works through the guard), "neutralize" (attack: exit 0, no marker),
-#         "close:<reason>[|<reason>]" (attack: the process ends with one of these codes).
+#         "close:<reason>[|<reason>]" (attack: the process ends with one of these codes),
+#         "known_limit" (the attack gets through and that is Windows by design, e.g. an admin
+#         with SeDebugPrivilege opens any process: the test is xfail, it documents the limit).
 # marker: the attack worked / the legit action ran.
-# proof:  regexes the guarded output must contain — the attack really was attempted there
-#         (e.g. guard threads were really frozen), so a pass is not a pass by accident.
+# proof:  regexes the guarded output must contain — the attack really was attempted there.
+# privs:  Windows privilege variants — "game" (game user / admin) or "game_other" (× the other
+#         program user / admin, for attacks from another program).
+# expect(game, other) -> overrides of {guard, proof, baseline} for one variant; baseline
+#         "works" (default) or "denied" (Windows itself stops the attack even without the guard).
 # build(ctx, native, marker_jar) -> {jvm_args?, extra_env?, action?, iters?}.
 
 def _agent(jar):
@@ -251,7 +286,30 @@ def _sc(**kw):
     kw.setdefault("needs_native", False)
     kw.setdefault("needs_ffm", False)
     kw.setdefault("proof", [])
+    kw.setdefault("privs", "game")
     return kw
+
+
+def _tamper_threads(verb):
+    # Admin (SeDebugPrivilege) gets past the guard's thread DACL and freezes / kills its threads:
+    # the watchdog must end the game. A standard user cannot even open them: the forbidden load
+    # that follows is caught as usual.
+    def expect(game, other):
+        if game == "admin":
+            return dict(guard="close:guard_stalled", proof=[r"TARGET %s [1-9]\d* guard threads" % verb])
+        return dict(guard="close:untrusted_module", proof=[r"TARGET %s 0 guard threads" % verb])
+    return expect
+
+
+def _dacl_expect(game, other):
+    if other == "admin":
+        # Windows lets an admin with SeDebugPrivilege open any process: not the DACL's job, the
+        # guard's detections (watchdog, hooks, sweeps) cover what such a program does next.
+        return dict(guard="known_limit", proof=[])
+    if game == "admin":
+        # A standard program cannot open an elevated one at all (integrity level), guard or not.
+        return dict(baseline="denied")
+    return {}
 
 
 SCENARIOS = [
@@ -312,18 +370,17 @@ SCENARIOS = [
     _sc(id="process_dacl_open", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],
+        privs="game_other", expect=_dacl_expect,
         build=lambda ctx, native, jar: dict(action="none", iters=16)),
 
     # ---- attacks: on the guard itself ------------------------------------------------------------
     _sc(id="tamper_freeze_guard", kind="attack", module="guard_watchdog", os=WIN, needs_native=True,
-        needs_ffm=True, guard="close:guard_stalled", timeout=60,
+        needs_ffm=True, guard="close:guard_stalled", timeout=60, expect=_tamper_threads("froze"),
         title="Заморозить потоки стража, затем загрузить чужой натив", marker="TARGET did ffm-freeze-guard",
-        proof=[r"TARGET froze [1-9]\d* guard threads"],
         build=lambda ctx, native, jar: dict(action="ffm-freeze-guard " + str(native), iters=2)),
     _sc(id="tamper_kill_guard", kind="attack", module="guard_watchdog", os=WIN, needs_native=True,
-        needs_ffm=True, guard="close:guard_stalled", timeout=60,
+        needs_ffm=True, guard="close:guard_stalled", timeout=60, expect=_tamper_threads("killed"),
         title="Убить потоки стража, затем загрузить чужой натив", marker="TARGET did ffm-kill-guard",
-        proof=[r"TARGET killed [1-9]\d* guard threads"],
         build=lambda ctx, native, jar: dict(action="ffm-kill-guard " + str(native), iters=2)),
     _sc(id="tamper_unload_guard", kind="attack", module="module_trust", os=WIN, needs_native=True,
         needs_ffm=True, guard="close:untrusted_module", timeout=60,
@@ -338,26 +395,57 @@ SCENARIOS = [
 ]
 
 
-def applies(sc, ctx):
-    """None if the scenario runs here, else a reason to skip it."""
+def variants(sc):
+    """Privilege variants (game, other) of a scenario on this host. Off Windows: one, as is."""
+    if host_os() != "windows":
+        return [(None, None)]
+    if sc["privs"] == "game_other":
+        return [(g, o) for g in ("user", "admin") for o in ("user", "admin")]
+    return [("user", None), ("admin", None)]
+
+
+def variant_id(variant):
+    game, other = variant
+    if not game:
+        return ""
+    return "game_%s" % game + ("-other_%s" % other if other else "")
+
+
+def expectations(sc, variant):
+    exp = dict(guard=sc["guard"], proof=sc["proof"], baseline="works")
+    if "expect" in sc:
+        exp.update(sc["expect"](*variant))
+    return exp
+
+
+def applies(sc, ctx, variant=(None, None)):
+    """None if the scenario runs here at this variant, else a reason to skip it."""
     if ctx.os not in sc["os"]:
         return "не для %s" % ctx.os
     if sc["needs_native"] and ctx.native is None:
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:
         return "нужна Java 22+ с FFM (здесь Java %d)" % ctx.java_feature
+    if "admin" in variant and not ctx.admin:
+        return "вариант «админ» требует, чтобы тест работал от администратора (на раннерах CI так и есть)"
     return None
 
 
-def baseline_ok(sc, base):
-    """Without the guard: an attack must work, a legit action must run; the app finishes."""
-    what = "атака не воспроизвелась" if sc["kind"] == "attack" else "действие не выполнилось"
+def baseline_ok(sc, base, exp=None):
+    """Without the guard: an attack must work, a legit action must run; the app finishes.
+    exp["baseline"] == "denied": Windows itself stops this attack at this privilege variant."""
+    exp = exp or dict(baseline="works")
     if base["exit"] != 0:
         return False, "приложение не завершилось чисто (exit %s)" % base["exit"]
-    if not has(base, sc["marker"]):
-        return False, "%s: нет маркера %r" % (what, sc["marker"])
     if not has(base, "TARGET exit"):
         return False, "приложение не доработало до конца"
+    if exp["baseline"] == "denied":
+        if has(base, sc["marker"]):
+            return False, "ждали, что Windows сама не пустит, а атака прошла: %r" % sc["marker"]
+        return True, "Windows сама не пускает (уровень целостности), приложение живо"
+    what = "атака не воспроизвелась" if sc["kind"] == "attack" else "действие не выполнилось"
+    if not has(base, sc["marker"]):
+        return False, "%s: нет маркера %r" % (what, sc["marker"])
     return True, ("атака сработала" if sc["kind"] == "attack" else "работает") + ", приложение живо"
 
 
@@ -366,9 +454,11 @@ def _closed_line(run):
     return (m.group(1), int(m.group(2))) if m else None
 
 
-def guard_ok(ctx, sc, guarded):
-    """Through the guard: an attack must be blocked, a legit action must still run."""
-    g = sc["guard"]
+def guard_ok(ctx, sc, guarded, exp=None):
+    """Through the guard: an attack must be blocked, a legit action must still run.
+    Returns (True | False | "xfail", message)."""
+    exp = exp or dict(guard=sc["guard"], proof=sc["proof"])
+    g = exp["guard"]
     if g == "allow":
         closed = _closed_line(guarded)
         if closed:
@@ -379,11 +469,17 @@ def guard_ok(ctx, sc, guarded):
             return False, "через гвард действие не выполнилось: нет %r" % sc["marker"]
         return True, "работает, страж не мешает"
 
+    if g == "known_limit":
+        if has(guarded, sc["marker"]):
+            return "xfail", ("известное ограничение Windows: администратор с SeDebugPrivilege открывает "
+                             "любой процесс мимо DACL — дальше его ловят другие слои")
+        return True, "не пустило даже администратора"
+
     if has(guarded, sc["marker"]):
         return False, "маркер атаки всё же появился: %r" % sc["marker"]
-    for rx in sc["proof"]:
+    for rx in exp["proof"]:
         if not re.search(rx, guarded["out"]):
-            return False, "атака не была проведена до конца (нет %r) — проверка ничего не доказала" % rx
+            return False, "атака не была проведена так, как ждали (нет %r) — проверка ничего не доказала" % rx
     if g.startswith("close:"):
         reasons = g.split(":", 1)[1].split("|")
         wants = {ctx.codes[r]: r for r in reasons}

@@ -43,23 +43,27 @@ def main():
     for sc in harness.SCENARIOS:
         if only and sc["id"] not in only:
             continue
-        skip = harness.applies(sc, ctx)
-        if skip:
-            rows.append(dict(id=sc["id"], state="skip", baseline="—", guard=skip))
-            continue
-        base = harness.run_scenario(ctx, sc, "baseline")
-        guarded = harness.run_scenario(ctx, sc, "guarded")
-        ok_b, bv = harness.baseline_ok(sc, base)
-        ok_g, gv = harness.guard_ok(ctx, sc, guarded)
-        passed = ok_b and ok_g
-        failed += 0 if passed else 1
-        rows.append(dict(id=sc["id"], state="OK" if passed else "FAIL", baseline=bv, guard=gv,
-                         base_exit=base["exit"], guard_exit=guarded["exit"]))
+        for variant in harness.variants(sc):
+            rid = "-".join(x for x in (sc["id"], harness.variant_id(variant)) if x)
+            skip = harness.applies(sc, ctx, variant)
+            if skip:
+                rows.append(dict(id=rid, state="skip", baseline="—", guard=skip))
+                continue
+            exp = harness.expectations(sc, variant)
+            base = harness.run_scenario(ctx, sc, "baseline", variant)
+            guarded = harness.run_scenario(ctx, sc, "guarded", variant)
+            ok_b, bv = harness.baseline_ok(sc, base, exp)
+            ok_g, gv = harness.guard_ok(ctx, sc, guarded, exp)
+            passed = bool(ok_b) and bool(ok_g)
+            failed += 0 if passed else 1
+            state = "FAIL" if not passed else ("LIMIT" if ok_g == "xfail" else "OK")
+            rows.append(dict(id=rid, state=state, baseline=bv, guard=gv,
+                             base_exit=base["exit"], guard_exit=guarded["exit"]))
 
     w = max((len(r["id"]) for r in rows), default=4)
-    print("\n%-4s %-*s  %-30s  %s" % ("", w, "scenario", "без гварда", "через гвард"))
+    print("\n%-5s %-*s  %-30s  %s" % ("", w, "scenario", "без гварда", "через гвард"))
     for r in rows:
-        print("%-4s %-*s  %-30s  %s" % (r["state"], w, r["id"], r["baseline"], r["guard"]))
+        print("%-5s %-*s  %-30s  %s" % (r["state"], w, r["id"], r["baseline"], r["guard"]))
     ran = [r for r in rows if r["state"] != "skip"]
     print("\n%d/%d scenarios passed (%d skipped)" %
           (len(ran) - failed, len(ran), len(rows) - len(ran)))
