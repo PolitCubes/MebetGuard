@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <string>
 
 #include "config.hpp"
 #include "core/guard.hpp"
@@ -174,12 +175,25 @@ void load_jli_and_parse(Context& ctx) {
         if (guard::closing()) guard::close_now(config::Reason::untrusted_module, L"jli.dll", report::Event{});
         close_java_missing(bin + L"\\jli.dll");
     }
-    auto get = [&](const char* name) { return reinterpret_cast<void*>(GetProcAddress(g_jli.dll, name)); };
-    g_jli.launch = reinterpret_cast<JliLaunchFn>(get("JLI_Launch"));
-    g_jli.cmd_to_args = reinterpret_cast<JliCmdToArgsFn>(get("JLI_CmdToArgs"));
-    g_jli.get_args = reinterpret_cast<JliGetStdArgsFn>(get("JLI_GetStdArgs"));
-    g_jli.get_argc = reinterpret_cast<JliGetStdArgcFn>(get("JLI_GetStdArgc"));
-    g_jli.init_arg_processing = reinterpret_cast<JliInitArgProcessingFn>(get("JLI_InitArgProcessing"));
+    // A 32-bit JDK exports these JNICALL (__stdcall) functions decorated, e.g. _JLI_Launch@56
+    // (the number is the bytes of arguments on the stack); 64-bit ones use the plain names.
+    auto get = [&](const char* name, int stack_bytes) {
+        void* p = reinterpret_cast<void*>(GetProcAddress(g_jli.dll, name));
+#if defined(_M_IX86)
+        if (!p) {
+            const std::string decorated = "_" + std::string(name) + "@" + std::to_string(stack_bytes);
+            p = reinterpret_cast<void*>(GetProcAddress(g_jli.dll, decorated.c_str()));
+        }
+#else
+        (void)stack_bytes;
+#endif
+        return p;
+    };
+    g_jli.launch = reinterpret_cast<JliLaunchFn>(get("JLI_Launch", 56));
+    g_jli.cmd_to_args = reinterpret_cast<JliCmdToArgsFn>(get("JLI_CmdToArgs", 4));
+    g_jli.get_args = reinterpret_cast<JliGetStdArgsFn>(get("JLI_GetStdArgs", 0));
+    g_jli.get_argc = reinterpret_cast<JliGetStdArgcFn>(get("JLI_GetStdArgc", 0));
+    g_jli.init_arg_processing = reinterpret_cast<JliInitArgProcessingFn>(get("JLI_InitArgProcessing", 8));
     if (!g_jli.launch || !g_jli.cmd_to_args || !g_jli.get_args || !g_jli.get_argc || !g_jli.init_arg_processing)
         close_java_missing(bin + L"\\jli.dll (JLI_* exports)");
 

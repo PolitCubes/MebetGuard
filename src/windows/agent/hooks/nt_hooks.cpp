@@ -16,6 +16,9 @@
 #include "hooks/load_gate.hpp"
 #include "strings.hpp"
 
+// The CRT's index of this module's implicit TLS block (tlssup).
+extern "C" unsigned long _tls_index;
+
 namespace mebet::hooks {
 
 namespace {
@@ -41,11 +44,29 @@ inline NTSTATUS canary(int i) {
 
 constexpr NTSTATUS kAccessDenied = nt::kStatusAccessDenied;
 
+// A thread gets our implicit TLS block (thread_local, and the guard MSVC checks on every use of
+// a function-local static) only after its early init, and loses it before it is gone; the heap
+// still allocates and decommits on such a thread (at exit) and lands in these hooks. Touching
+// TLS there reads address 8 * _tls_index and kills the process — seen on Windows ARM64 as
+// hook_NtFreeVirtualMemory → guard::shutting_down() → core() while a thread exits. So every
+// hook passes such a thread straight through. Direct syscalls skip these hooks anyway; the
+// periodic sweep still judges whatever memory the thread ends up with.
+inline bool tls_ready() {
+    // TEB: NT_TIB (7 pointers), EnvironmentPointer, ClientId (2), ActiveRpcHandle, then
+    // ThreadLocalStoragePointer — pointer slot 11 on x86, x64 and ARM64 alike.
+    const auto* teb = reinterpret_cast<void* const*>(NtCurrentTeb());
+    const auto* slots = static_cast<void* const*>(teb[11]);
+    return slots && slots[_tls_index];
+}
+
 // ---------------------------------------------------------------------------------------
 // 1. NtCreateSection — the load gate.
 NTSTATUS NTAPI hook_NtCreateSection(PHANDLE section, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
                                     PLARGE_INTEGER max_size, ULONG page_protection, ULONG allocation, HANDLE file) {
     if (is_token(section, 0)) return canary(0);
+    if (!tls_ready()) {
+        return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
+    }
     const bool image = (allocation & nt::kSecImage) != 0 && (allocation & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
     if (!image || !file || guard::shutting_down() || gate::own_read_on_this_thread()) {  // fast path
         return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
@@ -72,6 +93,10 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
                                        SIZE_T commit, PLARGE_INTEGER offset, PSIZE_T view_size, ULONG inherit,
                                        ULONG allocation, ULONG protect) {
     if (is_token(base, 1)) return canary(1);
+    if (!tls_ready()) {
+        return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
+                                       allocation, protect);
+    }
     if (guard::shutting_down() || !execguard::is_current_process(process)) {
         return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
                                        allocation, protect);
@@ -105,6 +130,9 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
 // 3. NtUnmapViewOfSection — forget what is gone.
 NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
     if (is_token(base, 2)) return canary(2);
+    if (!tls_ready()) {
+        return real_NtUnmapViewOfSection(process, base);
+    }
     if (guard::shutting_down() || !base) return real_NtUnmapViewOfSection(process, base);
     const auto addr = reinterpret_cast<std::uintptr_t>(base);
     const bool tracked = exec::find(addr) || modules::find(addr);
@@ -124,6 +152,9 @@ NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
 NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_PTR zero_bits, PSIZE_T size,
                                             ULONG type, ULONG protect) {
     if (is_token(base, 3)) return canary(3);
+    if (!tls_ready()) {
+        return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
+    }
     if (!execguard::executable(protect) || guard::shutting_down() || !execguard::is_current_process(process)) {
         return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
     }
@@ -144,6 +175,9 @@ NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_P
 // 5. NtProtectVirtualMemory — fast path: the new protection is not executable.
 NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T size, ULONG protect, PULONG old) {
     if (is_token(base, 4)) return canary(4);
+    if (!tls_ready()) {
+        return real_NtProtectVirtualMemory(process, base, size, protect, old);
+    }
     if (!execguard::executable(protect) || guard::shutting_down() || !base || !size ||
         !execguard::is_current_process(process)) {
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
@@ -170,6 +204,9 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
 // 6. NtFreeVirtualMemory — fast path: nothing recorded at the address (lock-free lookup).
 NTSTATUS NTAPI hook_NtFreeVirtualMemory(HANDLE process, PVOID* base, PSIZE_T size, ULONG type) {
     if (is_token(base, 5)) return canary(5);
+    if (!tls_ready()) {
+        return real_NtFreeVirtualMemory(process, base, size, type);
+    }
     if (guard::shutting_down() || !base || !*base || !exec::find(reinterpret_cast<std::uintptr_t>(*base))) {
         return real_NtFreeVirtualMemory(process, base, size, type);
     }
