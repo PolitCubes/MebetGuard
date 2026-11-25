@@ -5,9 +5,10 @@
 #    build-macos-binaries). Every arch x variant is its own job and uploads its own artifact
 #    bin-<os>-<arch>-<variant>. prod = release (every module on); dev = devtest (VM, WSL and
 #    dev-mode modules off, so it runs on a VM / dev-mode CI runner). Both unsigned here.
-# 2. e2e — starts only when ALL build jobs passed; one matrix per OS, one job per feature,
-#    each runs the attack with the guard and without it.
-# 3. ci-ok — green only if every build and every e2e job is green (the master rule needs it).
+# 2. e2e — one matrix per OS, after that OS's build matrix passed; one job per feature, each
+#    runs the attack with the guard and without it.
+# 3. ci-ok — needs only the three e2e matrices and fails if any of them failed, was cancelled
+#    or skipped (an e2e is skipped when its build failed), so a failed build fails it too.
 # 4. sign — release tags only (skipped on pull requests).
 name: CI
 
@@ -121,9 +122,9 @@ jobs:
           name: bin-macos-${{ matrix.arch }}-${{ matrix.variant }}
           path: dist/${{ matrix.kind }}/
 
-  # ==================== 2. e2e — only after every build job passed ===================
+  # ====================== 2. e2e — after the build of the same OS ======================
   e2e-windows:
-    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries]
+    needs: build-windows-binaries
     name: windows ${{ matrix.feature }}
     runs-on: windows-2022
     timeout-minutes: 15
@@ -168,7 +169,7 @@ jobs:
             --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll"
 
   e2e-linux:
-    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries]
+    needs: build-linux-binaries
     name: linux ${{ matrix.feature }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -196,7 +197,7 @@ jobs:
             --guard "$PWD/guard/x86-64-linux/MebetGuard" --java "$JAVA_HOME"
 
   e2e-macos:
-    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries]
+    needs: build-macos-binaries
     name: macos ${{ matrix.feature }}
     runs-on: macos-15
     timeout-minutes: 15
@@ -223,14 +224,14 @@ jobs:
           /tmp/venv/bin/pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
             --guard "$PWD/guard/arm64-macosx/MebetGuard" --java "$JAVA_HOME"
 
-  # ================= 3. ci-ok — green only if builds and e2e are all green ================
+  # ======== 3. ci-ok — red if any e2e failed / was cancelled / skipped (= build failed) ======
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [build-windows-binaries, build-linux-binaries, build-macos-binaries, e2e-windows, e2e-linux, e2e-macos]
+    needs: [e2e-windows, e2e-linux, e2e-macos]
     runs-on: ubuntu-24.04
     steps:
-      - name: every build and e2e job must be green
+      - name: every e2e matrix (and so every build) must be green
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
         run: exit 1
       - name: all green
