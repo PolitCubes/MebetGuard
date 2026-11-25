@@ -48,13 +48,17 @@ public final class MebetBench {
         if (name.equals("startup")) return;
         if (name.equals("list")) {
             List<String> names = new ArrayList<>(List.of("cpu_hash", "cpu_sort", "cpu_math", "alloc_young",
-                    "alloc_huge", "threads", "class_load", "jni_deflate", "game_tick"));
+                    "alloc_huge", "threads", "class_load", "jni_deflate", "game_tick", "frame_pacing"));
             if (ffm() != null) names.addAll(List.of("native_alloc", "file_mmap", "ffm_downcall"));
             System.out.println("BENCHES " + String.join(" ", names));
             return;
         }
         double warmupS = args.length > 1 ? Double.parseDouble(args[1]) : 3;
         double measureS = args.length > 2 ? Double.parseDouble(args[2]) : 10;
+        if (name.equals("frame_pacing")) {
+            framePacing(warmupS, measureS);
+            return;
+        }
         Round r = round(name);
         long end = System.nanoTime() + (long) (warmupS * 1e9);
         do {
@@ -279,40 +283,109 @@ public final class MebetBench {
             }
         }
 
-        // 360 ticks (6 s of a 60 FPS game): parallel physics, a spatial grid rebuilt from scratch, collisions per cell,
-        // and temporary vector objects — the garbage a real game makes every frame.
+        // 360 ticks (6 s of a 60 FPS game).
         void round() {
+            for (int t = 0; t < 360; t++) tick();
+        }
+
+        // One tick: parallel physics, a spatial grid rebuilt from scratch, collisions per cell,
+        // and temporary vector objects — the garbage a real game makes every frame.
+        void tick() {
             final double dt = 1.0 / 60;
-            for (int tick = 0; tick < 360; tick++) {
-                IntStream.range(0, N).parallel().forEach(i -> {
-                    vy[i] -= 9.8 * dt;
-                    x[i] += vx[i] * dt;
-                    y[i] += vy[i] * dt;
-                    if (x[i] < 0 || x[i] > 1000) vx[i] = -vx[i];
-                    if (y[i] < 0) { y[i] = 0; vy[i] = -vy[i] * 0.9; }
-                    if (y[i] > 1000) vy[i] = -Math.abs(vy[i]);
-                });
-                HashMap<Long, ArrayList<Integer>> grid = new HashMap<>();
-                for (int i = 0; i < N; i++) {
-                    long key = ((long) (x[i] / 25) << 32) ^ (long) (y[i] / 25);
-                    grid.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
-                }
-                long hits = 0;
-                for (ArrayList<Integer> cell : grid.values()) {
-                    for (int a = 0; a < cell.size(); a++) {
-                        for (int b = a + 1; b < cell.size(); b++) {
-                            int i = cell.get(a), j = cell.get(b);
-                            double dx = x[i] - x[j], dy = y[i] - y[j];
-                            if (dx * dx + dy * dy < 4) hits++;
-                        }
+            IntStream.range(0, N).parallel().forEach(i -> {
+                vy[i] -= 9.8 * dt;
+                x[i] += vx[i] * dt;
+                y[i] += vy[i] * dt;
+                if (x[i] < 0 || x[i] > 1000) vx[i] = -vx[i];
+                if (y[i] < 0) { y[i] = 0; vy[i] = -vy[i] * 0.9; }
+                if (y[i] > 1000) vy[i] = -Math.abs(vy[i]);
+            });
+            HashMap<Long, ArrayList<Integer>> grid = new HashMap<>();
+            for (int i = 0; i < N; i++) {
+                long key = ((long) (x[i] / 25) << 32) ^ (long) (y[i] / 25);
+                grid.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
+            }
+            long hits = 0;
+            for (ArrayList<Integer> cell : grid.values()) {
+                for (int a = 0; a < cell.size(); a++) {
+                    for (int b = a + 1; b < cell.size(); b++) {
+                        int i = cell.get(a), j = cell.get(b);
+                        double dx = x[i] - x[j], dy = y[i] - y[j];
+                        if (dx * dx + dy * dy < 4) hits++;
                     }
                 }
-                for (int i = 0; i < N; i++) {
-                    Vec v = new Vec(x[i], y[i]).add(new Vec(vx[i], vy[i]).scale(dt));
-                    hits += (long) v.x & 1;
-                }
-                SINK += hits;
             }
+            for (int i = 0; i < N; i++) {
+                Vec v = new Vec(x[i], y[i]).add(new Vec(vx[i], vy[i]).scale(dt));
+                hits += (long) v.x & 1;
+            }
+            SINK += hits;
         }
+    }
+
+    // ---- frame pacing: a 144 FPS loop, every frame timed ------------------------------------------
+
+    // Each frame: a game tick, software rendering of every entity into a 1280×720 framebuffer, a
+    // little garbage — then it waits for its 6.94 ms slot. The work time of every frame is kept, so
+    // a hitch (a frame that missed its slot) shows up even if the average does not move: that is
+    // where the guard's periodic checks (every 5 s) would hurt a game, if they did. The window is
+    // 30 s at least — six rounds of those checks.
+    static void framePacing(double warmupS, double measureS) {
+        final int w = 1280, h = 720;
+        final long budget = 1_000_000_000L / 144;
+        final int[] fb = new int[w * h];
+        final Game game = new Game();
+        Runnable frame = () -> {
+            game.tick();
+            for (int i = 0; i < fb.length; i += 4) fb[i] = 0xFF202830 + (i & 0xFF);  // clear
+            for (int i = 0; i < Game.N; i++) {                                       // draw sprites
+                int px = (int) (game.x[i] * (w - 8) / 1000), py = (int) (game.y[i] * (h - 8) / 1000);
+                if (px < 0 || py < 0 || px >= w - 8 || py >= h - 8) continue;
+                for (int dy = 0; dy < 8; dy++) {
+                    int row = (py + dy) * w + px;
+                    for (int dx = 0; dx < 8; dx++) fb[row + dx] = 0xFFE0A040 ^ (i << 4);
+                }
+            }
+            StringBuilder hud = new StringBuilder();                                 // per-frame garbage
+            for (int i = 0; i < 32; i++) hud.append("fps ").append(i).append(' ');
+            SINK += hud.length() + fb[(int) (SINK & 0xFFFF)];
+        };
+        long end = System.nanoTime() + (long) (warmupS * 1e9);
+        while (System.nanoTime() < end) frame.run();
+        final long window = (long) (Math.max(measureS, 30) * 1e9);
+        long[] work = new long[(int) (window / budget) + 1024];
+        int n = 0, over = 0;
+        final long start = System.nanoTime(), stop = start + window;
+        long next = start;
+        while (System.nanoTime() < stop && n < work.length) {
+            long t0 = System.nanoTime();
+            frame.run();
+            long dt = System.nanoTime() - t0;
+            work[n++] = dt;
+            if (dt > budget) over++;
+            next += budget;
+            long wait = next - System.nanoTime();
+            if (wait <= 0) {
+                next = System.nanoTime();  // behind schedule: start the next frame at once
+                continue;
+            }
+            if (wait > 300_000) java.util.concurrent.locks.LockSupport.parkNanos(wait - 300_000);
+            while (System.nanoTime() < next) Thread.onSpinWait();
+        }
+        long[] s = Arrays.copyOf(work, n);
+        Arrays.sort(s);
+        long sum = 0;
+        for (long v : s) sum += v;
+        StringBuilder sb = new StringBuilder();
+        sb.append("BENCH {\"name\":\"frame_pacing\",\"frames\":").append(n)
+          .append(",\"budget_ms\":").append(fmt(budget / 1e6))
+          .append(",\"mean_ms\":").append(fmt(sum / 1e6 / n))
+          .append(",\"p50_ms\":").append(fmt(s[n / 2] / 1e6))
+          .append(",\"p99_ms\":").append(fmt(s[(int) (n * 0.99)] / 1e6))
+          .append(",\"p999_ms\":").append(fmt(s[Math.min(n - 1, (int) (n * 0.999))] / 1e6))
+          .append(",\"max_ms\":").append(fmt(s[n - 1] / 1e6))
+          .append(",\"over_budget\":").append(over)
+          .append(",\"sink\":").append(SINK & 1).append('}');
+        System.out.println(sb);
     }
 }

@@ -276,7 +276,16 @@ void init_engine(const std::wstring& java_home) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&init_engine), &self);
     s.self_known = identity_of_path(win::module_path(self), s.self_id);
+    const DWORD self_err = GetLastError();
     s.exe_known = identity_of_path(win::module_path(nullptr), s.exe_id);
+    const DWORD exe_err = GetLastError();
+    // Test builds: say when our own files cannot be identified — they would be refused next.
+    if (config::kTestBuild && (!s.self_known || !s.exe_known)) {
+        std::fprintf(stderr, "[Mebet] own identity: agent=%s (error %lu) exe=%s (error %lu) %s\n",
+                     s.self_known ? "yes" : "no", s.self_known ? 0ul : self_err, s.exe_known ? "yes" : "no",
+                     s.exe_known ? 0ul : exe_err, to_utf8(win::module_path(nullptr)).c_str());
+        std::fflush(stderr);
+    }
 
     // Catalog infrastructure check: kernel32.dll is catalog-signed on every Windows.
     const std::wstring k32 = win::system_dir() + L"\\kernel32.dll";

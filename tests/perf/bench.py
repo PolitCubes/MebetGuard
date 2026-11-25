@@ -40,6 +40,7 @@ WHAT = {
     "class_load": "4000 классов в новых загрузчиках",
     "jni_deflate": "zip-сжатие 30 × 256 КБ (JNI)",
     "game_tick": "360 игровых тиков: физика, сетка, мусор, параллельно",
+    "frame_pacing": "кадр 144 FPS: тик + отрисовка 1280×720, окно 30 с (среднее время кадра)",
     "native_alloc": "1000 нативных блоков по 1 МБ (VirtualAlloc/Free)",
     "file_mmap": "2000 отображений файла по 4 МБ",
     "ffm_downcall": "30 млн нативных вызовов через FFM",
@@ -121,6 +122,7 @@ def main():
         names = [n for n in names if n in set(a.only.split(","))]
 
     values = {n: {"baseline": [], "guarded": []} for n in ["startup"] + names}
+    frames = {"baseline": [], "guarded": []}  # frame_pacing: the full BENCH record per run
     spent = {}  # module -> list of ms per guarded run
 
     def one(mode, args):
@@ -145,7 +147,10 @@ def main():
                 m = re.search(r"BENCH (\{.*\})", out)
                 if not m:
                     sys.exit("no BENCH line from %s %s:\n%s" % (mode, name, out))
-                values[name][mode].append(json.loads(m.group(1))["mean_ms"])
+                rec = json.loads(m.group(1))
+                values[name][mode].append(rec["mean_ms"])
+                if name == "frame_pacing":
+                    frames[mode].append(rec)
         print("rep %d/%d done" % (rep + 1, a.reps), flush=True)
 
     rows, ratios = [], []
@@ -159,7 +164,7 @@ def main():
             ratios.append(g / b)
     mean = (math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1) * 100 if ratios else 0.0
 
-    md = render(rows, mean, spent, a.reps, a.warmup, a.measure)
+    md = render(rows, mean, spent, a.reps, a.warmup, a.measure, frames)
     print(md)
     if a.markdown:
         Path(a.markdown).write_text(md, encoding="utf-8")
@@ -179,7 +184,25 @@ def _spread(xs):
     return (max(xs) - min(xs)) / med * 100 if med else 0.0
 
 
-def render(rows, mean, spent, reps, warmup, measure):
+def render_frames(frames):
+    """Frame pacing: the tail of the frame-time distribution, where stutter lives."""
+    if not frames["baseline"] or not frames["guarded"]:
+        return []
+    med = lambda mode, key: statistics.median(r[key] for r in frames[mode])  # noqa: E731
+    budget = frames["baseline"][0]["budget_ms"]
+    lines = ["#### Плавность кадров (144 FPS, бюджет кадра %.2f мс)" % budget, "",
+             "Время работы каждого кадра за окно 30 с; медиана по повторам. Фризы прячутся в хвосте "
+             "(p99, p99.9, максимум) и в числе кадров, не уложившихся в бюджет.", "",
+             "| | p50 | p99 | p99.9 | максимум | не уложились в бюджет | кадров |",
+             "|---|---:|---:|---:|---:|---:|---:|"]
+    for mode, label in (("baseline", "без гварда"), ("guarded", "с гвардом")):
+        lines.append("| %s | %.2f мс | %.2f мс | %.2f мс | %.2f мс | %d | %d |" % (
+            label, med(mode, "p50_ms"), med(mode, "p99_ms"), med(mode, "p999_ms"), med(mode, "max_ms"),
+            med(mode, "over_budget"), med(mode, "frames")))
+    return lines + [""]
+
+
+def render(rows, mean, spent, reps, warmup, measure, frames=None):
     lines = ["### Сколько стоит страж", "",
              ("Каждая нагрузка: прогрев %g с, затем окно замера не меньше %g с; значение — среднее "
               "время раунда в окне (с паузами GC). Медиана по %d повторам, режимы чередуются. "
@@ -193,6 +216,8 @@ def render(rows, mean, spent, reps, warmup, measure):
         lines.append("| `%s` | %s | %.1f мс | %.1f мс | %s | ±%.1f %% |" % (
             r["name"], r["what"], r["baseline_ms"], r["guarded_ms"], diff, r["noise_pct"] / 2))
     lines += ["", "**В среднем по нагрузкам (без запуска): %+.1f %%.**" % mean, ""]
+    if frames:
+        lines += render_frames(frames)
     if spent:
         lines += ["<details><summary>На что тратит время сам страж (за один запуск)</summary>", "",
                   "| модуль | мс, медиана | мс, максимум |", "|---|---:|---:|"]
