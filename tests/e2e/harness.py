@@ -470,9 +470,16 @@ def guard_ok(ctx, sc, guarded, exp=None):
         return True, "работает, страж не мешает"
 
     if g == "known_limit":
+        # The limit only shows when the attack really reached a running game: closed before it
+        # (CI once closed the game with 209 before the probe ran), the run proves nothing either way.
+        if guarded["exit"] != 0 or not has(guarded, "TARGET exit"):
+            return False, "через гвард не доработало (exit %s) — ограничение не проверено" % guarded["exit"]
         if has(guarded, sc["marker"]):
             return "xfail", ("известное ограничение Windows: администратор с SeDebugPrivilege открывает "
                              "любой процесс мимо DACL — дальше его ловят другие слои")
+        for rx in sc["proof"]:
+            if not re.search(rx, guarded["out"]):
+                return False, "атака не была проведена так, как ждали (нет %r) — проверка ничего не доказала" % rx
         return True, "не пустило даже администратора"
 
     if has(guarded, sc["marker"]):
