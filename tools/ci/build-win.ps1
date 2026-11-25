@@ -9,7 +9,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $b = "build/$Dir-$Kind"
-cmake -S . -B $b -G "Visual Studio 17 2022" -A $Platform -DMEBET_BUILD_KIND=$Kind -DMEBET_JAVA_HOME="$env:JAVA_HOME_21_X64"
+# Quote the -D args: PowerShell does not expand $Kind in a bare token that starts with '-'.
+cmake -S . -B $b -G "Visual Studio 17 2022" -A $Platform "-DMEBET_BUILD_KIND=$Kind" "-DMEBET_JAVA_HOME=$env:JAVA_HOME_21_X64"
 if ($LASTEXITCODE) { throw "configure failed" }
 cmake --build $b --config Release --parallel
 if ($LASTEXITCODE) { throw "build failed" }
