@@ -60,17 +60,18 @@ jobs:
           Copy-Item build\src\windows\Release\*.pdb dist\symbols\
           Get-FileHash dist\${{ matrix.dir }}\* -Algorithm SHA256 | Format-Table -AutoSize | Out-String -Width 200
 
-      # e2e fixture: a marker-only "cheat" DLL the target loads via System.load (module_trust
-      # layer). Unsigned and outside the Java folder, so the guard must refuse it (210). Built
-      # here with MSVC and shipped in the test artifact; the stand downloads it and runs tests/e2e.
-      - name: "e2e fixture — cheat DLL (marker only)"
+      # e2e fixture: a marker-only unsigned "cheat" native the target loads via System.load
+      # (module_trust, 210) or that is passed as a foreign -agentpath (jvm_agents, 208). Not a
+      # cheat — it only writes a marker. Built here with MSVC and shipped in the test artifact;
+      # the stand downloads it and runs tests/e2e against the matching guard build.
+      - name: "e2e fixture — unsigned native (marker only)"
         if: matrix.kind == 'test'
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $vc = switch ('${{ matrix.arch }}') { 'x64' { 'vcvars64.bat' } 'x86' { 'vcvars32.bat' } 'arm64' { 'vcvarsamd64_arm64.bat' } }
           New-Item -ItemType Directory -Force dist\fixtures | Out-Null
-          cmd /c "`"$vs\VC\Auxiliary\Build\$vc`" && cl /nologo /LD tests\e2e\attacks\native\mebet_cheat_dll.c /Fe:dist\fixtures\mebet_cheat.dll"
+          cmd /c "`"$vs\VC\Auxiliary\Build\$vc`" && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fe:dist\fixtures\mebet_fake_cheat.dll"
           Remove-Item dist\fixtures\*.obj, dist\fixtures\*.lib, dist\fixtures\*.exp -ErrorAction SilentlyContinue
           Get-ChildItem dist\fixtures
 
@@ -181,7 +182,7 @@ jobs:
           export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
           /opt/python/cp312-cp312/bin/python tests/e2e/run.py \
             --guard dist/${{ matrix.dir }}/MebetGuard --java "$JAVA_HOME" \
-            --only env_hardening,jvm_agents --json e2e-${{ matrix.arch }}.json
+            --json e2e-${{ matrix.arch }}.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -233,9 +234,24 @@ jobs:
         run: |
           python3 tests/e2e/run.py \
             --guard dist/arm64-macosx/MebetGuard --java "$JAVA_HOME" \
-            --only env_hardening,jvm_agents --json e2e-macos.json
+            --json e2e-macos.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: mebet-macos-${{ matrix.kind }}
           path: dist/
+
+  # The whole e2e in a container: the Dockerfile builds the guard (test/novm) and runs the
+  # layer suite inside the image. This is the "в контейнере" path end to end.
+  e2e-container:
+    name: e2e container (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the e2e image and run the layer suite
+        run: |
+          docker build -f tests/e2e/Dockerfile -t mebet-e2e .
+          docker run --rm mebet-e2e

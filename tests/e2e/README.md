@@ -16,6 +16,20 @@ python tests/e2e/run.py --guard <MebetGuard.exe> --java <JAVA_HOME> [--only id,i
                         [--untrusted-native <lib>] [--work <dir>] [--json <out>]
 ```
 
+## В контейнере
+
+Весь прогон целиком в Docker — внутри контейнера собирается страж (test/novm, без детекта
+ВМ/WSL) и гоняется набор:
+
+```
+docker build -f tests/e2e/Dockerfile -t mebet-e2e .
+docker run --rm mebet-e2e                       # все применимые слои, ненулевой код при провале
+docker run --rm mebet-e2e --only jvm_agents_javaagent
+```
+
+Так проверяются слои старта (окружение, чужие агенты) на Linux. Слои инъекции в память —
+Windows-only (см. ниже) и идут на стенде.
+
 Раннер сам собирает цель (`target/MebetTarget.java`), агент-маркер (`attacks/MebetMarkerAgent.java`
 → `mebet-marker.jar`) и неподписанный натив (`attacks/native/mebet_fake_cheat.c`, компилятором
 `clang`/`cl`/`gcc`; если его нет — сценарии с нативом пропускаются или натив передаётся через
@@ -44,7 +58,8 @@ CI собирает обе на каждой системе. e2e для всех
 | `env_hardening` | чужой агент через `JAVA_TOOL_OPTIONS` | нейтрализовать (очистить env) | — | ✅ |
 | `jvm_agents` | чужой `-javaagent` в строке | закрыть | 208 | ✅ |
 | `module_trust` | `System.load` неподписанного натива | закрыть | 210 | ✅ |
-| `jvm_agents` | `-agentpath` / `-agentlib` чужой | закрыть | 208 | 🟡 |
+| `jvm_agents` | `-agentpath` чужой нативный агент | закрыть | 208 | ✅ |
+| `env_hardening` | чужой агент через `JDK_JAVA_OPTIONS` | нейтрализовать | — | ✅ |
 | `jvm_agents` | агент-модуль JDK (`instrument.dll` и т.п.) | закрыть | 217 | ⬜ |
 | `jvm_agents` | внешний attach к JVM | закрыть | 216 | ⬜ |
 | `proxy_dll` | прокси-DLL рядом с exe | закрыть | 206 | ⬜ (Windows) |
@@ -80,9 +95,10 @@ CI собирает обе на каждой системе. e2e для всех
 (`System.load`), выделяет исполняемую память, стартует чужой поток — ровно то, что делает мод.
 Так проверка не зависит от отдельного инструмента-инжектора.
 
-`module_trust` использует неподписанную чит-DLL (`attacks/native/mebet_cheat_dll.c`, только
-маркер) — она собирается в CI и кладётся в тестовый артефакт (`dist/fixtures/mebet_cheat.dll`);
-на стенде её выкачивают и передают раннеру через `--untrusted-native`.
+`module_trust` и `jvm_agents` (`-agentpath`) используют одну неподписанную натив-заглушку
+(`attacks/native/mebet_fake_cheat.c`, только маркер: экспортирует `JNI_OnLoad`, `Agent_OnLoad`,
+`Agent_OnAttach`) — в контейнере её собирает `gcc`, в Windows-CI — MSVC в тестовый артефакт
+(`dist/fixtures/mebet_fake_cheat.dll`); на стенде её выкачивают и передают через `--untrusted-native`.
 
 Внешняя инъекция из другого процесса (`CreateRemoteThread` и т.п.) закрывается DACL процесса
 (`process_dacl`): его e2e проверяет, что процесс стража нельзя открыть с правами на запись

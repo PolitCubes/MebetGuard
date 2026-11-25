@@ -158,26 +158,46 @@ def has(run, text):
 # Each scenario: id, title, module (config/modules.json), os set, the attack set-up, the text
 # that proves the attack worked, and what the guard must do: close:<reason> | neutralize.
 
+ALL = {"windows", "linux", "macos"}
+
+
 def scenarios(ctx, marker_jar, native):
     agent = "-javaagent:" + str(marker_jar)
     AGENT_MARK = "ATTACK agent premain ran"
     s = []
 
+    # env_hardening (level on): the wrapper clears the Java env vars, so a cheat agent smuggled
+    # through them never loads. The guard does not close — the app runs without the agent.
     s.append(dict(
-        id="env_hardening", module="env_hardening", os={"windows", "linux", "macos"},
+        id="env_hardening_jto", module="env_hardening", os=ALL,
         title="Чужой агент через JAVA_TOOL_OPTIONS",
         setup=dict(extra_env={"JAVA_TOOL_OPTIONS": agent}),
         attack_marker=AGENT_MARK, guard="neutralize"))
-
     s.append(dict(
-        id="jvm_agents", module="jvm_agents", os={"windows", "linux", "macos"},
-        title="Чужой -javaagent в командной строке",
+        id="env_hardening_jdk", module="env_hardening", os=ALL,
+        title="Чужой агент через JDK_JAVA_OPTIONS",
+        setup=dict(extra_env={"JDK_JAVA_OPTIONS": agent}),
+        attack_marker=AGENT_MARK, guard="neutralize"))
+
+    # jvm_agents (level close): a foreign agent passed on the command line closes the client.
+    s.append(dict(
+        id="jvm_agents_javaagent", module="jvm_agents", os=ALL,
+        title="Чужой -javaagent (Java-агент)",
         setup=dict(jvm_args=[agent]),
         attack_marker=AGENT_MARK, guard="close:foreign_agent_arg"))
 
     if native is not None:
         s.append(dict(
-            id="module_trust", module="module_trust", os={"windows"},
+            id="jvm_agents_agentpath", module="jvm_agents", os=ALL,
+            title="Чужой -agentpath (нативный JVMTI-агент)",
+            setup=dict(jvm_args=["-agentpath:" + str(native)]),
+            attack_marker="ATTACK native Agent_OnLoad", guard="close:foreign_agent_arg"))
+
+        # module_trust (level close): a mod loads an unsigned native with System.load. On
+        # Windows the NtCreateSection gate refuses it (210); the Linux/macOS in-process gate
+        # is not wired yet (see README), so this layer is Windows-only for now.
+        s.append(dict(
+            id="module_trust_load", module="module_trust", os={"windows"},
             title="System.load неподписанной нативной библиотеки",
             setup=dict(action="load-native " + str(native)),
             attack_marker="TARGET did load-native", guard="close:untrusted_module"))
