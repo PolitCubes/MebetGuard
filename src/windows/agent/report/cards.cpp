@@ -58,6 +58,20 @@ void build_prefixes(Prefixes& p) {
     p.ready = true;
 }
 
+// Where the volume part of a path with no drive letter ends (the "\" after it):
+// "\\?\GLOBALROOT\Device\HarddiskVolume7\…", "\Device\HarddiskVolume7\…", "\\?\Volume{…}\…".
+// npos for any other path. `low` is lower-cased.
+std::size_t letterless_root_end(const std::wstring& low) {
+    std::size_t at = 0;
+    if (low.compare(0, 14, L"\\\\?\\globalroot") == 0) at = 14;
+    if (low.compare(at, 8, L"\\device\\") == 0) return low.find(L'\\', at + 8);
+    if (low.compare(0, 11, L"\\\\?\\volume{") == 0) {
+        const auto close = low.find(L'}');
+        return close == std::wstring::npos ? std::wstring::npos : close + 1;
+    }
+    return std::wstring::npos;
+}
+
 std::string json_string_or_null(const std::string& s) {
     JsonWriter w;
     if (s.empty()) w.null_value(); else w.value(s);
@@ -224,11 +238,19 @@ std::string anonymize(const std::wstring& path) {
         }
     }
     ReleaseSRWLockExclusive(&p.lock);
-    // Any other user folder: hide the name.
-    const std::wstring users = L":\\Users\\";
-    const auto pos = lower_ascii(out).find(lower_ascii(users));
-    if (pos != std::wstring::npos) {
-        const auto start = pos + users.size();
+    // Any other user folder: hide the name — "C:\Users\<user>\…", and the same on a volume with no
+    // DOS name ("\\?\GLOBALROOT\Device\HarddiskVolume7\Users\…"), which none of the prefixes match.
+    const std::wstring low = lower_ascii(out);
+    const std::wstring users = L"\\users\\";
+    std::size_t start = std::wstring::npos;
+    const auto drive = low.find(L":" + users);
+    if (drive != std::wstring::npos) {
+        start = drive + 1 + users.size();
+    } else {
+        const auto root = letterless_root_end(low);
+        if (root != std::wstring::npos && low.compare(root, users.size(), users) == 0) start = root + users.size();
+    }
+    if (start != std::wstring::npos) {
         const auto end = out.find(L'\\', start);
         out = out.substr(0, start) + L"<user>" + (end == std::wstring::npos ? std::wstring() : out.substr(end));
     }

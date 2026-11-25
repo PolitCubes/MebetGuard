@@ -104,6 +104,15 @@ void check_jvm_library(const wchar_t* name, const std::wstring& expected_dir) {
     if (!m) return;
     const std::wstring path = win::mapped_file_name(m);
     if (path.empty() || win::path_under(path, expected_dir)) return;
+    // The same folder under another name — JAVA_HOME through a junction or an 8.3 name, on a volume
+    // mounted into a folder: both sides as the file system names them.
+    const std::wstring file = win::canonical_path(path), dir = win::canonical_path(expected_dir);
+    if (!file.empty() && !dir.empty() && win::path_under(file, dir)) return;
+    if (config::kTestBuild) {  // test builds: which path was judged, so a failed e2e run says why
+        std::fprintf(stderr, "[Mebet] jvm library outside the client Java: %s (%s) not under %s (%s)\n",
+                     to_utf8(path).c_str(), to_utf8(file).c_str(), to_utf8(expected_dir).c_str(), to_utf8(dir).c_str());
+        std::fflush(stderr);
+    }
     report::Event ev;
     ev.type = "close.jvm_path";
     ev.level = report::Level::error;

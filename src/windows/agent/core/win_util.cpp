@@ -186,6 +186,42 @@ std::vector<std::wstring> list_dir(const std::wstring& dir, bool* had_subdirs) {
     return out;
 }
 
+namespace {
+
+// GetFinalPathNameByHandleW into a string of any length; empty on failure.
+std::wstring final_name(HANDLE h, DWORD flags) {
+    wchar_t small[MAX_PATH + 8];
+    DWORD n = GetFinalPathNameByHandleW(h, small, MAX_PATH + 8, flags);
+    if (n == 0) return std::wstring();
+    if (n < MAX_PATH + 8) return std::wstring(small, n);
+    std::wstring big(n, L'\0');  // n counts the terminating zero here
+    n = GetFinalPathNameByHandleW(h, &big[0], n, flags);
+    if (n == 0 || n >= big.size()) return std::wstring();
+    big.resize(n);
+    return big;
+}
+
+// A file or folder opened only to ask for its name: no data access, so share modes do not stand
+// in the way of a file the loader has mapped.
+HANDLE open_for_name(const std::wstring& path) {
+    return CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+// The DOS root of a volume ("\Device\HarddiskVolume3") from the mount manager: "C:", or
+// "C:\Mount\Data" for a volume mounted only into a folder; empty when it has none. Asked through
+// the volume's root folder, so WOW64 never redirects it.
+std::wstring dos_root_of_volume(const std::wstring& device) {
+    const HANDLE h = open_for_name(L"\\\\?\\GLOBALROOT" + device + L"\\");
+    if (h == INVALID_HANDLE_VALUE) return std::wstring();
+    std::wstring root = strip_long_prefix(final_name(h, FILE_NAME_OPENED | VOLUME_NAME_DOS));
+    CloseHandle(h);
+    while (!root.empty() && (root.back() == L'\\' || root.back() == L'/')) root.pop_back();
+    return root;
+}
+
+}  // namespace
+
 std::wstring nt_to_dos(const std::wstring& nt_path) {
     // Drive letters, refreshed on every call: a game can mount a drive while running.
     wchar_t drives[512];
@@ -202,12 +238,37 @@ std::wstring nt_to_dos(const std::wstring& nt_path) {
         }
     }
     if (istarts_with(nt_path, L"\\Device\\Mup\\")) return L"\\\\" + nt_path.substr(12);
-    // A volume with no drive letter this token can see: mounted into a folder, or lettered only in
-    // another logon session (CI: a standard-user token next to the elevated runner). Returned as it
-    // is, the NT path could not be opened, the file was "unreadable" and refused — the guard closed
-    // the game on its own exe. The GLOBALROOT form is the same path, open to every Win32 file API.
-    if (istarts_with(nt_path, L"\\Device\\")) return L"\\\\?\\GLOBALROOT" + nt_path;
+    if (istarts_with(nt_path, L"\\Device\\")) {
+        // No letter matched. QueryDosDeviceW must query the logon session's \?? folder, and its DACL
+        // lets in only SYSTEM, Administrators and its owner — Administrators again when an elevated
+        // token created it. A standard-user token made from an elevated one (`runas /trustlevel`, a
+        // launcher dropping its rights, the CI "game as a user") has Administrators deny-only: every
+        // lookup is refused, C: too. The raw NT path cannot be opened (the guard refused its own exe,
+        // 212), and a GLOBALROOT path compares unequal to every DOS folder (jvm.dll "outside the
+        // client Java", 209; the WOW64 layer "hidden", 214). The mount manager answers any token —
+        // and also names a volume mounted only into a folder.
+        const std::size_t end = nt_path.find(L'\\', 8);
+        if (end != std::wstring::npos) {
+            const std::wstring root = dos_root_of_volume(nt_path.substr(0, end));
+            if (!root.empty()) return root + nt_path.substr(end);
+        }
+        // A volume with no DOS name at all: the GLOBALROOT form still opens with every Win32 file API.
+        return L"\\\\?\\GLOBALROOT" + nt_path;
+    }
     return nt_path;
+}
+
+std::wstring canonical_path(const std::wstring& path) {
+    if (path.empty()) return std::wstring();
+    const HANDLE h = open_for_name(path);
+    if (h == INVALID_HANDLE_VALUE) return std::wstring();
+    std::wstring out = strip_long_prefix(final_name(h, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS));
+    if (out.empty()) {
+        const std::wstring nt = final_name(h, FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+        if (!nt.empty()) out = L"\\\\?\\GLOBALROOT" + nt;
+    }
+    CloseHandle(h);
+    return out;
 }
 
 std::wstring mapped_file_name(const void* address) {

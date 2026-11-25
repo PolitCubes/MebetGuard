@@ -42,8 +42,15 @@ bool file_exists(const std::wstring& path);
 bool dir_exists(const std::wstring& path);
 std::vector<std::wstring> list_dir(const std::wstring& dir, bool* had_subdirs = nullptr);
 
-// "\Device\HarddiskVolume3\…" → "C:\…" (kernel paths from MemoryMappedFilenameInformation).
+// "\Device\HarddiskVolume3\…" → "C:\…" (kernel paths from MemoryMappedFilenameInformation). A volume
+// whose letter this token cannot look up gets its DOS root from the mount manager (also a folder it
+// is mounted into); one with no DOS name at all comes back as "\\?\GLOBALROOT\Device\…", which every
+// Win32 file API still opens.
 std::wstring nt_to_dos(const std::wstring& nt_path);
+// An existing file or folder as the file system names it (GetFinalPathNameByHandleW): long names,
+// junctions and symbolic links resolved, the DOS form where its volume has one, else the GLOBALROOT
+// form; empty when it cannot be opened. Not for System32 paths in a WOW64 process (redirected).
+std::wstring canonical_path(const std::wstring& path);
 // Kernel path of the image/file mapped at an address (ТЗ §6: identity from the kernel, not the PEB).
 std::wstring mapped_file_name(const void* address);
 
