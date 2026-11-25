@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 PolitCubes
 #
-# Three build jobs (windows / linux / macos); inside each, one visible step per built instance,
-# so the "windows" job expands into "build x64 release", "build x64 test", ... Then one e2e job
-# per attack/defence type, each running its attack with the guard and without it.
+# Build under each OS (one visible step per arch × variant), then run the e2e features of THAT
+# OS — one job (check) per feature — then sign (tags only). Two build variants per arch:
+#   prod = release (every module on), dev = devtest (VM, WSL and dev-mode modules off, so it
+#   runs on a VM / dev-mode CI runner). Both unsigned here; only a tag build gets signed.
 name: CI
 
 on:
@@ -17,208 +18,173 @@ permissions:
   contents: read
 
 jobs:
-  # ============================ compilations: one job per OS =============================
+  # ================================ build: windows =================================
   windows:
     name: windows
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: build x64 release
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform x64 -Kind release -Dir x86-64-mustdie
-      - name: build x64 test
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform x64 -Kind test -Dir x86-64-mustdie
-      - name: build x64 devtest (dev_mode module off)
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform x64 -Kind devtest -Dir x86-64-mustdie
-      - name: build x86 release
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform Win32 -Kind release -Dir x86-mustdie
-      - name: build x86 test
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform Win32 -Kind test -Dir x86-mustdie
-      - name: build arm64 release
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform ARM64 -Kind release -Dir arm64-mustdie
-      - name: build arm64 test
-        shell: pwsh
-        run: ./tools/ci/build-win.ps1 -Platform ARM64 -Kind test -Dir arm64-mustdie
-      - name: wrapper imports only kernel32 (ТЗ §4)
+      - { name: x64 prod,   shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform x64   -Kind release -Dir x86-64-mustdie }
+      - { name: x64 dev,    shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform x64   -Kind devtest -Dir x86-64-mustdie }
+      - { name: x86 prod,   shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform Win32 -Kind release -Dir x86-mustdie }
+      - { name: x86 dev,    shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform Win32 -Kind devtest -Dir x86-mustdie }
+      - { name: arm64 prod, shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform ARM64 -Kind release -Dir arm64-mustdie }
+      - { name: arm64 dev,  shell: pwsh, run: ./tools/ci/build-win.ps1 -Platform ARM64 -Kind devtest -Dir arm64-mustdie }
+      - name: wrapper imports only kernel32
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe "$vs\VC\Tools\MSVC" | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          $deps = & $dumpbin.FullName /dependents build\x86-64-mustdie-test\src\windows\Release\MebetGuard.exe | Out-String
-          Write-Output $deps
+          $deps = & $dumpbin.FullName /dependents build\x86-64-mustdie-release\src\windows\Release\MebetGuard.exe | Out-String
           $static = ($deps -split 'Image has the following delay load dependencies:')[0]
           $names = [regex]::Matches($static, '(?im)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLower() }
           $bad = $names | Where-Object { $_ -notin @('kernel32.dll', 'ntdll.dll') }
           if ($bad) { throw "wrapper imports more than kernel32: $($bad -join ', ')" }
-      - name: e2e fixture — unsigned native (marker only)
+      - name: e2e fixture (unsigned native, marker only)
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          New-Item -ItemType Directory -Force dist\test\fixtures | Out-Null
-          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fe:dist\test\fixtures\mebet_fake_cheat.dll"
-          Remove-Item dist\test\fixtures\*.obj, dist\test\fixtures\*.lib, dist\test\fixtures\*.exp -ErrorAction SilentlyContinue
-          Get-ChildItem dist\test\fixtures
+          New-Item -ItemType Directory -Force dist\fixtures | Out-Null
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fe:dist\fixtures\mebet_fake_cheat.dll"
+          Remove-Item dist\fixtures\*.obj, dist\fixtures\*.lib, dist\fixtures\*.exp -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@v4
-        with:
-          name: windows-dist
-          path: dist/
+        with: { name: windows-dist, path: dist/ }
 
+  # ================================= build: linux ==================================
   linux:
     name: linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-      - name: build x64 release
-        run: bash tools/ci/build-posix.sh release x86-64-linux
-      - name: build x64 test
-        run: bash tools/ci/build-posix.sh test x86-64-linux
+        with: { distribution: temurin, java-version: "25" }
+      - name: aarch64 cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu
+      - { name: x64 prod,   run: bash tools/ci/build-posix.sh release x86-64-linux }
+      - { name: x64 dev,    run: bash tools/ci/build-posix.sh devtest x86-64-linux }
+      - { name: arm64 prod, run: bash tools/ci/build-posix.sh release arm64-linux -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ }
+      - { name: arm64 dev,  run: bash tools/ci/build-posix.sh devtest arm64-linux -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ }
       - uses: actions/upload-artifact@v4
-        with:
-          name: linux-dist
-          path: dist/
+        with: { name: linux-dist, path: dist/ }
 
+  # ================================= build: macos ==================================
   macos:
     name: macos
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-      - name: build universal release
-        run: |
-          bash tools/ci/build-posix.sh release arm64-macosx -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
-          mkdir -p dist/release/x86-64-macosx && cp dist/release/arm64-macosx/* dist/release/x86-64-macosx/
-      - name: build universal test
-        run: |
-          bash tools/ci/build-posix.sh test arm64-macosx -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
-          mkdir -p dist/test/x86-64-macosx && cp dist/test/arm64-macosx/* dist/test/x86-64-macosx/
+        with: { distribution: temurin, java-version: "25" }
+      - { name: x64 prod,   run: bash tools/ci/build-posix.sh release x86-64-macosx -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
+      - { name: x64 dev,    run: bash tools/ci/build-posix.sh devtest x86-64-macosx -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
+      - { name: arm64 prod, run: bash tools/ci/build-posix.sh release arm64-macosx -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
+      - { name: arm64 dev,  run: bash tools/ci/build-posix.sh devtest arm64-macosx -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 }
       - uses: actions/upload-artifact@v4
-        with:
-          name: macos-dist
-          path: dist/
+        with: { name: macos-dist, path: dist/ }
 
-  # ===================== e2e: one job per attack/defence type ===========================
-  # Cross-platform start-time layers, on the Linux build.
+  # ============================= e2e: one check per feature ========================
   e2e-linux:
     needs: linux
-    name: ${{ matrix.scenario }}
+    name: ${{ matrix.feature }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        scenario:
-          - env_hardening_jto     # агент через JAVA_TOOL_OPTIONS → чистка окружения
-          - env_hardening_jdk     # агент через JDK_JAVA_OPTIONS  → чистка окружения
-          - jvm_agents_javaagent  # -javaagent → закрытие 208
-          - jvm_agents_agentpath  # -agentpath нативный → закрытие 208
+        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
+        with: { distribution: temurin, java-version: "25" }
       - uses: actions/download-artifact@v4
-        with:
-          name: linux-dist
-          path: dist
+        with: { name: linux-dist, path: dist }
       - name: prepare
         run: |
-          chmod +x dist/test/x86-64-linux/MebetGuard
+          chmod +x dist/devtest/x86-64-linux/MebetGuard
           sudo apt-get update && sudo apt-get install -y python3-pytest
-      - name: "attack ${{ matrix.scenario }} with the guard and without it"
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          python3 -m pytest tests/e2e -v --no-header -k '${{ matrix.scenario }}' \
-            --guard "$PWD/dist/test/x86-64-linux/MebetGuard" --java "$JAVA_HOME"
+          python3 -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
+            --guard "$PWD/dist/devtest/x86-64-linux/MebetGuard" --java "$JAVA_HOME"
 
-  # Defence layer: the dev-mode-enforcing build must close on the (test-signing) Windows runner.
-  dev_mode:
-    needs: windows
-    name: dev_mode
-    runs-on: windows-2022
+  e2e-macos:
+    needs: macos
+    name: ${{ matrix.feature }}
+    runs-on: macos-15
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-          architecture: x64
+        with: { distribution: temurin, java-version: "25" }
       - uses: actions/download-artifact@v4
-        with:
-          name: windows-dist
-          path: dist
-      - name: the enforcing build closes with 203 on a dev-mode runner
-        shell: pwsh
-        env:
-          MEBET_TEST_NO_UI: "1"
+        with: { name: macos-dist, path: dist }
+      - name: prepare
         run: |
-          # The normal test build keeps dev_mode on, so it must refuse this dev-mode machine.
-          New-Item -ItemType Directory -Force tests\out | Out-Null
-          & "$env:JAVA_HOME\bin\javac.exe" -d tests\out tests\e2e\target\MebetTarget.java
-          $p = Start-Process dist\test\x86-64-mustdie\MebetGuard.exe -ArgumentList '-Dmebet.iters=2','-cp','tests\out','MebetTarget' -NoNewWindow -PassThru -Wait -RedirectStandardError e.txt -RedirectStandardOutput o.txt
-          Get-Content o.txt, e.txt
-          if ($p.ExitCode -ne 203) { throw "ждали 203 (dev_mode), получили $($p.ExitCode)" }
-          Write-Output '::notice::enforcing build closed with 203 on the dev-mode runner as required'
+          chmod +x dist/devtest/arm64-macosx/MebetGuard
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        run: |
+          /tmp/venv/bin/pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' \
+            --guard "$PWD/dist/devtest/arm64-macosx/MebetGuard" --java "$JAVA_HOME"
 
-  # Windows-only memory layers, on the devtest build (its dev_mode module is off).
   e2e-windows:
     needs: windows
-    name: ${{ matrix.scenario }}
+    name: ${{ matrix.feature }}
     runs-on: windows-2022
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        scenario:
-          - module_trust_load   # System.load неподписанного натива → закрытие 210
+        include:
+          - { feature: env_hardening_jto,    kind: devtest }
+          - { feature: env_hardening_jdk,    kind: devtest }
+          - { feature: jvm_agents_javaagent, kind: devtest }
+          - { feature: jvm_agents_agentpath, kind: devtest }
+          - { feature: module_trust_load,    kind: devtest }
+          - { feature: dev_mode,             kind: release }   # prod build must close (203) here
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-          architecture: x64
+        with: { distribution: temurin, java-version: "25", architecture: x64 }
       - uses: actions/download-artifact@v4
-        with:
-          name: windows-dist
-          path: dist
+        with: { name: windows-dist, path: dist }
       - name: install pytest
         shell: pwsh
         run: python -m pip install -q pytest
-      - name: "attack ${{ matrix.scenario }} with the guard and without it"
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
         shell: pwsh
         run: |
-          # devtest build = the dev_mode module is off, so the guard starts on this dev-mode runner.
-          python -m pytest tests/e2e -v --no-header -k '${{ matrix.scenario }}' `
-            --guard "$pwd\dist\devtest\x86-64-mustdie\MebetGuard.exe" --java "$env:JAVA_HOME" `
-            --untrusted-native "$pwd\dist\test\fixtures\mebet_fake_cheat.dll"
+          python -m pytest tests/e2e -v --no-header -k '${{ matrix.feature }}' `
+            --guard "$pwd\dist\${{ matrix.kind }}\x86-64-mustdie\MebetGuard.exe" --java "$env:JAVA_HOME" `
+            --untrusted-native "$pwd\dist\fixtures\mebet_fake_cheat.dll"
 
-  # Single gate for the branch rule: green only if every job above passed.
+  # ================================ sign (tags only) ===============================
+  sign:
+    name: sign
+    needs: [e2e-windows, e2e-linux, e2e-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "SignPath signing of MebetGuard.exe / .dll goes here (release tags only)."
+
+  # ================================= branch gate ===================================
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [windows, linux, macos, e2e-linux, dev_mode, e2e-windows]
+    needs: [windows, linux, macos, e2e-windows, e2e-linux, e2e-macos]
     runs-on: ubuntu-24.04
     steps:
       - name: fail if any required job did not pass

@@ -47,10 +47,8 @@ def main():
         if skip:
             rows.append(dict(id=sc["id"], state="skip", baseline="—", guard=skip))
             continue
-        setup = sc["build"](ctx, ctx.native, ctx.marker_jar)
-        jvm_args, extra_env, action = setup.get("jvm_args", ()), setup.get("extra_env"), setup.get("action")
-        base = harness.launch(ctx, "baseline", jvm_args, extra_env, action)
-        guarded = harness.launch(ctx, "guarded", jvm_args, extra_env, action)
+        base = harness.run_scenario(ctx, sc, "baseline")
+        guarded = harness.run_scenario(ctx, sc, "guarded")
         ok_b, bv = harness.baseline_ok(sc, base)
         ok_g, gv = harness.guard_ok(ctx, sc, guarded)
         passed = ok_b and ok_g

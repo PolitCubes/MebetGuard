@@ -137,6 +137,12 @@ def has(run, text):
     return text in run["out"]
 
 
+def run_scenario(ctx, sc, mode):
+    """Run one side (baseline|guarded) of a scenario."""
+    setup = sc["build"](ctx, ctx.native, ctx.marker_jar)
+    return launch(ctx, mode, setup.get("jvm_args", ()), setup.get("extra_env"), setup.get("action"))
+
+
 # --- scenarios -----------------------------------------------------------------------------
 # build(ctx, native, marker_jar) -> {jvm_args?, extra_env?, action?}. os = where it applies.
 # guard: "neutralize" (exit 0, no marker) or "close:<reason>" (exit = that code, no marker).
@@ -166,6 +172,13 @@ SCENARIOS = [
          title="System.load неподписанной нативной библиотеки", guard="close:untrusted_module",
          attack_marker="TARGET did load-native",
          build=lambda ctx, native, jar: dict(action="load-native " + str(native))),
+    # The locked dev-mode check: on a dev-mode / test-signing machine the prod build must close
+    # before the JVM even starts. Only passes where the machine really is in dev mode (the CI
+    # Windows runner); the e2e-windows job runs it against the prod (release) build.
+    dict(id="dev_mode", module="dev_mode", os={"windows"}, needs_native=False,
+         title="Запуск prod-сборки в dev-режиме → закрытие", guard="close:dev_mode",
+         attack_marker="TARGET up pid=",
+         build=lambda ctx, native, jar: dict()),
 ]
 
 

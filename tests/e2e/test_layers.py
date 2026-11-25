@@ -22,17 +22,12 @@ def test_layer(ctx, sc):
     if skip:
         pytest.skip(skip)
 
-    setup = sc["build"](ctx, ctx.native, ctx.marker_jar)
-    jvm_args = setup.get("jvm_args", ())
-    extra_env = setup.get("extra_env")
-    action = setup.get("action")
-
     # 1. Without the guard the attack must work.
-    base = harness.launch(ctx, "baseline", jvm_args, extra_env, action)
+    base = harness.run_scenario(ctx, sc, "baseline")
     ok, msg = harness.baseline_ok(sc, base)
     assert ok, "[%s] без гварда: %s\n%s" % (sc["id"], msg, base["out"])
 
     # 2. Through the guard it must be blocked.
-    guarded = harness.launch(ctx, "guarded", jvm_args, extra_env, action)
+    guarded = harness.run_scenario(ctx, sc, "guarded")
     ok, msg = harness.guard_ok(ctx, sc, guarded)
     assert ok, "[%s] через гвард: %s\n%s" % (sc["id"], msg, guarded["out"])
