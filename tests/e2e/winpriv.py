@@ -24,6 +24,8 @@ TOKEN_ALL_ACCESS = 0xF01FF
 DISABLE_MAX_PRIVILEGE, LUA_TOKEN = 0x1, 0x4
 WIN_BUILTIN_ADMINISTRATORS_SID, WIN_MEDIUM_LABEL_SID = 26, 67
 TOKEN_INTEGRITY_LEVEL, SE_GROUP_INTEGRITY = 25, 0x20
+TOKEN_USER_CLASS, TOKEN_OWNER_CLASS, TOKEN_DEFAULT_DACL_CLASS = 1, 4, 6
+WIN_LOCAL_SYSTEM_SID = 22
 STARTF_USESTDHANDLES = 0x100
 CREATE_UNICODE_ENVIRONMENT, CREATE_NO_WINDOW = 0x400, 0x08000000
 WAIT_OBJECT_0 = 0
@@ -37,6 +39,14 @@ class SID_AND_ATTRIBUTES(ctypes.Structure):
 
 class TOKEN_MANDATORY_LABEL(ctypes.Structure):
     _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+
+class TOKEN_OWNER(ctypes.Structure):
+    _fields_ = [("Owner", ctypes.c_void_p)]
+
+
+class TOKEN_DEFAULT_DACL(ctypes.Structure):
+    _fields_ = [("DefaultDacl", ctypes.c_void_p)]
 
 
 class LUID(ctypes.Structure):
@@ -98,6 +108,12 @@ _SetTokenInformation = _proto(_adv.SetTokenInformation, wt.BOOL, wt.HANDLE, ctyp
 _CreateProcessAsUserW = _proto(_adv.CreateProcessAsUserW, wt.BOOL, wt.HANDLE, wt.LPCWSTR, ctypes.c_void_p,
                                ctypes.c_void_p, ctypes.c_void_p, wt.BOOL, wt.DWORD, ctypes.c_void_p, wt.LPCWSTR,
                                ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION))
+_GetTokenInformation = _proto(_adv.GetTokenInformation, wt.BOOL, wt.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                              wt.DWORD, ctypes.POINTER(wt.DWORD))
+_CopySid = _proto(_adv.CopySid, wt.BOOL, wt.DWORD, ctypes.c_void_p, ctypes.c_void_p)
+_InitializeAcl = _proto(_adv.InitializeAcl, wt.BOOL, ctypes.c_void_p, wt.DWORD, wt.DWORD)
+_AddAccessAllowedAce = _proto(_adv.AddAccessAllowedAce, wt.BOOL, ctypes.c_void_p, wt.DWORD, wt.DWORD,
+                              ctypes.c_void_p)
 _ImpersonateLoggedOnUser = _proto(_adv.ImpersonateLoggedOnUser, wt.BOOL, wt.HANDLE)
 _RevertToSelf = _proto(_adv.RevertToSelf, wt.BOOL)
 _LookupPrivilegeValueW = _proto(_adv.LookupPrivilegeValueW, wt.BOOL, wt.LPCWSTR, wt.LPCWSTR, ctypes.POINTER(LUID))
@@ -143,9 +159,50 @@ def user_token():
     label = TOKEN_MANDATORY_LABEL(SID_AND_ATTRIBUTES(ctypes.cast(medium, ctypes.c_void_p), SE_GROUP_INTEGRITY))
     _check(_SetTokenInformation(tok, TOKEN_INTEGRITY_LEVEL, ctypes.byref(label),
                                 ctypes.sizeof(label) + _GetLengthSid(medium)), "SetTokenInformation(integrity)")
+    # An elevated token names Administrators as the owner and in the default DACL of everything
+    # its process creates. With that group deny-only the new process could not touch its own
+    # objects (CI: java died at start with "DLL init failed", 0xC0000142). Give both to the user
+    # and SYSTEM, as UAC's own filtered token does.
+    user = _token_user(own)
+    owner = TOKEN_OWNER(ctypes.cast(user, ctypes.c_void_p))
+    _check(_SetTokenInformation(tok, TOKEN_OWNER_CLASS, ctypes.byref(owner), ctypes.sizeof(owner)),
+           "SetTokenInformation(owner)")
+    system = ctypes.create_string_buffer(68)
+    n = wt.DWORD(68)
+    _check(_CreateWellKnownSid(WIN_LOCAL_SYSTEM_SID, None, system, ctypes.byref(n)), "CreateWellKnownSid(system)")
+    acl = _acl_allowing([user, system])
+    dacl = TOKEN_DEFAULT_DACL(ctypes.cast(acl, ctypes.c_void_p))
+    _check(_SetTokenInformation(tok, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(dacl), ctypes.sizeof(dacl)),
+           "SetTokenInformation(default DACL)")
+    _keep.extend([admins, medium, user, system, acl])
     _CloseHandle(own)
     _user_token = tok
     return tok
+
+
+_keep = []  # buffers the token information above points into
+
+
+def _token_user(token):
+    """A copy of the token's user SID."""
+    size = wt.DWORD(0)
+    _GetTokenInformation(token, TOKEN_USER_CLASS, None, 0, ctypes.byref(size))
+    buf = ctypes.create_string_buffer(size.value)
+    _check(_GetTokenInformation(token, TOKEN_USER_CLASS, buf, size, ctypes.byref(size)), "GetTokenInformation(user)")
+    sid = ctypes.c_void_p.from_buffer(buf).value  # TOKEN_USER.User.Sid
+    out = ctypes.create_string_buffer(_GetLengthSid(sid))
+    _check(_CopySid(len(out), out, sid), "CopySid")
+    return out
+
+
+def _acl_allowing(sids):
+    """An ACL granting GENERIC_ALL to each SID."""
+    size = 8 + sum(8 + _GetLengthSid(s) for s in sids)
+    acl = ctypes.create_string_buffer(size)
+    _check(_InitializeAcl(acl, size, 2), "InitializeAcl")
+    for s in sids:
+        _check(_AddAccessAllowedAce(acl, 2, 0x10000000, s), "AddAccessAllowedAce")
+    return acl
 
 
 def set_debug_privilege(enable):

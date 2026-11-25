@@ -201,6 +201,13 @@ jobs:
       - name: install pytest
         shell: pwsh
         run: python -m pip install -q pytest
+      # The "game as a standard user" variants run with a non-admin token: let it read the JDK
+      # and the workspace the elevated runner created (a player's game folder is theirs anyway).
+      - name: standard-user access to the JDK and the workspace
+        shell: pwsh
+        run: |
+          icacls "$env:JAVA_HOME" /grant "*S-1-5-11:(OI)(CI)RX" /T /C /Q | Out-Null
+          icacls "$pwd" /grant "*S-1-5-11:(OI)(CI)M" /T /C /Q | Out-Null
       # A crash leaves a minidump, so a failed job shows where it crashed, not only an exit code.
       - name: crash dumps on
         shell: pwsh
@@ -212,7 +219,7 @@ jobs:
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         shell: pwsh
         run: |
-          python -m pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' `
+          python -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' `
             --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
             --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll"
       - name: crash report (faulting module, JVM hs_err, stack)
@@ -268,7 +275,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y python3-pytest
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          python3 -m pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' \
+          python3 -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' \
             --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME"
 
   e2e-macos:
@@ -301,8 +308,105 @@ jobs:
           python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          /tmp/venv/bin/pytest tests/e2e -v --no-header --no-skip -k '${{ matrix.feature }}' \
+          /tmp/venv/bin/pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' \
             --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME"
+
+  # ======= perf — what the guard costs: a report in the run summary, not part of ci-ok =======
+  # tests/perf/bench.py: every workload gets 3 s of warm-up and at least 10 s measured, without
+  # the guard and through it, the two alternating, 3 reps; the table shows the overhead in %.
+  perf-windows:
+    needs: build-windows-binaries
+    name: perf windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     dir: x86-64-mustdie }
+          - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     dir: x86-mustdie }
+          - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, dir: arm64-mustdie }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: ${{ matrix.java }}
+          architecture: ${{ matrix.java_arch }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-windows-${{ matrix.arch }}-dev
+          path: guard
+      - name: "perf: the same workloads without the guard and through it"
+        shell: pwsh
+        run: python tests/perf/bench.py --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" --json perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-windows-${{ matrix.arch }}
+          path: perf.json
+
+  perf-linux:
+    needs: build-linux-binaries
+    name: perf linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
+          - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}-dev
+          path: guard
+      - name: "perf: the same workloads without the guard and through it"
+        run: |
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
+          python3 tests/perf/bench.py --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" --json perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-linux-${{ matrix.arch }}
+          path: perf.json
+
+  perf-macos:
+    needs: build-macos-binaries
+    name: perf macos ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
+          - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-macos-${{ matrix.arch }}-dev
+          path: guard
+      - name: "perf: the same workloads without the guard and through it"
+        run: |
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
+          python3 tests/perf/bench.py --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" --json perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-macos-${{ matrix.arch }}
+          path: perf.json
 
   # ======== 3. ci-ok — red if any e2e failed / was cancelled / skipped (= build failed) ======
   ci-ok:
