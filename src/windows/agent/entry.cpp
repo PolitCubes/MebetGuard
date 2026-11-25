@@ -145,6 +145,13 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
     static std::atomic<bool> entered{false};
     if (!boot || boot->size < sizeof(BootInfo) || boot->version != kBootInfoVersion || entered.exchange(true)) return 200;
     guard::init(boot);
+    // Pinned: FreeLibrary on the agent (a mod calling it through the Foreign Function API, say)
+    // no longer unloads the guard and leaves the hooks jumping into freed memory.
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&MebetGuardMain), &self);
+    }
     nt::api();
     modules::init();
 

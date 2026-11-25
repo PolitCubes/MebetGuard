@@ -131,17 +131,50 @@ jobs:
     needs: build-windows-binaries
     name: windows ${{ matrix.arch }} ${{ matrix.feature }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         arch: [x64, x86, arm64]
-        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath, module_trust_load, dev_mode]
+        feature:
+          # legit: the game's own behaviour must pass the guard untouched
+          - clean_launch
+          - thread_churn
+          - jit_hot
+          - trusted_native_load
+          - ffm_benign
+          # attacks on the JVM start
+          - env_hardening_jto
+          - env_hardening_jdk
+          - jvm_agents_javaagent
+          - jvm_agents_agentpath
+          - dev_mode
+          # attacks inside the running game
+          - module_trust_load
+          - jvm_agent_module
+          - foreign_exec_alloc
+          - foreign_exec_protect
+          - process_dacl_open
+          # attacks on the guard itself
+          - tamper_freeze_guard
+          - tamper_kill_guard
+          - tamper_unload_guard
+          - tamper_jam_sweep
         include:
           - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     vc: x64,     dir: x86-64-mustdie }
           - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     vc: x64_x86, dir: x86-mustdie }
           - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
           - { feature: dev_mode, variant: prod }   # the prod build must close on a dev-mode runner (203)
+        # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
+        # attacks cannot exist there.
+        exclude:
+          - { arch: x86, feature: ffm_benign }
+          - { arch: x86, feature: foreign_exec_alloc }
+          - { arch: x86, feature: foreign_exec_protect }
+          - { arch: x86, feature: tamper_freeze_guard }
+          - { arch: x86, feature: tamper_kill_guard }
+          - { arch: x86, feature: tamper_unload_guard }
+          - { arch: x86, feature: tamper_jam_sweep }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -214,7 +247,8 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x64, arm64]
-        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+        feature: [clean_launch, thread_churn, jit_hot, ffm_benign,
+                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
         include:
           - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
           - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
@@ -246,7 +280,8 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x64, arm64]
-        feature: [env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+        feature: [clean_launch, thread_churn, jit_hot, ffm_benign,
+                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
         include:
           - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
           - { arch: arm64, runner: macos-15,       dir: arm64-macosx }

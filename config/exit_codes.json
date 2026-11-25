@@ -75,6 +75,9 @@
       "en": "A class that does not come from the verified client files was loaded: {file}." },
     { "id": "hardening_failed",    "code": 224, "title_ru": "Не удалось включить защиту", "title_en": "Protection could not be enabled",
       "ru": "Страж не смог включить защиту процесса ({file}). Перезапустите игру. Если повторяется — напишите нам, указав код.",
-      "en": "The guard could not enable process protection ({file}). Restart the game. If it happens again, contact us with this code." }
+      "en": "The guard could not enable process protection ({file}). Restart the game. If it happens again, contact us with this code." },
+    { "id": "guard_stalled",       "code": 225, "title_ru": "Страж остановлен", "title_en": "Guard stopped",
+      "ru": "Посторонняя программа заморозила или остановила поток стража.",
+      "en": "A foreign program froze or stopped a guard thread." }
   ]
 }

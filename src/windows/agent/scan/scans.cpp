@@ -7,6 +7,7 @@
 #include <detours.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -248,8 +249,27 @@ bool preexisting_region_ok(std::uintptr_t begin, std::uintptr_t end) {
 
 enum class SweepMode { startup, periodic };
 
+// M-07. A hooked call between op_begin and op_end may be about to record the region it has
+// just made, so a region found while such calls are in flight is only a suspect; still there
+// on the next sweep, it is judged. The sweep used to skip everything while anything was in
+// flight, and a thread killed inside a hook left the counter up for good: the periodic sweep
+// never ran again. Worker thread only, so no lock.
+std::vector<std::uintptr_t>* g_suspects_prev = new std::vector<std::uintptr_t>();
+std::vector<std::uintptr_t>* g_suspects_now = new std::vector<std::uintptr_t>();
+
+// True the first time a region is seen while calls are in flight: judge it next sweep.
+bool first_sighting(std::uintptr_t base) {
+    g_suspects_now->push_back(base);
+    return std::find(g_suspects_prev->begin(), g_suspects_prev->end(), base) == g_suspects_prev->end();
+}
+
+void rotate_suspects() {
+    std::swap(g_suspects_prev, g_suspects_now);
+    g_suspects_now->clear();
+}
+
 void sweep_memory(SweepMode mode) {
-    if (mode == SweepMode::periodic && exec::ops_in_flight()) return;  // judge next round
+    const bool in_flight = mode == SweepMode::periodic && exec::ops_in_flight();
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
     auto addr = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
@@ -284,6 +304,7 @@ void sweep_memory(SweepMode mode) {
                 continue;
             }
             if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
+            if (in_flight && first_sighting(alloc)) continue;
             close_hidden_image(alloc);
             continue;
         }
@@ -294,9 +315,10 @@ void sweep_memory(SweepMode mode) {
             exec::allow(base, next, exec::Owner{trust::Trust::os, 0, exec::Source::preexisting});
             continue;
         }
-        if (mode == SweepMode::periodic && exec::ops_in_flight()) return;
+        if (in_flight && first_sighting(base)) continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");
     }
+    if (mode == SweepMode::periodic) rotate_suspects();
 }
 
 void sweep_threads(SweepMode mode) {

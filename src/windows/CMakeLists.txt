@@ -36,6 +36,7 @@ add_library(mebet_agent SHARED
     agent/core/timing.cpp
     agent/core/win_util.cpp
     agent/core/guard.cpp
+    agent/core/watchdog.cpp
     agent/trust/file_identity.cpp
     agent/trust/signatures.cpp
     agent/trust/engine.cpp

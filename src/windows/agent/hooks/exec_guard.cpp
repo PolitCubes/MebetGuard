@@ -39,7 +39,10 @@ void close_foreign_code(const Requester& r, const char* operation, std::uintptr_
     ev.level = report::Level::error;
     char title[160];
     std::snprintf(title, sizeof(title), "Closed: executable memory requested by %s (%s)",
-                  r.address ? "a module that is not allowed" : "code outside any module", operation);
+                  r.from_jvm_code ? "Java code through the Foreign Function API"
+                  : r.address     ? "a module that is not allowed"
+                                  : "code outside any module",
+                  operation);
     ev.title = title;
     JsonWriter w;
     w.begin_object();
@@ -48,6 +51,7 @@ void close_foreign_code(const Requester& r, const char* operation, std::uintptr_
     w.field("address", cards::address_hex(address));
     w.field("size", static_cast<std::uint64_t>(size));
     w.key("requester").raw(cards::address_json(r.address));
+    if (r.from_jvm_code) w.field("requester_kind", "jvm_generated_code");
     w.end_object();
     ev.extra_json = w.take();
     ev.fingerprint = {"close.foreign_code", cards::address_owner_key(r.address)};
@@ -92,7 +96,12 @@ Requester find_requester() {
         r.trust = owner.trust;
         r.module_base = owner.module_base;
         r.from_exec_region = true;
-        r.allowed = owner.trust != trust::Trust::unknown;
+        // The JVM asks for executable memory from jvm.dll, never from the code it generated.
+        // A request whose first frame is in that code (JIT, interpreter, a downcall stub) is
+        // Java code calling the OS through the Foreign Function API: a mod's way to shellcode
+        // without a DLL of its own.
+        r.from_jvm_code = owner.trust == trust::Trust::java;
+        r.allowed = owner.trust != trust::Trust::unknown && !r.from_jvm_code;
     }
     return r;
 }

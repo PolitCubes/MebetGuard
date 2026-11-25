@@ -12,6 +12,7 @@
 #include "core/exec_table.hpp"
 #include "core/guard.hpp"
 #include "core/module_table.hpp"
+#include "core/watchdog.hpp"
 #include "hooks/exec_guard.hpp"
 #include "hooks/load_gate.hpp"
 #include "strings.hpp"
@@ -67,6 +68,7 @@ NTSTATUS NTAPI hook_NtCreateSection(PHANDLE section, ACCESS_MASK access, POBJECT
     if (!tls_ready()) {
         return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
     }
+    watchdog::check_from_hook();
     const bool image = (allocation & nt::kSecImage) != 0 && (allocation & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
     if (!image || !file || guard::shutting_down() || gate::own_read_on_this_thread()) {  // fast path
         return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
@@ -97,6 +99,7 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
         return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
                                        allocation, protect);
     }
+    watchdog::check_from_hook();
     if (guard::shutting_down() || !execguard::is_current_process(process)) {
         return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
                                        allocation, protect);
@@ -133,6 +136,7 @@ NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
     if (!tls_ready()) {
         return real_NtUnmapViewOfSection(process, base);
     }
+    watchdog::check_from_hook();
     if (guard::shutting_down() || !base) return real_NtUnmapViewOfSection(process, base);
     const auto addr = reinterpret_cast<std::uintptr_t>(base);
     const bool tracked = exec::find(addr) || modules::find(addr);
@@ -155,6 +159,7 @@ NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_P
     if (!tls_ready()) {
         return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
     }
+    watchdog::check_from_hook();
     if (!execguard::executable(protect) || guard::shutting_down() || !execguard::is_current_process(process)) {
         return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
     }
@@ -178,6 +183,7 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
     if (!tls_ready()) {
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
     }
+    watchdog::check_from_hook();
     if (!execguard::executable(protect) || guard::shutting_down() || !base || !size ||
         !execguard::is_current_process(process)) {
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
@@ -207,6 +213,7 @@ NTSTATUS NTAPI hook_NtFreeVirtualMemory(HANDLE process, PVOID* base, PSIZE_T siz
     if (!tls_ready()) {
         return real_NtFreeVirtualMemory(process, base, size, type);
     }
+    watchdog::check_from_hook();
     if (guard::shutting_down() || !base || !*base || !exec::find(reinterpret_cast<std::uintptr_t>(*base))) {
         return real_NtFreeVirtualMemory(process, base, size, type);
     }

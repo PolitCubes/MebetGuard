@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/timing.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "strings.hpp"
 #include "window/game_window.hpp"
@@ -129,6 +130,7 @@ DWORD WINAPI worker_main(void*) {
             if (left < timeout) timeout = static_cast<DWORD>(left);
         }
         MsgWaitForMultipleObjectsEx(1, &c.wake, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        watchdog::worker_tick();  // heartbeat; is the watchdog thread still alive?
 
         if (CloseRequest* r = c.close.load()) run_close(*r);
 
@@ -231,7 +233,7 @@ void add_periodic(const char* name, unsigned interval_ms, Task task, config::Mod
 void start_worker() {
     Core& c = core();
     HANDLE t = CreateThread(nullptr, 0, &worker_main, nullptr, 0, &c.worker_tid);
-    if (t) CloseHandle(t);
+    watchdog::start(t);  // watches the worker, and the worker watches it
 }
 
 DWORD worker_thread_id() { return core().worker_tid; }

@@ -1,6 +1,9 @@
 # End-to-end layer tests
 
-Каждый слой защиты стража проверяется одной и той же атакой **дважды**:
+Каждый сценарий гоняется **дважды** — без гварда и через гвард — и это два отдельных теста.
+Сценарии двух видов: **атака** (что делает чит) и **легитимное действие** (что делает сама игра).
+
+Атака:
 
 - **без гварда** — целевая JVM (`MebetTarget`) запускается обычным `java`. Атака **должна
   сработать**: её маркер появляется в выводе, приложение продолжает работать.
@@ -9,7 +12,14 @@
   этого слоя (`config/exit_codes.json`) или молча нейтрализует атаку, а приложение живёт.
 
 Слой засчитан, только если **и** без гварда атака воспроизвелась, **и** через гвард она больше
-не проходит. Это и есть пруф «было уязвимо → стало закрыто» через наш исполняемый файл.
+не проходит. Это и есть пруф «было уязвимо → стало закрыто» через наш исполняемый файл. Где
+атака может тихо не состояться (например, не получилось открыть поток стража), через гвард
+дополнительно проверяется, что атака **была проведена** (строка «заморожено N≥1 потоков»):
+иначе тест падает как недоказательный. «Закрыт» засчитывается по коду выхода; строка
+`[Mebet] closed` без кода — только если приложение действительно остановилось.
+
+Легитимное действие (обычный запуск, тысячи потоков, JIT, библиотека самой Java, обычный
+нативный вызов через FFM) должно работать **в обоих** прогонах: страж не должен мешать игре.
 
 Один тест на каждый сценарий (pytest — видно каждый сценарий отдельно):
 
@@ -18,9 +28,10 @@ pytest tests/e2e -v --guard <MebetGuard> --java <JAVA_HOME> [--untrusted-native 
 ```
 
 ```
-tests/e2e/test_layers.py::test_layer[env_hardening_jto]     PASSED
-tests/e2e/test_layers.py::test_layer[jvm_agents_javaagent]  PASSED
-tests/e2e/test_layers.py::test_layer[module_trust_load]     PASSED
+tests/e2e/test_layers.py::test_layer[module_trust_load-baseline]  PASSED   без гварда: атака сработала
+tests/e2e/test_layers.py::test_layer[module_trust_load-guarded]   PASSED   через гвард: закрыт, код 210
+tests/e2e/test_layers.py::test_layer[thread_churn-baseline]       PASSED   работает
+tests/e2e/test_layers.py::test_layer[thread_churn-guarded]        PASSED   работает, страж не мешает
 ```
 
 Быстрая таблица без зависимостей (та же логика, одна строка на сценарий):
@@ -104,7 +115,7 @@ Liberica (BellSoft): гвард доверяет издателю Java игры,
 | `module_trust` | `System.load` неподписанного натива | закрыть | 210 | ✅ |
 | `jvm_agents` | `-agentpath` чужой нативный агент | закрыть | 208 | ✅ |
 | `env_hardening` | чужой агент через `JDK_JAVA_OPTIONS` | нейтрализовать | — | ✅ |
-| `jvm_agents` | агент-модуль JDK (`instrument.dll` и т.п.) | закрыть | 217 | ⬜ |
+| `jvm_agents` | агент-модуль JDK в рантайме (`System.loadLibrary("instrument")`) | закрыть | 217 | ✅ (Windows) |
 | `jvm_agents` | внешний attach к JVM | закрыть | 216 | ⬜ |
 | `proxy_dll` | прокси-DLL рядом с exe | закрыть | 206 | ⬜ (Windows) |
 | `proxy_dll` | лишний файл рядом с exe | закрыть | 207 | ⬜ (Windows) |
@@ -112,8 +123,13 @@ Liberica (BellSoft): гвард доверяет издателю Java игры,
 | `startup_self_check` | подмена агента (хэш не сходится) | закрыть | 201 | ⬜ |
 | `foreign_threads` | `CreateRemoteThread` в чужой код | закрыть | 213 | ⬜ (Windows, натив) |
 | `hidden_images` | ручной маппинг образа | закрыть | 214 | ⬜ (Windows, натив) |
-| `foreign_exec_memory` | RWX-память + выполнение (JNA/шелл-код) | закрыть | 215 | ⬜ (Windows, натив) |
+| `foreign_exec_memory` | FFM из Java: `VirtualAlloc(RWX)` + шелл-код | закрыть | 215 | ✅ (Windows x64/arm64) |
+| `foreign_exec_memory` | FFM из Java: `VirtualAlloc(RW)` → `VirtualProtect(RX)` + шелл-код | закрыть | 215 | ✅ (Windows x64/arm64) |
+| `foreign_exec_memory` | убить потоки посреди хука (M-07), затем RWX через `VirtualAlloc2` мимо хуков | обход памяти → закрыть | 215 | ✅ (Windows x64/arm64) |
 | `hook_self_check` | снос хуков стража в ntdll | закрыть | 219 | ⬜ (Windows, натив) |
+| `guard_watchdog` | заморозить потоки стража (`SuspendThread`, админ + SeDebugPrivilege), затем чужой натив | закрыть | 225 | ✅ (Windows x64/arm64) |
+| `guard_watchdog` | убить потоки стража (`TerminateThread`), затем чужой натив | закрыть | 225 | ✅ (Windows x64/arm64) |
+| `module_trust` | `FreeLibrary` на страже (выгрузить), затем чужой натив | DLL закреплена → закрыть | 210 | ✅ (Windows x64/arm64) |
 | `module_trust` | денилистнутый модуль | закрыть | 211 | ⬜ |
 | `jvm_classes` | `DefineClass` в рантайме вне jar | отчёт (не закрывать) | 223 | ⬜ (нужен канал отчётов) |
 | `virtual_machine` | запуск в ВМ | закрыть (release) | 204 | 🟡 (release в VirtualBox) |
@@ -121,12 +137,21 @@ Liberica (BellSoft): гвард доверяет издателю Java игры,
 | `dev_mode` | дев-режим / test-signing Windows | закрыть (заблокировано) | 203 | 🟡 (на GitHub-раннере он включён) |
 | `debugger` | юзермод-отладчик | закрыть | 218 | ⬜ |
 | `input_source` | синтетический ввод `SendInput` | отбросить + отчёт | — | ⬜ (Windows) |
-| `process_dacl` | внешний `OpenProcess`/`CreateRemoteThread` | DACL не пускает | — | ⬜ (Windows) |
+| `process_dacl` | чужая программа: `OpenProcess` на запись памяти и создание потоков | DACL не пускает | — | ✅ (Windows) |
 | `extension_point_disable` | не-MS AppInit_DLLs | не загрузить | — | ⬜ (Windows) |
 | `posix_preload` | `LD_PRELOAD` чужой библиотеки | отчёт | — | ⬜ (Linux) |
 | `wine` | запуск под Wine | отчёт | — | ⬜ |
 | `kernel_state` / `driver_names` / `time_check` / `extension_points` | состояние среды | отчёт | — | ⬜ (нужен канал отчётов) |
 | `jvm_launch` / `splash` / `window_identity` | порядок запуска, заставка, окно | работает как задумано | — | ⬜ (наблюдение) |
+
+Легитимные сценарии (страж не мешает, на всех ОС и архитектурах, где применимо): обычный
+запуск, 2000 коротких Java-потоков (старт и выход потока идут через хуки — ловит падения вроде
+снятого TLS у уходящего потока), горячий цикл под JIT, `System.load` библиотеки самой Java
+(Windows), обычный нативный вызов через FFM (Java 22+).
+
+FFM-атаки (Foreign Function & Memory API, Java 22+) — это чит-мод без своей DLL: Java-код
+сам зовёт `VirtualAlloc`, `SuspendThread`, `FreeLibrary`. На 32-битной Windows их нет: у 32-битной
+Java нет FFM-линкера, а Java 22+ под x86 не выпускается.
 
 Слои уровня «отчёт» (`report`) не закрывают клиент — их e2e проверяет, что событие отправлено;
 это требует тестового канала GlitchTip и будет добавлено вместе с ним.

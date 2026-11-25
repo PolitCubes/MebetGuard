@@ -12,6 +12,7 @@
     { "id": "jvm_agents",              "title": "JVM: внешний attach и чужой агент",     "section": "10", "release": "close",  "test": "close" },
     { "id": "jvm_classes",             "title": "JVM: классы, DefineClass",              "section": "10", "release": "report", "test": "report" },
     { "id": "hook_self_check",         "title": "Самопроверка хуков",                    "section": "7",  "release": "close",  "test": "close" },
+    { "id": "guard_watchdog",          "title": "Сторож потоков стража",                 "section": "7",  "release": "close",  "test": "close" },
     { "id": "virtual_machine",         "title": "Виртуальная машина",                    "section": "8",  "release": "close",  "test": "off" },
     { "id": "dev_mode",                "title": "Дев-режим Windows",                     "section": "8",  "release": "close",  "test": "close", "locked": true },
     { "id": "kernel_state",            "title": "Secure Boot, HVCI",                     "section": "8",  "release": "report", "test": "report" },

@@ -19,6 +19,7 @@ struct Requester {
     std::uintptr_t module_base = 0;
     bool allowed = false;
     bool from_exec_region = false;  // JIT stub or other recorded executable memory
+    bool from_jvm_code = false;     // that memory is code the JVM generated (JIT, FFM stubs)
 };
 
 Requester find_requester();
