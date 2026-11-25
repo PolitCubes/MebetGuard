@@ -7,7 +7,7 @@
 
 | Что | Откуда | Зачем |
 |---|---|---|
-| `JAVA_HOME` | `LauncherGuard_lmodule` (`systemEnv`) | папка Java клиента: обёртка грузит `bin\jli.dll` (Windows) или `lib/libjli.so`/`.dylib` по полному пути |
+| `JAVA_HOME` | `LauncherGuard_lmodule` (`systemEnv`) | папка Java клиента (та, что сервер раздаёт через `customJavaDownload`; на Windows её издатель должен быть в `config/java.json`): обёртка грузит `bin\jli.dll` (Windows) или `lib/libjli.so`/`.dylib` по полному пути |
 | командная строка Java | `ClientLauncherProcess` | разбирается средствами самого JDK (`JLI_CmdToArgs`), `@argfiles` выключены |
 | `-Djava.library.path=` | `ClientLauncherProcess` | папка natives — для проверки прокси-DLL |
 | `-Dmebet.errors=false` | настройки лаунчера (будущая галочка) | выключить канал «ошибки стража» |

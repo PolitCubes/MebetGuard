@@ -414,7 +414,7 @@ void warm_up(const std::wstring& sample_embedded, const std::wstring& sample_cat
         if (f != INVALID_HANDLE_VALUE) {
             const Signatures s = read_embedded(f, sample_embedded);
             // Windows 7 without the SHA-2 update cannot verify a SHA-256 Authenticode
-            // signature such as BellSoft's (ТЗ §6: close with a clear reason).
+            // signature such as the Java vendor's (ТЗ §6: close with a clear reason).
             const auto& v = win::os_version();
             if (v.major == 6 && v.minor == 1 && s.signers.empty() && sha2_failure(s.result)) g_sha2_broken = true;
             CloseHandle(f);

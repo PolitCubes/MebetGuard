@@ -43,6 +43,8 @@ Decision decide_path(const std::wstring& path);
 // SHA-256 of a whole file through a handle (reports, hash list).
 bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes);
 
+// JAVA_HOME from the launcher, resolved like final_path(); the only place where files of
+// the Java vendor from config/java.json are trusted as the game Java.
 bool is_java_dir_file(const std::wstring& path);
 const std::wstring& java_home();
 

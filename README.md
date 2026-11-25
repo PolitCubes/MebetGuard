@@ -38,9 +38,9 @@ JVM вместо `javaw.exe`, **одна библиотека-агент** ра�
 
 **Во время игры (Windows)**
 - каждая DLL проверяется один раз, в момент загрузки, в потоке, который её грузит
-  (хук `NtCreateSection`): компонент Windows, наша Java (BellSoft), натив игры по SHA-256,
-  доверенный издатель (CN + O + класс корня), WHQL-драйвер видеокарты — иначе отказ в
-  загрузке и закрытие;
+  (хук `NtCreateSection`): компонент Windows, Java игры (издатель из `config/java.json`,
+  только внутри `JAVA_HOME`), натив игры по SHA-256, доверенный издатель (CN + O + класс
+  корня), WHQL-драйвер видеокарты — иначе отказ в загрузке и закрытие;
 - исполняемая память вне образов (ручной маппинг, шелл-код): учёт выделений и обход регионов;
 - потоки, стартующие вне разрешённого кода; образы, отображённые мимо загрузчика;
 - внешнее подключение к JVM (JVMTI `ThreadStart`), агенты `instrument`/`jdwp`/`attach`;
@@ -118,7 +118,15 @@ cmake --build build
 
 Списки разрешённого правятся только в `config/` и требуют пересборки и переподписи:
 `publishers.json` — доверенные издатели, `roots.json` + `roots/` — закреплённые корни,
-`denylist.json` — денилист, `hashes/*.txt` — нативы игры (`tools/snap_hashes.py`).
+`denylist.json` — денилист, `hashes/*.txt` — нативы игры (`tools/snap_hashes.py`),
+`java.json` — чья подпись на Windows считается Java игры.
+
+Java игры выбирает сервер: `LaunchServer.json` → `customJavaDownload` (`forceUseCustomJava`)
+указывает на папки `updates/java25-<ОС>-<архитектура>` в PolitCubes/updates, лаунчер передаёт
+стражу её путь в `JAVA_HOME`. Страж не зашивает поставщика: в `java.json` перечислены издатели
+из `publishers.json` (группа `java`) — сейчас BellSoft (Liberica), запись Amazon Corretto
+готова. Сменили Java на сервере — поменяйте список (на время переезда можно двух), пересоберите
+и переподпишите страж. Подпись поставщика действует только для файлов внутри `JAVA_HOME`.
 
 ## Code signing policy
 
@@ -128,9 +136,11 @@ cmake --build build
 `MebetGuard.dll`, собранные в CI из тега этого репозитория. Каждый релиз одобряется
 вручную.
 
-- Авторы и ревьюеры: команда [mebet](https://github.com/orgs/PolitCubes/teams/mebet).
+- Авторы и ревьюеры: команда [mebet](https://github.com/orgs/PolitCubes/teams/mebet) —
+  [Clercq](https://github.com/Clercq), [luckybl0ck](https://github.com/luckybl0ck).
   Изменения от остальных попадают в `master` только через pull request с одобрением команды.
-- Одобряющие подпись: команда [mebet](https://github.com/orgs/PolitCubes/teams/mebet).
+- Одобряющие подпись: команда [mebet](https://github.com/orgs/PolitCubes/teams/mebet) —
+  [Clercq](https://github.com/Clercq), [luckybl0ck](https://github.com/luckybl0ck).
 - Политика конфиденциальности: что страж отправляет и как это выключить —
   [`docs/reports.md`](docs/reports.md); отдельная страница на сайте — до первого подписанного релиза.
 

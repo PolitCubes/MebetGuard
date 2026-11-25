@@ -55,18 +55,21 @@ struct RootDef {
 struct PublisherDef {
     const char* id;
     const char* name;   // UTF-8
-    const char* group;  // gpu, overlay, antivirus, input, shell, utility, peripheral, audio, java
+    // gpu, overlay, antivirus, input, shell, utility, peripheral, audio, java. Only the java
+    // publishers listed in config/java.json are generated, and they count inside JAVA_HOME only.
+    const char* group;
     std::uint32_t root_mask;  // bit i = kRoots[i] is acceptable
     const char* min_product_version;  // optional VERSIONINFO ProductVersion floor
 };
 
-// One accepted (CN, O[, issuer CN]) variant of a publisher, already normalized with
+// One accepted (CN, O[, issuer CN][, OU]) variant of a publisher, already normalized with
 // mebet::normalize_name (case and punctuation folded).
 struct SignerDef {
     std::uint16_t publisher;  // index into kPublishers
     const char* cn;
     const char* o;
     const char* issuer_cn;  // nullptr = any issuer
+    const char* ou;         // nullptr = any OU (Amazon signs Corretto and other products with one CN/O)
 };
 
 // Serial prefix of a certificate already seen for a publisher (history, not a match key).

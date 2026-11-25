@@ -1,0 +1,9 @@
+{
+  "$comment": "Java игры (ТЗ §6, §10). Источник правды — сервер: LaunchServer.json customJavaDownload (forceUseCustomJava) → папки updates/java25-<ОС>-<архитектура> в PolitCubes/updates; страж запускает ту Java, которую передал лаунчер (JAVA_HOME). Здесь — чьей подписи на Windows верить как Java игры: id издателей из publishers.json с group «java». Их файлы доверяются только внутри JAVA_HOME; издатели группы java, которых нет в этом списке, в сборку не попадают вовсе. Сменили Java на сервере — поменяйте список, пересоберите и переподпишите страж; на время переезда можно указать двух издателей. Linux и macOS издателя не проверяют.",
+  "publishers": ["bellsoft"],
+  "checked": {
+    "date": "2026-11-25",
+    "game": "updates/java25-<ОС>-<архитектура> (customJavaDownload): BellSoft Liberica 25.0.5.1+5-LTS, jvm.dll подписан CN=BELLSOFT, корень Sectigo Public Code Signing Root R46",
+    "launcher": "updates/java25-launcher-<ОС>-<архитектура>: Amazon Corretto 25.0.5.1.2 + OpenJFX — Java самого лаунчера, страж её не запускает"
+  }
+}
