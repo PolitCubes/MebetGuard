@@ -202,6 +202,11 @@ std::wstring nt_to_dos(const std::wstring& nt_path) {
         }
     }
     if (istarts_with(nt_path, L"\\Device\\Mup\\")) return L"\\\\" + nt_path.substr(12);
+    // A volume with no drive letter this token can see: mounted into a folder, or lettered only in
+    // another logon session (CI: a standard-user token next to the elevated runner). Returned as it
+    // is, the NT path could not be opened, the file was "unreadable" and refused — the guard closed
+    // the game on its own exe. The GLOBALROOT form is the same path, open to every Win32 file API.
+    if (istarts_with(nt_path, L"\\Device\\")) return L"\\\\?\\GLOBALROOT" + nt_path;
     return nt_path;
 }
 

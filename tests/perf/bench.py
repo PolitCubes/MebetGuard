@@ -156,7 +156,8 @@ def main():
     rows, ratios = [], []
     for name, v in values.items():
         b, g = statistics.median(v["baseline"]), statistics.median(v["guarded"])
-        noise = max(_spread(v["baseline"]), _spread(v["guarded"]))
+        # ± half the larger spread between reps: a difference inside it is not a measurement.
+        noise = max(_spread(v["baseline"]), _spread(v["guarded"])) / 2
         over = (g - b) / b * 100 if b else 0.0
         rows.append(dict(name=name, what=WHAT.get(name, ""), baseline_ms=b, guarded_ms=g,
                          overhead_pct=over, noise_pct=noise, within_noise=abs(over) <= noise))
@@ -214,7 +215,7 @@ def render(rows, mean, spent, reps, warmup, measure, frames=None):
         if r["within_noise"]:
             diff += " (в пределах шума)"
         lines.append("| `%s` | %s | %.1f мс | %.1f мс | %s | ±%.1f %% |" % (
-            r["name"], r["what"], r["baseline_ms"], r["guarded_ms"], diff, r["noise_pct"] / 2))
+            r["name"], r["what"], r["baseline_ms"], r["guarded_ms"], diff, r["noise_pct"]))
     lines += ["", "**В среднем по нагрузкам (без запуска): %+.1f %%.**" % mean, ""]
     if frames:
         lines += render_frames(frames)
