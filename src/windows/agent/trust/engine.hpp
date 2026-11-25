@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Module trust decision (ТЗ §6): the one place that says whether a file may run in the
 // game process. Order: denylist → collected list (hashes) → signatures (Microsoft rule,
 // trusted publishers, WHQL in the display driver folder). One decision per file, cached

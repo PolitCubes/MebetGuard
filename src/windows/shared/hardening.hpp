@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Step 1 of the wrapper (ТЗ §4): DLL search order, extension points, environment.
 // Runs before any DLL other than ntdll/kernel32/kernelbase is in the process, so it may
 // use only kernel32 (the wrapper imports nothing else, ТЗ §4 «Импорты exe»).

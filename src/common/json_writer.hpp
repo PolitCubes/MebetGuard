@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Minimal streaming JSON writer for report events (Sentry/GlitchTip format, ТЗ §12).
 #pragma once
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Hook self-check (ТЗ §7 «Самопроверка хуков»): our hook removed or replaced → close;
 // a foreign hook on top of ours (antivirus) → report.
 #include "hooks/hook_check.hpp"

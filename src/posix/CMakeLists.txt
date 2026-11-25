@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 # Linux / macOS: MebetGuard (wrapper) + libMebetGuard.so / .dylib (agent), ТЗ §11.
 
 set(MEBET_POSIX_CFLAGS -Wall -Wextra -Wno-unused-parameter -fstack-protector-strong)

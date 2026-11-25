@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // SHA-256 (FIPS 180-4). Own implementation so that the wrapper can hash the agent
 // before any crypto DLL is loaded, and so that every platform hashes the same way.
 #pragma once

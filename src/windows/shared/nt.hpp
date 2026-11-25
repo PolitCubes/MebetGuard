@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Native API declarations used by the wrapper and the agent.
 //
 // Everything is resolved at runtime with GetProcAddress, so a function missing on an

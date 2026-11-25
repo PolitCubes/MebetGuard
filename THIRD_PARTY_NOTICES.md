@@ -1,7 +1,8 @@
 # Third-party notices
 
-Mebet Anticheat is our own code under the MIT license (see `LICENSE`). It uses or
-derives from the following open-source work.
+Mebet Anticheat is our own code under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`, see `LICENSE`). It uses or derives from the following open-source work;
+every item is compatible with AGPL-3.0.
 
 ## Microsoft Detours — MIT
 

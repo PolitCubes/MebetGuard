@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Result of the module trust decision (ТЗ §6 «Собранный список разрешённого»).
 #pragma once
 

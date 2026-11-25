@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Report payloads (ТЗ §12 «Карточка файла», «События», «Обезличивание»). Everything here
 // is anonymous: user folders become %USERPROFILE% etc., no names, no machine ids, file
 // contents only as hashes, memory only from foreign executable regions and ≤ 256 bytes.

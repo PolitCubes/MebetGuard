@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Signing-invariant hash of a PE file.
 //
 // The wrapper embeds the hash of the agent (ТЗ §4 step 4: "хэш агента вшит в exe"), but

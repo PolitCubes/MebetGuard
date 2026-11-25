@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Address ranges of every image the guard has accepted (loader modules, KnownDLLs, the
 // agent, the wrapper). Used by the hooks to find "who asked" and by the sweeps to tell a
 // registered image from a hidden one (ТЗ §5).

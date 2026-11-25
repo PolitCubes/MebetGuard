@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Resources of the wrapper (ТЗ §4 «PE, манифест, ресурсы», §13 metadata).
 #pragma code_page(65001)
 #include <winresrc.h>
@@ -31,7 +33,7 @@ BEGIN
             VALUE "FileDescription", "PolitCubes"
             VALUE "FileVersion", MEBET_VERSION_STR
             VALUE "InternalName", "MebetGuard"
-            VALUE "LegalCopyright", "Copyright (c) 2026 PolitCubes. MIT License."
+            VALUE "LegalCopyright", "Copyright (c) 2026 PolitCubes. AGPL-3.0-only."
             VALUE "OriginalFilename", "MebetGuard.exe"
             // SignPath metadata rule: ProductName is the project name (ТЗ §13).
             VALUE "ProductName", "Mebet Anticheat"

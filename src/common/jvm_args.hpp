@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Inspection of the Java command line that the launcher passed to the wrapper
 // (ТЗ §4 step 9, §10 «Чужой агент при старте»). The arguments are the ones JLI itself
 // produced (JLI_GetStdArgs on Windows, argv on Linux/macOS), so quoting and order are

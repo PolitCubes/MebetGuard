@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Smoke test of the wrapper on CI: the JVM must start through MebetGuard, run Java code
 // and exit with the code it chose. Started with "load <dll>" it loads a native library,
 // which lets CI check that an unsigned, unlisted DLL closes the client (exit code 210).

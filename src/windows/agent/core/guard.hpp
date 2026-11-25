@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Guard core: the controlled close (ТЗ §3 «Как закрываем»), the worker thread and the
 // routing of every signal by the level of its module.
 //

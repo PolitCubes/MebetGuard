@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Linux / macOS agent (ТЗ §11). Base level: four blocking measures — own wrapper with
 // JLI_Launch and our -agentpath, PR_SET_DUMPABLE 0 (Linux) / PT_DENY_ATTACH (macOS),
 // -XX:+DisableAttachMechanism from the profile, hashes of our own files — plus WSL2

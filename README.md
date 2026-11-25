@@ -4,7 +4,7 @@
 
 Нативный страж клиента PolitCubes. Заменяет GravitGuard: **один exe-обёртка** запускает
 JVM вместо `javaw.exe`, **одна библиотека-агент** работает внутри процесса игры. Всё в
-одном процессе. Код — наш, открытый, под MIT.
+одном процессе. Код — наш, открытый, под GNU AGPL-3.0-only.
 
 | Платформа | Файлы | Папка в лаунчере (`LauncherGuard`) |
 |---|---|---|
@@ -126,9 +126,17 @@ cmake --build build
 [SignPath.io](https://signpath.io), certificate by
 [SignPath Foundation](https://signpath.org)». Подписываются только `MebetGuard.exe` и
 `MebetGuard.dll`, собранные в CI из тега этого репозитория. Каждый релиз одобряется
-вручную. Роли (авторы, ревьюеры, одобряющие) и политика конфиденциальности будут
-опубликованы вместе с первым подписанным релизом.
+вручную.
+
+- Авторы и ревьюеры: команда [mebet](https://github.com/orgs/PolitCubes/teams/mebet).
+  Изменения от остальных попадают в `master` только через pull request с одобрением команды.
+- Одобряющие подпись: команда [mebet](https://github.com/orgs/PolitCubes/teams/mebet).
+- Политика конфиденциальности: что страж отправляет и как это выключить —
+  [`docs/reports.md`](docs/reports.md); отдельная страница на сайте — до первого подписанного релиза.
 
 ## Лицензия
 
-MIT — [`LICENSE`](LICENSE). Сторонний код и данные — [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+GNU Affero General Public License v3.0 only (`AGPL-3.0-only`) — [`LICENSE`](LICENSE).
+Кто распространяет страж, в том числе изменённый, обязан дать получателям его исходный код
+под той же лицензией; исходники каждой сборки — этот репозиторий. Сторонний код и данные —
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

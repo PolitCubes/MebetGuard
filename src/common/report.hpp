@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Reports and guard errors (ТЗ §12). Two GlitchTip channels, both anonymous, both on by
 // default and switched off separately by the launcher (-Dmebet.reports=false,
 // -Dmebet.errors=false). Decisions of the guard never depend on these switches.

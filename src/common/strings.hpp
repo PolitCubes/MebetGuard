@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Small string helpers shared by every platform. Kept dependency-free on purpose.
 #pragma once
 

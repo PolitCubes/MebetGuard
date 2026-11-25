@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Every C++ allocation of the agent goes to its own heap.
 //
 // The hooks on NtAllocateVirtualMemory / NtFreeVirtualMemory run while the caller may hold

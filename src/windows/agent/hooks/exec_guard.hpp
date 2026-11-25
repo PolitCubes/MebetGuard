@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Executable memory accounting (ТЗ §5 «Чужой код в памяти»). Executable memory is rare,
 // so a request for it takes the slow path: up to a few stack frames above the system DLLs
 // tell which module asked. An allowed module gets the region recorded; anything else is

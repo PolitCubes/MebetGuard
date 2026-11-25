@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // The game window (ТЗ §4 «Заголовок и значок окна», §9 «Источник ввода»).
 //
 // The window is found by EVENT_OBJECT_CREATE (class GLFW30 for Classic, SDL_app for

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Process and thread DACL (ТЗ §7 «Права в DACL»). Everything not listed is denied: reading
 // and writing memory, creating threads, duplicating handles, suspending, changing rights;
 // on threads — SET_CONTEXT (APC, thread hijack) and SUSPEND_RESUME. SYSTEM and an

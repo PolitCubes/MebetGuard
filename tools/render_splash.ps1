@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 param(
   [string]$Root = (Split-Path -Parent $PSScriptRoot),
   [int]$Width = 300

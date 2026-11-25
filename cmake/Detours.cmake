@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 # Microsoft Detours (MIT) at a pinned commit: x86, x64 and ARM64 with one API (ТЗ §5
 # allows MinHook or Detours; MinHook has no ARM64). Only the hooking core is compiled —
 # no process-creation or binary-editing helpers.

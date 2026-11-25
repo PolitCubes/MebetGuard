@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Contract between the wrapper executable and the agent library.
 //
 // The wrapper does only what must happen before any other DLL is loaded (ТЗ §4 step 1:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Types of the tables that tools/gen_config.py generates from config/*.json.
 // The tables themselves live in the generated headers mebet_config.hpp and
 // mebet_trust_data.hpp; nothing here is read from disk at runtime (ТЗ §3).

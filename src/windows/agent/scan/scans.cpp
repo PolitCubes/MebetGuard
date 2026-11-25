@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 #include "scan/scans.hpp"
 
 #include "nt.hpp"  // windows.h before detours.h

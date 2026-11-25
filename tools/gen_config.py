@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 """Turn config/*.json into C++ tables that are compiled into the guard.
 
 ТЗ §3: module levels and all lists are baked into the build; nothing is read from

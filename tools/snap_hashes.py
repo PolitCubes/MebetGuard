@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 """Snapshot the SHA-256 of every native library of a client profile.
 
 ТЗ §6 «Собранный список разрешённого»: natives of the game and of mods are unsigned

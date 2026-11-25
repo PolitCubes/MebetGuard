@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Identity of a file as the kernel sees it (ТЗ §5: cache key FileId + size + mtime).
 #pragma once
 

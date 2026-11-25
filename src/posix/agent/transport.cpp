@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Report transport on Linux/macOS: libcurl loaded at runtime (no link-time dependency;
 // without libcurl the guard works the same and simply sends nothing).
 #include <dlfcn.h>

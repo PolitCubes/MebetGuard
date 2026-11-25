@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Agent entry: the whole start sequence of ТЗ §4 and §5 in one readable place.
 //
 //   wrapper step 1 (env, DLL dirs, extension points) ── done before this DLL was loaded

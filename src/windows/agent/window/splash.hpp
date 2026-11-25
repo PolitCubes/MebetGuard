@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Start-up splash (ТЗ §4 «Заставка при запуске»): the Mebet logo for at least 2 s, gone
 // when the game window appears. Own thread with its own message loop, so the start of the
 // game never waits for it. Layered, borderless, no taskbar button, never takes focus.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 /* A plain unsigned DLL that is on no list: loading it into the guarded JVM must close the
    client with "untrusted_module" (exit code 210). Test fixture only; not part of any build
    that is shipped or signed. */

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Sweeps of the process (ТЗ §5): the one-time start-up check of everything that got in
 // before the agent, and the periodic sweeps of memory regions and threads.
 #pragma once

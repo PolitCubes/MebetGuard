@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Trustworthiness of the system (ТЗ §8 «Среда», §7 table): dev mode, virtual machine,
 // kernel state, drivers, Wine, extension points, debugger, time.
 #pragma once

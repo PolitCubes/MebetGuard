@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // The six ntdll hooks of the agent (ТЗ §5 «Какие API»): NtCreateSection (the load gate),
 // NtMapViewOfSection (safety net, executable mappings), NtUnmapViewOfSection,
 // NtAllocateVirtualMemory / NtProtectVirtualMemory / NtFreeVirtualMemory (executable

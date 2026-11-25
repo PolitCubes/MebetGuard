@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 """Write the header with the agent hash that the wrapper embeds (ТЗ §4 step 4).
 
 Windows: signing-invariant PE hash, identical to mebet::win::pe_image_hash

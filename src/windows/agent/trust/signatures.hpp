@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Authenticode and catalog signatures of a file (ТЗ §6 «Процедура проверки»).
 //
 // Every signature is read: the primary one and the nested ones (OBS carries RSA + ECC,

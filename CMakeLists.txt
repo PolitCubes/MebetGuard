@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 cmake_minimum_required(VERSION 3.18)
 
 # Mebet Anticheat — native client guard of PolitCubes.

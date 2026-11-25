@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Mebet wrapper for Linux and macOS (ТЗ §11): own executable that starts the JVM through
 // libjli with the guard's -agentpath. Same split as on Windows: this file clears the
 // Java environment, verifies the agent by the SHA-256 embedded at build time, loads it by

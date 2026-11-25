@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Table of allowed executable memory outside images (ТЗ §5 «Чужой код в памяти»).
 // Filled by the hooks when an allowed module asks for executable memory (the JVM code
 // cache, JNA/libffi closures, overlay trampolines…) and by the start-up scan; the region

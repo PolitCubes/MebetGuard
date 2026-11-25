@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
 # Windows: MebetGuard.exe (wrapper) + MebetGuard.dll (agent) for x64, x86 and ARM64.
 
 if(MEBET_ARCH STREQUAL "arm64")

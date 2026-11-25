@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Own-time counter of every module (ТЗ §5: «счётчик собственного времени», §14 замеры).
 // One QueryPerformanceCounter pair per measured block; never used on the fast path of a hook.
 #pragma once

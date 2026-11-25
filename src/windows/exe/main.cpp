@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Mebet wrapper (ТЗ §4). Replaces javaw.exe: the launcher starts this executable with the
 // usual Java command line and JAVA_HOME pointing to the client Java.
 //

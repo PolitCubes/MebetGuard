@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Start of the JVM (ТЗ §4 «Порядок запуска Java», §10) and the checks that must pass
 // before it: Java location, files next to the wrapper, proxy DLLs, agent arguments.
 #pragma once

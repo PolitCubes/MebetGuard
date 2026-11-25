@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Sorted set of address ranges with lock-free readers.
 //
 // Readers (hooks on the hot path) take the current snapshot with one atomic load and

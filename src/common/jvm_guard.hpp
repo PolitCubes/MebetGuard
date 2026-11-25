@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // JVM protection through JVMTI (ТЗ §10, §5 «Защита JVM»). Platform-neutral; every
 // platform supplies the few hooks below.
 //

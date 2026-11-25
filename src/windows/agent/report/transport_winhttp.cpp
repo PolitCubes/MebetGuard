@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 // Report transport on Windows: WinHTTP, the guard's own HTTPS client (ТЗ §12: a second
 // sentry-native client cannot live in the same process). No disk queue: offline = lost.
 #include "core/win_util.hpp"  // windows.h before winhttp.h

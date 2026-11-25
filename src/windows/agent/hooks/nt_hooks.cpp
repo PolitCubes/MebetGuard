@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 PolitCubes
 #include "hooks/nt_hooks.hpp"
 
 #include "nt.hpp"  // windows.h must come before detours.h
