@@ -211,7 +211,11 @@ def guard_ok(ctx, sc, guarded):
     if g.startswith("close:"):
         reason = g.split(":", 1)[1]
         want = ctx.codes[reason]
-        if guarded["exit"] != want:
+        # The guard prints "[Mebet] closed: <reason> (code N)" before any reason window; the
+        # prod build shows that window (ignores MEBET_TEST_NO_UI) and can block on a headless
+        # runner, so accept the stderr line as proof of the close too, not only the exit code.
+        closed = guarded["exit"] == want or ("closed: %s (code %d)" % (reason, want)) in guarded["out"]
+        if not closed:
             return False, "ждали закрытие с кодом %d (%s), получили exit %s" % (want, reason, guarded["exit"])
         return True, "закрыт, код %d (%s)" % (want, reason)
     # neutralize
