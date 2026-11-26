@@ -55,9 +55,12 @@ std::atomic<std::uint64_t> g_beat_worker{0};
 std::atomic<std::uint64_t> g_beat_watchdog{0};
 // Query/synchronize copies only: code in the process that finds them can wait on them, not
 // suspend or end the thread. Read by the worker and by every hook thread, hence atomic. The
-// watchdog thread publishes its own, after its first beat.
+// one of the watchdog thread is made by its creator (the thread itself cannot: the DACL the guard
+// puts on its threads leaves no right to ask for the suspend count) and handed over in
+// g_watchdog_own; the thread publishes it in g_watchdog after its first beat.
 std::atomic<HANDLE> g_worker{nullptr};
 std::atomic<HANDLE> g_watchdog{nullptr};
+std::atomic<HANDLE> g_watchdog_own{nullptr};
 std::atomic<bool> g_watchdog_created{false};
 std::atomic<DWORD> g_worker_tid{0};
 std::atomic<int> g_worker_slow{0};  // SlowWork scopes open on the worker
@@ -257,7 +260,7 @@ DWORD WINAPI watchdog_main(void*) {
         // Published by the thread itself, after its first beat: until it runs there is nothing
         // for the worker or the hooks to find silent or suspended.
         if (!g_watchdog.load(std::memory_order_relaxed))
-            g_watchdog.store(query_copy(GetCurrentThread()), std::memory_order_release);
+            g_watchdog.store(g_watchdog_own.load(std::memory_order_acquire), std::memory_order_release);
 
         const HANDLE w = g_worker.load(std::memory_order_acquire);
         worker.look(now, g_beat_worker.load(std::memory_order_relaxed), suspended(w) == 1, kWatchdogStep);
@@ -313,13 +316,21 @@ void start(HANDLE worker) {
     // created suspended with both published by its creator: the worker — already running — could
     // find it "suspended" before it had ever run, or "silent" while it still waited for the
     // loader behind a library on a slow disk, and a clean launch was closed with guard_stalled.
-    HANDLE w = CreateThread(nullptr, 0, &watchdog_main, nullptr, 0, nullptr);
-    if (!w) {
+    // Suspended only until its handle is handed over; nobody can see it meanwhile.
+    HANDLE w = CreateThread(nullptr, 0, &watchdog_main, nullptr, CREATE_SUSPENDED, nullptr);
+    const HANDLE own = w ? query_copy(w) : nullptr;
+    if (!w || !own) {
+        if (w) {
+            TerminateThread(w, 0);  // never ran
+            CloseHandle(w);
+        }
         on_stall("watchdog thread could not start", true);
         return;
     }
-    CloseHandle(w);
+    g_watchdog_own.store(own, std::memory_order_release);
     g_watchdog_created.store(true, std::memory_order_release);
+    ResumeThread(w);
+    CloseHandle(w);
 }
 
 void worker_tick() {
