@@ -459,10 +459,28 @@ jobs:
     if: always()
     needs: [e2e-windows, e2e-linux, e2e-macos]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
     steps:
       - name: every e2e matrix (and so every build) must be green
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
         run: exit 1
+      # needs.*.result does not see every job of a matrix: one that GitHub cancelled because no
+      # runner ever took it (24 min queued on macOS) left the matrix "success", and ci-ok passed with
+      # a feature that never ran. So every build and e2e job of this attempt is asked for by itself.
+      - name: every single build and e2e job ran and passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bad=$(gh api --paginate \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name != "ci-ok" and .name != "sign" and (.name | startswith("perf ") | not))
+                  | select(.conclusion != "success") | "\(.name): \(.conclusion // .status)"')
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "::error::not every build and e2e job ran and passed"
+            exit 1
+          fi
       - name: all green
         run: echo "all builds and all e2e features passed"
 

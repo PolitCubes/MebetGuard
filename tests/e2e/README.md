@@ -76,7 +76,9 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
             Matrix: e2e-macos     x64 · arm64  ×  то же, что linux (paths-* — на arm64)
             <вариант>: cyrillic · ukrainian · latin · specials · beyond
 3. ci-ok    зависит только от трёх e2e; красный, если любая упала, отменена или пропущена
-            (пропущена = упала её сборка) — его требует правило ветки master
+            (пропущена = упала её сборка) — его требует правило ветки master. Каждое задание сборки
+            и e2e он спрашивает у API по отдельности: отмену внутри матрицы (GitHub так и не дал
+            раннер) needs.*.result не видит
 4. sign     только на тегах v* (на pull request всегда skipped)
 ```
 
