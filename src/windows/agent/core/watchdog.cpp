@@ -62,6 +62,7 @@ std::atomic<HANDLE> g_worker{nullptr};
 std::atomic<HANDLE> g_watchdog{nullptr};
 std::atomic<HANDLE> g_watchdog_own{nullptr};
 std::atomic<bool> g_watchdog_created{false};
+std::atomic<std::uint64_t> g_created_at{0};  // when start() ran: the clock of threads that have not beaten yet
 // Set by the worker on its own thread. Not its thread id: Windows hands the id of a thread that
 // has ended to the next new thread, and that thread would then beat for a dead worker.
 thread_local bool t_worker = false;
@@ -124,9 +125,14 @@ struct Witness {
     }
 };
 
+// For the hooks. A thread that has not made its first beat is not silent yet — but one that was
+// stopped before it could ever beat must not stay invisible for good: it counts from the moment
+// the watchdog was started, with the longer limit a start gets.
 bool silent(const std::atomic<std::uint64_t>& beat, std::uint64_t now, std::uint64_t max) {
     const std::uint64_t b = beat.load(std::memory_order_relaxed);
-    return b && now > b && now - b > max;
+    if (b) return now > b && now - b > max;
+    const std::uint64_t created = g_created_at.load(std::memory_order_relaxed);
+    return created && now > created && now - created > kStartMax;
 }
 
 // "[Mebet] closed: <id> (code <n>) <what>\n" without the CRT: the thread that froze the guard
@@ -355,6 +361,7 @@ void start(HANDLE worker) {
     CloseHandle(worker);
     if (!worker_copy || !config::enabled(config::Module::guard_watchdog)) return;
     g_worker.store(worker_copy, std::memory_order_release);
+    g_created_at.store(now_100ns(), std::memory_order_relaxed);
     // The last-words thread first: a stall found a moment later already has it.
     g_say = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_said = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -380,6 +387,11 @@ void start(HANDLE worker) {
     g_watchdog_created.store(true, std::memory_order_release);
     ResumeThread(w);
     CloseHandle(w);
+}
+
+void worker_started() {
+    t_worker = true;
+    g_beat_worker.store(now_100ns(), std::memory_order_relaxed);
 }
 
 void worker_tick() {
@@ -423,11 +435,12 @@ SlowWork::~SlowWork() {
 std::uint64_t witnessed_100ns() { return g_witnessed.load(std::memory_order_relaxed); }
 
 void check_from_hook() {
+    if (!g_watchdog_created.load(std::memory_order_acquire)) return;
+    // Null until the watchdog thread has made its first beat; then nothing below finds it stopped
+    // and only its silence counts.
     const HANDLE watchdog = g_watchdog.load(std::memory_order_acquire);
-    if (config::kTestBuild && g_watchdog_created.load(std::memory_order_relaxed))
-        trace_hook(now_100ns(), g_worker.load(std::memory_order_acquire), watchdog, guard::closing());
-    if (!watchdog) return;
     const std::uint64_t now = now_100ns();
+    if (config::kTestBuild) trace_hook(now, g_worker.load(std::memory_order_acquire), watchdog, guard::closing());
     if (!silent(g_beat_watchdog, now, kWatchdogSilentMax)) return;  // the fast path
     if (!silent(g_beat_worker, now, kWatchdogSilentMax)) return;      // the worker deals with it
     if (guard::shutting_down() || (g_dll_shutdown && g_dll_shutdown())) return;

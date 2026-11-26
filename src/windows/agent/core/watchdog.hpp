@@ -27,6 +27,10 @@ namespace mebet::watchdog {
 
 // Takes the worker's thread handle (keeps a query/synchronize copy) and starts the watchdog.
 void start(HANDLE worker);
+// The worker, as its very first step: the first heartbeat. Until then it has "not started yet",
+// which is not silence — so the sooner the better: stopped before its first beat, it would be
+// noticed only after the long limit of a start.
+void worker_started();
 // The worker, once per loop: heartbeat + checks the watchdog thread.
 void worker_tick();
 // The worker, inside a task that can run long (file after file on a slow disk, a big file chunk

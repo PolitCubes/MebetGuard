@@ -126,6 +126,7 @@ void drain_deferred() {
 }
 
 DWORD WINAPI worker_main(void*) {
+    watchdog::worker_started();
     Core& c = core();
     game_window::install_in_worker();
     for (;;) {
