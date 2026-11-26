@@ -18,12 +18,18 @@ struct Record {
     std::size_t size;
     trust::Trust trust;
     std::wstring path;  // DOS path from the kernel, may be empty for early modules
+    std::uint64_t serial = 0;  // unique per add: tells this record from a later one at the same base
 };
 
 void init();  // remembers ntdll / kernelbase / kernel32 / self / exe ranges
 
 void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path);
 void remove(std::uintptr_t base);
+// For the sweep, which judges a file while other threads load and unload: adds only when the base
+// has no record yet (the hook that mapped a library there has the last word) and returns the
+// serial of the new record, 0 when nothing was added; remove_if removes only that very record.
+std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path);
+void remove_if(std::uintptr_t base, std::uint64_t serial);
 
 // Lock-free lookups.
 bool find(std::uintptr_t addr, trust::Trust* t = nullptr, std::uintptr_t* base = nullptr);

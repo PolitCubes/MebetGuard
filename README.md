@@ -12,9 +12,10 @@ JVM вместо `javaw.exe`, **одна библиотека-агент** ра�
 | Windows x86 | `MebetGuard.exe` + `MebetGuard.dll` | `x86-mustdie` |
 | Windows ARM64 | `MebetGuard.exe` + `MebetGuard.dll` | `arm64-mustdie` |
 | Linux x64 / ARM64 | `MebetGuard` + `libMebetGuard.so` | `x86-64-linux` / `arm64-linux` |
-| macOS (universal) | `MebetGuard` + `libMebetGuard.dylib` | `x86-64-macosx` / `arm64-macosx` |
+| macOS x64 / ARM64 | `MebetGuard` + `libMebetGuard.dylib` | `x86-64-macosx` / `arm64-macosx` |
 
-Сборки — во вкладке Actions (артефакты `mebet-*`). Подписанных релизов пока нет: условие
+Сборки — во вкладке Actions: артефакты `bin-<os>-<arch>-prod` (release) и `-dev` (devtest, только для
+тестов); у macOS отдельная сборка на каждую архитектуру, не universal. Подписанных релизов пока нет: условие
 первого релиза — собранный список разрешённого и закрытый чеклист `[скан]` (см. ниже).
 
 ## Что проверяет страж

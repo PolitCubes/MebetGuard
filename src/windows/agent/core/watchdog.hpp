@@ -29,8 +29,24 @@ namespace mebet::watchdog {
 void start(HANDLE worker);
 // The worker, once per loop: heartbeat + checks the watchdog thread.
 void worker_tick();
-// The worker, inside a task that can run long (file after file on a slow disk): heartbeat only.
+// The worker, inside a task that can run long (file after file on a slow disk, a big file chunk
+// by chunk): heartbeat only. Does nothing on any other thread, so shared code may call it.
 void worker_beat();
+// Around one call that can take long and shows nothing meanwhile (a signature check, opening a
+// file on a slow disk): on the worker thread its silence gets a much longer limit while the
+// scope is open; on any other thread it does nothing. A healthy game on a cold hard disk was
+// closed with guard_stalled in the middle of such a call — or with it instead of the code of
+// the detection whose file was being hashed.
+class SlowWork {
+public:
+    SlowWork();
+    ~SlowWork();
+    SlowWork(const SlowWork&) = delete;
+    SlowWork& operator=(const SlowWork&) = delete;
+
+private:
+    bool on_worker_;
+};
 // Every NT hook: one load and one compare on the fast path; no TLS, no locks, no allocation.
 void check_from_hook();
 // A clock that stands still while the whole process is held: the time, in 100 ns units, the

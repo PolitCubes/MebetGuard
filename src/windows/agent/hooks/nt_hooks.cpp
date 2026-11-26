@@ -114,7 +114,6 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
         req = execguard::find_requester();
         if (!execguard::may_create_exec(req, "NtMapViewOfSection", 0, view_size ? *view_size : 0)) return kAccessDenied;
     }
-    exec::op_begin();
     const NTSTATUS s =
         real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit, allocation, protect);
     if (nt::ok(s) && base && *base && view_size) {
@@ -122,14 +121,12 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
             if (!gate::on_image_view(section, *base, *view_size)) {
                 real_NtUnmapViewOfSection(process, *base);
                 *base = nullptr;
-                exec::op_end();
                 return kAccessDenied;
             }
         } else if (execguard::executable(protect)) {
             execguard::record(reinterpret_cast<std::uintptr_t>(*base), *view_size, req, exec::Source::map);
         }
     }
-    exec::op_end();
     return s;
 }
 
@@ -140,14 +137,19 @@ NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
     if (tls_ready()) watchdog::check_from_hook();
     if (guard::shutting_down() || !base) return real_NtUnmapViewOfSection(process, base);
     const auto addr = reinterpret_cast<std::uintptr_t>(base);
-    const bool tracked = exec::find(addr) || modules::find(addr);
-    if (!tracked || !execguard::is_current_process(process)) return real_NtUnmapViewOfSection(process, base);
+    // The kernel takes any address inside the view, so the module is found by range and
+    // forgotten by its own base: forgotten by the address the caller passed, a view unmapped
+    // through an address in its middle stayed in the table with its trust.
+    std::uintptr_t module_base = 0;
+    const bool is_module = modules::find(addr, nullptr, &module_base);
+    if ((!is_module && !exec::find(addr)) || !execguard::is_current_process(process))
+        return real_NtUnmapViewOfSection(process, base);
     std::uintptr_t begin = 0, end = 0;
     const bool range = execguard::allocation_range(addr, &begin, &end);
     const NTSTATUS s = real_NtUnmapViewOfSection(process, base);
     if (nt::ok(s)) {
         if (range) exec::forget(begin, end);
-        gate::on_view_unmapped(base);
+        if (is_module) gate::on_view_unmapped(reinterpret_cast<void*>(module_base));
     }
     return s;
 }
@@ -168,12 +170,10 @@ NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_P
     if (!execguard::may_create_exec(req, "NtAllocateVirtualMemory", base && *base ? reinterpret_cast<std::uintptr_t>(*base) : 0,
                                     size ? *size : 0))
         return kAccessDenied;
-    exec::op_begin();
     const NTSTATUS s = real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
     if (nt::ok(s) && base && *base && size) {
         execguard::record(reinterpret_cast<std::uintptr_t>(*base), *size, req, exec::Source::allocate);
     }
-    exec::op_end();
     return s;
 }
 
@@ -200,10 +200,8 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
     }
     const execguard::Requester req = execguard::find_requester();
     if (!execguard::may_create_exec(req, "NtProtectVirtualMemory", addr, *size)) return kAccessDenied;
-    exec::op_begin();
     const NTSTATUS s = real_NtProtectVirtualMemory(process, base, size, protect, old);
     if (nt::ok(s)) execguard::record(reinterpret_cast<std::uintptr_t>(*base), *size, req, exec::Source::protect);
-    exec::op_end();
     return s;
 }
 

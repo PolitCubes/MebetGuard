@@ -250,64 +250,42 @@ bool preexisting_region_ok(std::uintptr_t begin, std::uintptr_t end) {
 
 enum class SweepMode { startup, periodic };
 
-// M-07. A hooked call between op_begin and op_end may be about to record the region it has
-// just made, so a region found while such calls are in flight is only a suspect; still there
-// on the next sweep, it is judged. The sweep used to skip everything while anything was in
-// flight, and a thread killed inside a hook left the counter up for good: the periodic sweep
-// never ran again. Worker thread only, so no lock.
+// A hooked call records the memory it has just made a moment after making it; the loader maps an
+// image a moment before it lists it and drops it from its list (the guard forgets it then) a
+// moment before it unmaps it. The periodic walk can catch any of them in between, and what it
+// sees then looks exactly like foreign code or a hidden image: games were closed for only
+// loading or unloading a library. So before the walk judges such a find it looks again a few
+// times over a quarter of a second. What was only in between has settled by then — recorded,
+// listed or gone; what is still there the same way is judged, in this very sweep.
 //
-// Whether calls are in flight is asked when a region is judged, not once before the walk: a
-// call that starts while the walk is on its way makes its region just as unrecorded for a
-// moment (judge_now). Images have a rule of their own (hidden_image_now).
-std::vector<std::uintptr_t>* g_suspects_prev = new std::vector<std::uintptr_t>();
-std::vector<std::uintptr_t>* g_suspects_now = new std::vector<std::uintptr_t>();
+// M-07, for the record: the sweep used to skip everything while a hooked call was in flight, and
+// a thread killed inside a hook left that counter up for good — the periodic sweep never ran
+// again. Then it kept suspects from one sweep to the next by their address: something that moved
+// between two sweeps, or stayed for less than one interval, was never judged. Neither is needed:
+// a quarter of a second is far more than a live call or the loader takes.
+constexpr DWORD kSettleMs[] = {2, 18, 60, 170};
 
-// True the first time a region is seen while calls are in flight: judge it next sweep.
-bool first_sighting(std::uintptr_t base) {
-    g_suspects_now->push_back(base);
-    return std::find(g_suspects_prev->begin(), g_suspects_prev->end(), base) == g_suspects_prev->end();
+template <typename Settled>
+bool still_there(Settled settled) {
+    for (const DWORD wait : kSettleMs) {
+        if (settled()) return false;
+        Sleep(wait);
+        watchdog::worker_beat();
+    }
+    return !settled();
 }
 
-void rotate_suspects() {
-    std::swap(g_suspects_prev, g_suspects_now);
-    g_suspects_now->clear();
-}
-
+// The image at `alloc` is in the module table, or no image has its base there any more.
 bool image_recorded(std::uintptr_t alloc) {
     if (modules::find(alloc)) return true;
-    MEMORY_BASIC_INFORMATION m{};  // unmapped again: nothing left to judge
+    MEMORY_BASIC_INFORMATION m{};
     return !VirtualQuery(reinterpret_cast<void*>(alloc), &m, sizeof(m)) || m.Type != MEM_IMAGE ||
            reinterpret_cast<std::uintptr_t>(m.AllocationBase) != alloc;
 }
 
-// The periodic walk found an image that is neither in the module table nor in the list of the
-// loader. A hidden image stays that way. A library that is being loaded or unloaded looks the
-// same for a moment, with no hooked call in flight at all: the loader drops a module from its
-// list (and tells the guard, which forgets it) just before it unmaps the image, and maps an
-// image just before it lists it — on some systems with a call the hooks do not see. A game
-// that only unloaded a library was closed for a "hidden image". So the image gets a second look
-// after a moment, and if it is still there it becomes a suspect: closed when the next sweep
-// finds it again, a few seconds later.
-bool hidden_image_now(std::uintptr_t alloc) {
-    Sleep(2);
-    if (image_recorded(alloc) || loader_knows(alloc)) return false;  // listed by now: the next sweep judges its file
-    return !first_sighting(alloc);
-}
-
-// The file of an image the loader lists was refused by the periodic walk. Is the refusal about
-// what is mapped there now? A library unloaded while its file was being judged leaves nothing to
-// read — an empty name, an "unreadable" file — and another library may already sit at the same
-// address; the game was closed for an "untrusted module" with no name. The refusal stands when
-// the same file is still mapped; anything else is a suspect for the next sweep.
-bool refusal_stands(std::uintptr_t alloc, const std::wstring& judged_path) {
-    if (image_recorded(alloc)) return false;  // gone, or recorded by a hook meanwhile
-    if (!judged_path.empty() && iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), judged_path))
-        return true;
-    return !first_sighting(alloc);
-}
-
+// The executable region at `base` is in the table of allowed memory, or is no longer there.
 bool region_recorded(std::uintptr_t base) {
-    MEMORY_BASIC_INFORMATION m{};  // freed or no longer executable: nothing left to judge
+    MEMORY_BASIC_INFORMATION m{};
     if (!VirtualQuery(reinterpret_cast<void*>(base), &m, sizeof(m)) || m.State != MEM_COMMIT || !(m.Protect & 0xF0) ||
         (m.Protect & PAGE_GUARD) || m.Type == MEM_IMAGE)
         return true;
@@ -315,20 +293,22 @@ bool region_recorded(std::uintptr_t base) {
     return exec::covers(b, b + m.RegionSize);
 }
 
-// The periodic walk found something nobody recorded: judge it now? Calls in flight are read
-// before the table: a call that ended in between has recorded its region, and with none in
-// flight nobody is about to. With calls in flight the region gets a moment and a second look;
-// still unrecorded and calls still in flight (the counter may be stuck, M-07), it becomes a
-// suspect for the next sweep.
-template <typename Recorded>
-bool judge_now(std::uintptr_t base, Recorded recorded) {
-    for (int look = 0; look < 2; ++look) {
-        const bool in_flight = exec::ops_in_flight();
-        if (recorded(base)) return false;
-        if (!in_flight) return true;
-        if (look == 0) Sleep(2);
-    }
-    return !first_sighting(base);
+// The same file is still mapped as an image at `alloc`.
+bool same_file_mapped(std::uintptr_t alloc, const std::wstring& path) {
+    return !path.empty() && iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), path);
+}
+
+// The file of an image the loader lists was refused by the periodic walk. Is the refusal about
+// what is mapped there? A library unloaded while its file was being judged leaves nothing to
+// read — an empty name, an "unreadable" file — and another library may already sit at the same
+// address: a game was closed for an "untrusted module" with no name. The refusal stands when,
+// look after look, the image is still there, unrecorded, and no other file has taken its place.
+bool refusal_stands(std::uintptr_t alloc, const std::wstring& judged_path) {
+    return still_there([&] {
+        if (image_recorded(alloc)) return true;
+        const std::wstring now = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+        return !now.empty() && !iequals_ascii(now, judged_path);  // another file: the next sweep judges that one
+    });
 }
 
 void sweep_memory(SweepMode mode) {
@@ -359,14 +339,15 @@ void sweep_memory(SweepMode mode) {
                 const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(alloc));
                 const trust::Decision d = trust::decide_path(path);
                 if (d.verdict.allowed) {
+                    // The verdict is about the file that was mapped when its name was read. The
+                    // library may have been unloaded since, and another loaded at its address:
+                    // recorded only if that file is still what is mapped, never over a record a
+                    // hook has made meanwhile, and taken back if the image went away in between.
                     MODULEINFO mi{};
-                    if (GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(alloc), &mi, sizeof(mi))) {
-                        modules::add(alloc, mi.SizeOfImage, d.verdict.trust, d.facts.path);
-                        // Unloaded while its file was judged: do not leave the address allowed.
-                        MEMORY_BASIC_INFORMATION now{};
-                        if (!VirtualQuery(reinterpret_cast<void*>(alloc), &now, sizeof(now)) || now.Type != MEM_IMAGE ||
-                            reinterpret_cast<std::uintptr_t>(now.AllocationBase) != alloc)
-                            modules::remove(alloc);
+                    if (GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(alloc), &mi, sizeof(mi)) &&
+                        same_file_mapped(alloc, path)) {
+                        const std::uint64_t serial = modules::add_if_absent(alloc, mi.SizeOfImage, d.verdict.trust, d.facts.path);
+                        if (serial && !same_file_mapped(alloc, path)) modules::remove_if(alloc, serial);
                     }
                 } else if (!periodic || refusal_stands(alloc, path)) {
                     gate::deny_module(d, d.verdict.reason, mode == SweepMode::startup ? "startup" : "sweep");
@@ -374,7 +355,9 @@ void sweep_memory(SweepMode mode) {
                 continue;
             }
             if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
-            if (periodic && !hidden_image_now(alloc)) continue;
+            // Neither recorded nor listed: a hidden image stays so, a library in the middle of
+            // loading or unloading does not.
+            if (periodic && !still_there([&] { return image_recorded(alloc) || loader_knows(alloc); })) continue;
             close_hidden_image(alloc);
             continue;
         }
@@ -385,10 +368,9 @@ void sweep_memory(SweepMode mode) {
             exec::allow(base, next, exec::Owner{trust::Trust::os, 0, exec::Source::preexisting});
             continue;
         }
-        if (periodic && !judge_now(base, &region_recorded)) continue;
+        if (periodic && !still_there([&] { return region_recorded(base); })) continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");
     }
-    if (periodic) rotate_suspects();
 }
 
 void sweep_threads(SweepMode mode) {

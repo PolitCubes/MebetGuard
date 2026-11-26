@@ -47,6 +47,11 @@ std::vector<std::wstring> list_dir(const std::wstring& dir, bool* had_subdirs = 
 // is mounted into); one with no DOS name at all comes back as "\\?\GLOBALROOT\Device\…", which every
 // Win32 file API still opens.
 std::wstring nt_to_dos(const std::wstring& nt_path);
+// The path in the form that opens exactly the file it names. Win32 drops a dot or a space at the
+// end of a path component: a mapped image named "name.dll." would be judged by the trusted
+// "name.dll" lying next to it. Such a path gets the long-path prefix, which switches that off;
+// every other path is returned as it is.
+std::wstring exact_path(const std::wstring& path);
 // An existing file or folder as the file system names it (GetFinalPathNameByHandleW): long names,
 // junctions and symbolic links resolved, the DOS form where its volume has one, else the GLOBALROOT
 // form; empty when it cannot be opened. Not for System32 paths in a WOW64 process (redirected).

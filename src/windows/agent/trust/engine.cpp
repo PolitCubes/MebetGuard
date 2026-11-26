@@ -303,7 +303,32 @@ const std::wstring& java_home() { return state().java_home; }
 
 bool is_java_dir_file(const std::wstring& path) { return win::path_under(path, state().java_home); }
 
+namespace {
+
+// Hashes a mapped file chunk by chunk, so that on the worker thread a big file on a slow disk is
+// work the watchdog can see, not half a minute of silence. False when the view faults (the file
+// shrank under it). In a function of its own: structured exception handling cannot share one
+// with objects that have destructors.
+bool sha256_of_view(const void* view, std::size_t total, Sha256Digest& out) {
+    __try {
+        const auto* bytes = static_cast<const unsigned char*>(view);
+        const std::size_t chunk = 4u << 20;
+        Sha256 h;
+        for (std::size_t done = 0; done < total; done += chunk) {
+            h.update(bytes + done, total - done < chunk ? total - done : chunk);
+            watchdog::worker_beat();
+        }
+        out = h.finish();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+}  // namespace
+
 bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
+    watchdog::SlowWork slow;  // the first touch of a file on a cold disk
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) || static_cast<std::uint64_t>(size.QuadPart) > max_bytes) return false;
     if (size.QuadPart == 0) {
@@ -316,12 +341,7 @@ bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
     const void* view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
     bool ok = false;
     if (view) {
-        __try {
-            out = Sha256::of(view, static_cast<std::size_t>(size.QuadPart));
-            ok = true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            ok = false;  // the file shrank under us
-        }
+        ok = sha256_of_view(view, static_cast<std::size_t>(size.QuadPart), out);
         UnmapViewOfFile(view);
     }
     CloseHandle(map);
@@ -329,6 +349,7 @@ bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
 }
 
 Decision decide(HANDLE file, const std::wstring& path_hint) {
+    watchdog::SlowWork slow;  // a signature or catalog check shows nothing while it runs
     State& st = state();
     Decision d;
     FileFacts& f = d.facts;
@@ -442,6 +463,7 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
 }
 
 Decision decide_path(const std::wstring& path) {
+    watchdog::SlowWork slow;  // the open itself can wait on a slow disk
     HANDLE f = open_read(path);
     if (f == INVALID_HANDLE_VALUE) {
         Decision d;

@@ -236,18 +236,28 @@ bool not_a_volume(const std::wstring& device) {
 
 // Asked once per volume: the answer does not change while the volume is mounted, and the question
 // opens a handle — it used to be asked again for every module path, inside the load hook too.
+struct VolumeRoot {
+    std::wstring device;
+    std::wstring root;       // DOS root, "" = none found
+    std::uint64_t asked_ms;  // when
+};
 struct VolumeRoots {
     SRWLOCK lock = SRWLOCK_INIT;
-    std::vector<std::pair<std::wstring, std::wstring>> known;  // device → DOS root ("" = none)
+    std::vector<VolumeRoot> known;
 };
+// "None" may be a volume that really has no DOS name — or one failed open (a filter driver, a
+// moment without resources). Remembered for the whole session, one such failure turned every
+// later path on that volume into the GLOBALROOT form, which compares unequal to every DOS folder.
+constexpr std::uint64_t kNoRootRetryMs = 5000;
 
 std::wstring dos_root_of_volume(const std::wstring& device) {
     static VolumeRoots* const roots = new VolumeRoots();  // leaked: hooks use it while the process exits
     VolumeRoots& v = *roots;
+    const std::uint64_t now = GetTickCount64();
     AcquireSRWLockShared(&v.lock);
-    for (const auto& kv : v.known) {
-        if (iequals_ascii(kv.first, device)) {
-            const std::wstring root = kv.second;
+    for (const VolumeRoot& k : v.known) {
+        if (iequals_ascii(k.device, device) && (!k.root.empty() || now - k.asked_ms < kNoRootRetryMs)) {
+            const std::wstring root = k.root;
             ReleaseSRWLockShared(&v.lock);
             return root;
         }
@@ -255,7 +265,14 @@ std::wstring dos_root_of_volume(const std::wstring& device) {
     ReleaseSRWLockShared(&v.lock);
     const std::wstring root = ask_dos_root_of_volume(device);
     AcquireSRWLockExclusive(&v.lock);
-    if (v.known.size() < 64) v.known.emplace_back(device, root);
+    bool kept = false;
+    for (VolumeRoot& k : v.known) {
+        if (!iequals_ascii(k.device, device)) continue;
+        k.root = root;
+        k.asked_ms = now;
+        kept = true;
+    }
+    if (!kept && v.known.size() < 64) v.known.push_back(VolumeRoot{device, root, now});
     ReleaseSRWLockExclusive(&v.lock);
     return root;
 }
@@ -298,6 +315,23 @@ std::wstring nt_to_dos(const std::wstring& nt_path) {
         return L"\\\\?\\GLOBALROOT" + nt_path;
     }
     return nt_path;
+}
+
+std::wstring exact_path(const std::wstring& path) {
+    if (path.compare(0, 4, L"\\\\?\\") == 0 || path.compare(0, 4, L"\\\\.\\") == 0) return path;
+    if (path.find(L'/') != std::wstring::npos) return path;  // not a name the kernel gave: left to Win32
+    bool trimmed = false;  // a component Win32 would trim (but not "." and "..")
+    for (std::size_t begin = 0; begin < path.size() && !trimmed;) {
+        std::size_t end = path.find(L'\\', begin);
+        if (end == std::wstring::npos) end = path.size();
+        const std::wstring part = path.substr(begin, end - begin);
+        trimmed = !part.empty() && part != L"." && part != L".." && (part.back() == L'.' || part.back() == L' ');
+        begin = end + 1;
+    }
+    if (!trimmed) return path;
+    if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') return L"\\\\?\\" + path;
+    if (path.compare(0, 2, L"\\\\") == 0) return L"\\\\?\\UNC\\" + path.substr(2);
+    return path;
 }
 
 std::wstring canonical_path(const std::wstring& path) {

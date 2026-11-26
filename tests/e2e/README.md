@@ -16,7 +16,9 @@
 атака может тихо не состояться (например, не получилось открыть поток стража), через гвард
 дополнительно проверяется, что атака **была проведена** (строка «заморожено N≥1 потоков»):
 иначе тест падает как недоказательный. «Закрыт» засчитывается по коду выхода; строка
-`[Mebet] closed` без кода — только если приложение действительно остановилось.
+`[Mebet] closed` без кода — только если приложение действительно остановилось. Атака изнутри
+игры засчитывается, только если игра до неё дошла (строка `TARGET action:`): страж, который
+по ошибке отверг библиотеку самой JVM, выходит с тем же кодом ещё до `main()`.
 
 Легитимное действие (обычный запуск, тысячи потоков, JIT, библиотека самой Java, обычный
 нативный вызов через FFM) должно работать **в обоих** прогонах: страж не должен мешать игре.
@@ -26,6 +28,10 @@
 ```
 pytest tests/e2e -v --guard <MebetGuard> --java <JAVA_HOME> [--untrusted-native <lib>]
 ```
+
+Сценарий `dev_mode` (prod-сборка на машине в dev-режиме закрывается с 203) в обычном прогоне
+пропускается: с любой другой сборкой или машиной он пройти не может. Его включает
+`--expect-dev-mode` — так его запускает CI на prod-сборке.
 
 ```
 tests/e2e/test_layers.py::test_layer[module_trust_load-baseline]  PASSED   без гварда: атака сработала
@@ -59,8 +65,8 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
             Matrix: build-linux-binaries     linux x64 prod · x64 dev · arm64 prod · arm64 dev
             Matrix: build-macos-binaries     macos x64 prod · x64 dev · arm64 prod · arm64 dev
 2. e2e      (каждая — после сборки своей ОС; джоб на архитектуру × фичу)
-            Matrix: e2e-windows   x64 · x86 · arm64  ×  env_hardening_jto · env_hardening_jdk ·
-                                  jvm_agents_javaagent · jvm_agents_agentpath · module_trust_load · dev_mode
+            Matrix: e2e-windows   x64 · x86 · arm64  ×  каждый сценарий из harness.SCENARIOS для Windows
+                                  (на x86 — без сценариев FFM)
             Matrix: e2e-linux     x64 · arm64  ×  env_hardening_jto · env_hardening_jdk ·
                                   jvm_agents_javaagent · jvm_agents_agentpath
             Matrix: e2e-macos     x64 · arm64  ×  то же, что linux
@@ -138,6 +144,7 @@ Liberica (BellSoft): гвард доверяет издателю Java игры,
 | `debugger` | юзермод-отладчик | закрыть | 218 | ⬜ |
 | `input_source` | синтетический ввод `SendInput` | отбросить + отчёт | — | ⬜ (Windows) |
 | `process_dacl` | чужая программа: `OpenProcess` на запись памяти и создание потоков | DACL не пускает | — | ✅ (Windows) |
+| `guard_watchdog` | окно причины закрытия никто не закрыл, игра работает за ним | завершить процесс самому, с кодом причины, когда срок закрытия вышел | код причины | ✅ (Windows) |
 | `extension_point_disable` | не-MS AppInit_DLLs | не загрузить | — | ⬜ (Windows) |
 | `posix_preload` | `LD_PRELOAD` чужой библиотеки | отчёт | — | ⬜ (Linux) |
 | `wine` | запуск под Wine | отчёт | — | ⬜ |

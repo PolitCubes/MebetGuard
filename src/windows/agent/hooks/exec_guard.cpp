@@ -54,7 +54,10 @@ void close_foreign_code(const Requester& r, const char* operation, std::uintptr_
     if (r.from_jvm_code) w.field("requester_kind", "jvm_generated_code");
     w.end_object();
     ev.extra_json = w.take();
-    ev.fingerprint = {"close.foreign_code", cards::address_owner_key(r.address)};
+    // Java code has no module to name it by, and the hash of the JIT region it sits in is new in
+    // every session: one issue for all such requests.
+    ev.fingerprint = {"close.foreign_code", r.from_jvm_code ? std::string("jvm_generated_code")
+                                                             : cards::address_owner_key(r.address)};
     guard::signal(config::Module::foreign_exec_memory, config::Reason::foreign_code, std::wstring(), std::move(ev));
 }
 

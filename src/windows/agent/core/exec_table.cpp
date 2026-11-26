@@ -23,8 +23,6 @@ RangeSet<Owner>& table() {
     return *t;
 }
 
-std::atomic<long> g_in_flight{0};
-
 }  // namespace
 
 void allow(std::uintptr_t begin, std::uintptr_t end, const Owner& owner) {
@@ -43,9 +41,5 @@ bool find(std::uintptr_t addr, Owner* out) {
 
 bool covers(std::uintptr_t begin, std::uintptr_t end) { return table().covers(begin, end); }
 bool overlaps(std::uintptr_t begin, std::uintptr_t end) { return table().overlaps(begin, end); }
-
-void op_begin() { g_in_flight.fetch_add(1, std::memory_order_acq_rel); }
-void op_end() { g_in_flight.fetch_sub(1, std::memory_order_acq_rel); }
-bool ops_in_flight() { return g_in_flight.load(std::memory_order_acquire) != 0; }
 
 }  // namespace mebet::exec

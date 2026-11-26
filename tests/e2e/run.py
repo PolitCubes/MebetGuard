@@ -29,9 +29,12 @@ def main():
     ap.add_argument("--only", default="", help="comma-separated scenario ids")
     ap.add_argument("--untrusted-native", default=None)
     ap.add_argument("--json", default="")
+    ap.add_argument("--expect-dev-mode", action="store_true",
+                    help="the guard is a release build and this machine is in dev mode: run the dev_mode scenario")
     a = ap.parse_args()
 
     ctx = harness.Ctx(a.guard, a.java, a.work, a.untrusted_native)
+    ctx.expect_dev_mode = a.expect_dev_mode
     if not ctx.guard.exists():
         sys.exit("guard not found: " + str(ctx.guard))
     if not ctx.java.exists():

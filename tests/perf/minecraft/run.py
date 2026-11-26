@@ -115,7 +115,7 @@ def one(a, mode, copy, pristine, profile, cp, run_no):
     java_home = Path(a.java).resolve()
     head = Path(a.guard).resolve() if mode == "guarded" else java_home / "bin" / "java.exe"
     cmd = [head, "-Xmx" + a.xmx] + profile["jvmArgs"] + [
-        "-Dfile.encoding=UTF-8",
+        "-Dfile.encoding=UTF-8", "-Dmebet.reports=false", "-Dmebet.errors=false",  # a measurement sends nothing
         "-Djava.library.path=" + str(copy / "natives" / a.natives),
         "-Dmcbench.world=" + a.world, "-Dmcbench.warmup=%g" % a.warmup,
         "-Dmcbench.measure=%g" % a.measure, "-Dmcbench.out=" + str(result),

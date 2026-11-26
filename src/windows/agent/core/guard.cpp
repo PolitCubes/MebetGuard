@@ -82,7 +82,9 @@ void drain_deferred() {
 
 [[noreturn]] void run_close(CloseRequest& r) {
     Core& c = core();
-    c.flow_started.store(true);
+    if (c.flow_started.exchange(true)) {
+        for (;;) Sleep(INFINITE);  // another thread is already closing
+    }
     const auto& def = config::reason(r.reason);
 
     // 1. The game disappears at once; the splash gives way to the reason window (ТЗ §4).
@@ -178,10 +180,13 @@ void arm() { core().armed.store(true, std::memory_order_release); }
 
 void request_close(config::Reason reason, const std::wstring& detail, report::Event ev) {
     Core& c = core();
-    bool expected = false;
-    if (!c.closing.compare_exchange_strong(expected, true)) return;  // the first reason wins
-    c.exit_code.store(config::reason(reason).exit_code);
+    // The first reason wins, and its exit code and request are in place before anyone can see
+    // the close as pending: whoever ends a pending close (the watchdog, a hook) must not find
+    // code 0 — a launcher reads that as a normal exit.
+    int none = 0;
+    if (!c.exit_code.compare_exchange_strong(none, config::reason(reason).exit_code)) return;
     c.close.store(new CloseRequest{reason, detail, std::move(ev)});
+    c.closing.store(true, std::memory_order_release);
     if (c.wake) SetEvent(c.wake);
 }
 
@@ -189,7 +194,7 @@ void close_now(config::Reason reason, const std::wstring& detail, report::Event 
     request_close(reason, detail, std::move(ev));
     Core& c = core();
     CloseRequest* r = c.close.load();
-    if (!r || c.flow_started.load()) {
+    if (!r) {
         for (;;) Sleep(INFINITE);  // another thread is closing
     }
     run_close(*r);

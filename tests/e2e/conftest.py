@@ -13,6 +13,8 @@ def pytest_addoption(parser):
     g.addoption("--untrusted-native", default=None, help="prebuilt unsigned native (no compiler)")
     g.addoption("--no-skip", action="store_true",
                 help="fail instead of skipping a scenario that cannot run here (CI)")
+    g.addoption("--expect-dev-mode", action="store_true",
+                help="the guard is a release build and this machine is in dev mode: run the dev_mode scenario")
 
 
 @pytest.fixture(scope="session")
@@ -28,5 +30,6 @@ def ctx(request):
     if not c.java.exists():
         pytest.fail("нет java: %s" % c.java)
     c.no_skip = request.config.getoption("--no-skip")
+    c.expect_dev_mode = request.config.getoption("--expect-dev-mode")
     harness.build_fixtures(c)
     return c

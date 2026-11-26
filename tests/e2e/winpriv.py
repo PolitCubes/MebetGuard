@@ -221,7 +221,11 @@ def set_debug_privilege(enable):
                                     ctypes.byref(size))
         if not ok or ctypes.get_last_error() == 1300:  # ERROR_NOT_ALL_ASSIGNED: no such privilege
             return None
-        return bool(old.PrivilegeCount and old.Privileges[0].Attributes & 0x2)
+        # The previous state lists only what changed: nothing listed means the privilege already
+        # was as asked. Read as "was off", an enabled privilege got switched off after the call.
+        if not old.PrivilegeCount:
+            return bool(enable)
+        return bool(old.Privileges[0].Attributes & 0x2)
     finally:
         _CloseHandle(tok)
 

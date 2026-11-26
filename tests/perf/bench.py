@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -68,6 +69,8 @@ def run(cmd, env, timeout=600):
 
 def build(java_home, work):
     classes = work / "classes"
+    # From scratch: a class left by a run with a newer JDK (MebetBenchFfm) breaks an older one.
+    shutil.rmtree(classes, ignore_errors=True)
     classes.mkdir(parents=True, exist_ok=True)
     sources = [HERE / "MebetBench.java", HERE / "MebetBenchPayload.java"]
     if java_feature(java_home) >= 22:
@@ -115,7 +118,8 @@ def main():
     env = os.environ.copy()
     env["JAVA_HOME"] = str(java_home)
     env["MEBET_TEST_NO_UI"] = "1"
-    jvm = ["-Xmx" + a.xmx]
+    # Reports off: a measurement must never send anything, whatever DSN the build has.
+    jvm = ["-Xmx" + a.xmx, "-Dmebet.reports=false", "-Dmebet.errors=false"]
     if java_feature(java_home) >= 22:
         jvm.append("--enable-native-access=ALL-UNNAMED")
     head = {"baseline": java, "guarded": guard}

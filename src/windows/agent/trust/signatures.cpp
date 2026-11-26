@@ -253,7 +253,13 @@ std::uint32_t pinned_by_own_chain(PCCERT_CONTEXT leaf, HCERTSTORE extra, int* ro
     return mask;
 }
 
-void fill_signer(CRYPT_PROVIDER_DATA* prov, Signer& s) {
+// system_chain_valid: WinVerifyTrust succeeded, so the chain it built is a validated one. With
+// any other result that still gets here (an untrusted root, a chaining error) the chain is only a
+// list of certificates: Windows names its worst problem and says nothing of the rest — a root it
+// does not trust outranks an issuer that is no CA at all. A pinned root found in such a list
+// proves nothing, so then only the chain built here against the pinned roots, with its errors
+// checked, can name one.
+void fill_signer(CRYPT_PROVIDER_DATA* prov, Signer& s, bool system_chain_valid) {
     CRYPT_PROVIDER_SGNR* sgnr = WTHelperGetProvSignerFromChain(prov, 0, FALSE, 0);
     if (!sgnr) return;
     CRYPT_PROVIDER_CERT* pc = WTHelperGetProvCertFromChain(sgnr, 0);
@@ -281,10 +287,12 @@ void fill_signer(CRYPT_PROVIDER_DATA* prov, Signer& s) {
         s.root_sha256 = Sha256::of(root->pbCertEncoded, root->cbCertEncoded);
         s.ms_os = microsoft_root(sgnr->pChainContext, 0);
         s.ms_app = !s.ms_os && microsoft_root(sgnr->pChainContext, kMicrosoftRootCheckApplicationRoot);
-        s.pinned_root = pinned_index(root);
+        if (system_chain_valid) s.pinned_root = pinned_index(root);
     }
-    s.pinned_mask = pinned_mask_of(sgnr->pChainContext);
-    if (s.pinned_root >= 0) s.pinned_mask |= 1u << s.pinned_root;
+    if (system_chain_valid) {
+        s.pinned_mask = pinned_mask_of(sgnr->pChainContext);
+        if (s.pinned_root >= 0) s.pinned_mask |= 1u << s.pinned_root;
+    }
     if (!s.ms_os && !s.ms_app && s.pinned_mask == 0) {
         // The system chain holds no pinned root: try the pinned roots with the
         // certificates that came with the signature.
@@ -324,7 +332,7 @@ LONG verify_one(DWORD union_choice, void* info, SignatureSettings* settings, Sig
     *got = false;
     if (digest_ok(r) && wd.hWVTStateData) {
         if (CRYPT_PROVIDER_DATA* prov = WTHelperProvDataFromStateData(wd.hWVTStateData)) {
-            fill_signer(prov, *signer);
+            fill_signer(prov, *signer, r == ERROR_SUCCESS);
             *got = !signer->cn.empty() || !signer->o.empty();
         }
     }

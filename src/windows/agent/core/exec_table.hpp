@@ -35,9 +35,4 @@ bool find(std::uintptr_t addr, Owner* out = nullptr);
 bool covers(std::uintptr_t begin, std::uintptr_t end);
 bool overlaps(std::uintptr_t begin, std::uintptr_t end);
 
-// A hook is between the real call and allow(): the sweep must not judge right now.
-void op_begin();
-void op_end();
-bool ops_in_flight();
-
 }  // namespace mebet::exec

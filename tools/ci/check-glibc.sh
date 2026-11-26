@@ -11,7 +11,8 @@ GLIBC_FLOOR="GLIBC_2.28"
 GLIBCXX_FLOOR="GLIBCXX_3.4.25"
 
 newest() {  # newest "<prefix>_<version>" the files need, empty when none
-  readelf -V "${@:2}" | grep -o "$1_[0-9][0-9.]*" | sort -uV | tail -1
+  # grep finds nothing when no such symbol is needed: that is an answer, not a failure.
+  { readelf -V "${@:2}" | grep -o "$1_[0-9][0-9.]*" || true; } | sort -uV | tail -1
 }
 
 bad=0

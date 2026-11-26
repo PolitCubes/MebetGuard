@@ -10,6 +10,8 @@
 // Observability the oracle in run.py relies on (every line flushed):
 //   "TARGET up pid=<n>"      — the JVM reached main()
 //   "TARGET alive <i>"       — heartbeat i (the app is still running)
+//   "TARGET action: <a>"     — the in-process action is about to run: the game got that far.
+//                              A close before this line was not about the action at all.
 //   "TARGET did <marker>"    — an in-process action asked for by -Dmebet.cmd ran. For an
 //                              attack (what a cheat mod does from inside the JVM) its
 //                              presence is the proof the attack worked, and with the guard in
@@ -35,6 +37,8 @@ public class MebetTarget {
         String cmdFile = System.getProperty("mebet.cmd", "");
         if (!cmdFile.isEmpty() && Files.exists(Paths.get(cmdFile))) {
             String action = Files.readAllLines(Paths.get(cmdFile)).get(0).trim();
+            System.out.println("TARGET action: " + action);
+            System.out.flush();
             runAction(action);  // models what a cheat jar does from inside the JVM
         }
 

@@ -81,6 +81,7 @@ class Ctx:
         self.ffm = False    # Foreign Function & Memory API in the target (Java 22+)
         self.admin = bool(winpriv and winpriv.is_admin())
         self.no_skip = False
+        self.expect_dev_mode = False  # --expect-dev-mode: a release build on a dev-mode machine
 
     def tool(self, name):
         return self.java_home / "bin" / (name + EXE)
@@ -241,7 +242,8 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
     env["MEBET_TEST_NO_UI"] = "1"
     if extra_env:
         env.update(extra_env)
-    pre = ["-Dmebet.iters=%d" % iters]
+    # Reports and error reports off: a test run must never send anything, whatever DSN the build has.
+    pre = ["-Dmebet.reports=false", "-Dmebet.errors=false", "-Dmebet.iters=%d" % iters]
     if action is not None:
         cmd_file = ctx.work / ("action_%s.txt" % mode)
         cmd_file.write_text(action + "\n", encoding="utf-8")
@@ -301,12 +303,23 @@ def _agent(jar):
     return "-javaagent:" + str(jar)
 
 
+def _agent_env(jar):
+    """The same option for JAVA_TOOL_OPTIONS / JDK_JAVA_OPTIONS: both are split on spaces, so a
+    path with a space (a checkout under "Program Files", a user name with one) must be quoted —
+    with forward slashes, because inside quotes JDK_JAVA_OPTIONS reads a backslash as an escape."""
+    path = str(jar)
+    return _agent(jar) if " " not in path else '-javaagent:"%s"' % path.replace("\\", "/")
+
+
 def _sc(**kw):
     kw.setdefault("os", ALL)
     kw.setdefault("needs_native", False)
     kw.setdefault("needs_ffm", False)
     kw.setdefault("proof", [])
     kw.setdefault("privs", "game")
+    kw.setdefault("ingame", False)         # the attack runs inside the started game (an action)
+    kw.setdefault("strict_exit", False)    # the process must end by itself with the code
+    kw.setdefault("needs_dev_mode", False)
     return kw
 
 
@@ -364,10 +377,10 @@ SCENARIOS = [
     # ---- attacks: the start of the JVM -----------------------------------------------------------
     _sc(id="env_hardening_jto", kind="attack", module="env_hardening", guard="neutralize",
         title="Чужой агент через JAVA_TOOL_OPTIONS", marker="ATTACK agent premain ran",
-        build=lambda ctx, native, jar: dict(extra_env={"JAVA_TOOL_OPTIONS": _agent(jar)})),
+        build=lambda ctx, native, jar: dict(extra_env={"JAVA_TOOL_OPTIONS": _agent_env(jar)})),
     _sc(id="env_hardening_jdk", kind="attack", module="env_hardening", guard="neutralize",
         title="Чужой агент через JDK_JAVA_OPTIONS", marker="ATTACK agent premain ran",
-        build=lambda ctx, native, jar: dict(extra_env={"JDK_JAVA_OPTIONS": _agent(jar)})),
+        build=lambda ctx, native, jar: dict(extra_env={"JDK_JAVA_OPTIONS": _agent_env(jar)})),
     _sc(id="jvm_agents_javaagent", kind="attack", module="jvm_agents", guard="close:foreign_agent_arg",
         title="Чужой -javaagent (Java-агент)", marker="ATTACK agent premain ran",
         build=lambda ctx, native, jar: dict(jvm_args=[_agent(jar)])),
@@ -377,24 +390,35 @@ SCENARIOS = [
         build=lambda ctx, native, jar: dict(jvm_args=["-agentpath:" + str(native)])),
     # The locked dev-mode check: on a dev-mode / test-signing machine the prod build must close
     # before the JVM even starts. Only passes where the machine really is in dev mode (the CI
-    # Windows runners); the e2e-windows job runs it against the prod (release) build.
-    _sc(id="dev_mode", kind="attack", module="dev_mode", os=WIN, guard="close:dev_mode",
+    # Windows runners); the e2e-windows job runs it against the prod (release) build. With any
+    # other build or machine it cannot pass, so it runs only when asked for (--expect-dev-mode):
+    # a full local run would otherwise never be green.
+    _sc(id="dev_mode", kind="attack", module="dev_mode", os=WIN, guard="close:dev_mode", needs_dev_mode=True,
         title="Запуск prod-сборки в dev-режиме → закрытие", marker="TARGET up pid=",
         build=lambda ctx, native, jar: dict()),
 
     # ---- attacks: inside the running game --------------------------------------------------------
-    _sc(id="module_trust_load", kind="attack", module="module_trust", os=WIN, needs_native=True,
+    _sc(id="module_trust_load", kind="attack", module="module_trust", os=WIN, needs_native=True, ingame=True,
         guard="close:untrusted_module", title="System.load неподписанной нативной библиотеки",
         marker="TARGET did load-native",
         build=lambda ctx, native, jar: dict(action="load-native " + str(native))),
-    _sc(id="jvm_agent_module", kind="attack", module="jvm_agents", os=WIN, guard="close:jvm_agent_module",
+    # The close with the reason window left open (no MEBET_TEST_NO_UI) and nobody to dismiss it:
+    # the game keeps running behind the window for 75 s, and the guard must end the process
+    # itself, with the code of the reason, when the time for a close is up.
+    _sc(id="close_window_timeout", kind="attack", module="guard_watchdog", os=WIN, needs_native=True, ingame=True,
+        guard="close:untrusted_module", strict_exit=True, timeout=120,
+        title="Окно причины никто не закрыл: процесс завершается сам, с кодом причины",
+        marker="TARGET did load-native", proof=[r"\[Mebet\] closed: pending_close .*not finished in time"],
+        build=lambda ctx, native, jar: dict(action="load-native " + str(native), iters=300,
+                                            extra_env={"MEBET_TEST_NO_UI": ""})),
+    _sc(id="jvm_agent_module", kind="attack", module="jvm_agents", os=WIN, guard="close:jvm_agent_module", ingame=True,
         title="Модуль агентов JDK (instrument) в рантайме", marker="TARGET did load-library instrument",
         build=lambda ctx, native, jar: dict(action="load-library instrument")),
-    _sc(id="foreign_exec_alloc", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True,
+    _sc(id="foreign_exec_alloc", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
         guard="close:foreign_code", title="FFM: VirtualAlloc(RWX) + шелл-код из Java",
         marker="TARGET did ffm-exec-alloc",
         build=lambda ctx, native, jar: dict(action="ffm-exec-alloc")),
-    _sc(id="foreign_exec_protect", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True,
+    _sc(id="foreign_exec_protect", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
         guard="close:foreign_code", title="FFM: VirtualProtect(RX) + шелл-код из Java",
         marker="TARGET did ffm-exec-protect",
         build=lambda ctx, native, jar: dict(action="ffm-exec-protect")),
@@ -405,20 +429,20 @@ SCENARIOS = [
         build=lambda ctx, native, jar: dict(action="none", iters=16)),
 
     # ---- attacks: on the guard itself ------------------------------------------------------------
-    _sc(id="tamper_freeze_guard", kind="attack", module="guard_watchdog", os=WIN, needs_native=True,
+    _sc(id="tamper_freeze_guard", kind="attack", module="guard_watchdog", os=WIN, needs_native=True, ingame=True,
         needs_ffm=True, guard="close:guard_stalled", timeout=60, expect=_tamper_threads("froze"),
         title="Заморозить потоки стража, затем загрузить чужой натив", marker="TARGET did ffm-freeze-guard",
         build=lambda ctx, native, jar: dict(action="ffm-freeze-guard " + str(native), iters=2)),
-    _sc(id="tamper_kill_guard", kind="attack", module="guard_watchdog", os=WIN, needs_native=True,
+    _sc(id="tamper_kill_guard", kind="attack", module="guard_watchdog", os=WIN, needs_native=True, ingame=True,
         needs_ffm=True, guard="close:guard_stalled", timeout=60, expect=_tamper_threads("killed"),
         title="Убить потоки стража, затем загрузить чужой натив", marker="TARGET did ffm-kill-guard",
         build=lambda ctx, native, jar: dict(action="ffm-kill-guard " + str(native), iters=2)),
-    _sc(id="tamper_unload_guard", kind="attack", module="module_trust", os=WIN, needs_native=True,
+    _sc(id="tamper_unload_guard", kind="attack", module="module_trust", os=WIN, needs_native=True, ingame=True,
         needs_ffm=True, guard="close:untrusted_module", timeout=60,
         title="FreeLibrary на страже, затем загрузить чужой натив", marker="TARGET did ffm-unload-guard",
         proof=[r"TARGET called FreeLibrary on the guard [1-9]\d* times"],
         build=lambda ctx, native, jar: dict(action="ffm-unload-guard " + str(native), iters=2)),
-    _sc(id="tamper_jam_sweep", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True,
+    _sc(id="tamper_jam_sweep", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
         guard="close:foreign_code", timeout=90,
         title="Убить потоки посреди хука, затем RWX мимо хуков (только обход)",
         marker="TARGET did ffm-jam-sweep", proof=[r"TARGET killed [1-9]\d* threads inside MapViewOfFile"],
@@ -453,6 +477,8 @@ def applies(sc, ctx, variant=(None, None)):
     """None if the scenario runs here at this variant, else a reason to skip it."""
     if ctx.os not in sc["os"]:
         return "не для %s" % ctx.os
+    if sc["needs_dev_mode"] and not ctx.expect_dev_mode:
+        return "только для prod-сборки на машине в dev-режиме (запускается с --expect-dev-mode)"
     if sc["needs_native"] and ctx.native is None:
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:
@@ -515,6 +541,11 @@ def guard_ok(ctx, sc, guarded, exp=None):
 
     if has(guarded, sc["marker"]):
         return False, "маркер атаки всё же появился: %r" % sc["marker"]
+    # An attack from inside the game proves something only if the game got as far as starting it:
+    # a guard that refuses the JVM's own library exits with the very same code before main().
+    if sc["ingame"] and not has(guarded, "TARGET action: "):
+        return False, ("игра закрыта раньше, чем атака началась (нет «TARGET action:», exit %s) — "
+                       "проверка ничего не доказала" % guarded["exit"])
     for rx in exp["proof"]:
         if not re.search(rx, guarded["out"]):
             return False, "атака не была проведена так, как ждали (нет %r) — проверка ничего не доказала" % rx
@@ -527,7 +558,7 @@ def guard_ok(ctx, sc, guarded, exp=None):
         # headless runner until the harness kills it: then the "[Mebet] closed" line is the
         # proof — but only if the app really stopped (it never reached its end).
         closed = _closed_line(guarded)
-        if closed and closed[1] in wants and not has(guarded, "TARGET exit"):
+        if closed and closed[1] in wants and not has(guarded, "TARGET exit") and not sc["strict_exit"]:
             return True, "закрыт, код %d (%s)" % (closed[1], closed[0])
         return False, "ждали закрытие с кодом %s, получили exit %s%s" % (
             "/".join("%d (%s)" % (c, r) for c, r in wants.items()), guarded["exit"],

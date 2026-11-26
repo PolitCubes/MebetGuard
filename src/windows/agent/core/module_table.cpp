@@ -39,6 +39,7 @@ struct Names {
 
 std::atomic<Names*> g_names{nullptr};
 Names& names() { return once(g_names); }
+std::atomic<std::uint64_t> g_serial{0};
 
 struct Span {
     std::uintptr_t begin = 0, end = 0;
@@ -73,26 +74,57 @@ void init() {
     g_self = span_of(self_module());
 }
 
+// The range and the record of a module change together, under the lock of the names: with the
+// two steps apart, a record removed by one thread and added again by another could end up
+// without its range (or with the range of the one that is gone).
 void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path) {
     if (!base || !size) return;
-    ranges().add(base, base + size, Payload{t, base}, false);
     Names& n = names();
     AcquireSRWLockExclusive(&n.lock);
-    n.records[base] = Record{base, size, t, path};
+    auto it = n.records.find(base);
+    if (it != n.records.end() && it->second.size > size) ranges().remove(base, base + it->second.size);
+    ranges().add(base, base + size, Payload{t, base}, false);
+    n.records[base] = Record{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1};
     ReleaseSRWLockExclusive(&n.lock);
 }
 
-void remove(std::uintptr_t base) {
+std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path) {
+    if (!base || !size) return 0;
     Names& n = names();
-    std::size_t size = 0;
+    std::uint64_t serial = 0;
     AcquireSRWLockExclusive(&n.lock);
-    auto it = n.records.find(base);
-    if (it != n.records.end()) {
-        size = it->second.size;
-        n.records.erase(it);
+    if (n.records.find(base) == n.records.end()) {
+        serial = g_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+        ranges().add(base, base + size, Payload{t, base}, false);
+        n.records[base] = Record{base, size, t, path, serial};
     }
     ReleaseSRWLockExclusive(&n.lock);
+    return serial;
+}
+
+namespace {
+void remove_locked(Names& n, std::map<std::uintptr_t, Record>::iterator it) {
+    const std::uintptr_t base = it->second.base;
+    const std::size_t size = it->second.size;
+    n.records.erase(it);
     if (size) ranges().remove(base, base + size);
+}
+}  // namespace
+
+void remove(std::uintptr_t base) {
+    Names& n = names();
+    AcquireSRWLockExclusive(&n.lock);
+    auto it = n.records.find(base);
+    if (it != n.records.end()) remove_locked(n, it);
+    ReleaseSRWLockExclusive(&n.lock);
+}
+
+void remove_if(std::uintptr_t base, std::uint64_t serial) {
+    Names& n = names();
+    AcquireSRWLockExclusive(&n.lock);
+    auto it = n.records.find(base);
+    if (it != n.records.end() && it->second.serial == serial) remove_locked(n, it);
+    ReleaseSRWLockExclusive(&n.lock);
 }
 
 bool find(std::uintptr_t addr, trust::Trust* t, std::uintptr_t* base) {

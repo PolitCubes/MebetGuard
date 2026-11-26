@@ -2,6 +2,8 @@
 // Copyright (c) 2026 PolitCubes
 #include "trust/file_identity.hpp"
 
+#include "core/win_util.hpp"
+
 namespace mebet::trust {
 
 namespace {
@@ -81,8 +83,8 @@ std::wstring final_path(HANDLE file) {
 }
 
 HANDLE open_read(const std::wstring& path) {
-    return CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return CreateFileW(win::exact_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
 }  // namespace mebet::trust

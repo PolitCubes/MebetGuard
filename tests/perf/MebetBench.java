@@ -358,9 +358,10 @@ public final class MebetBench {
         final long start = System.nanoTime(), stop = start + window;
         long next = start;
         while (System.nanoTime() < stop && n < work.length) {
-            long t0 = System.nanoTime();
+            // From the moment the frame was due, not from the moment it started: a stall that
+            // begins while waiting for the next frame delays that frame just the same.
             frame.run();
-            long dt = System.nanoTime() - t0;
+            long dt = System.nanoTime() - next;
             work[n++] = dt;
             if (dt > budget) over++;
             next += budget;

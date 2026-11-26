@@ -158,6 +158,7 @@ jobs:
           - foreign_exec_alloc
           - foreign_exec_protect
           - process_dacl_open
+          - close_window_timeout
           # attacks on the guard itself
           - tamper_freeze_guard
           - tamper_kill_guard
@@ -167,7 +168,8 @@ jobs:
           - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     vc: x64,     dir: x86-64-mustdie }
           - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     vc: x64_x86, dir: x86-mustdie }
           - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
-          - { feature: dev_mode, variant: prod }   # the prod build must close on a dev-mode runner (203)
+          # the prod build must close on a dev-mode runner (203)
+          - { feature: dev_mode, variant: prod, extra: "--expect-dev-mode" }
         # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
         # attacks cannot exist there.
         exclude:
@@ -222,10 +224,12 @@ jobs:
           New-ItemProperty -Path $k -Name DumpType -Value 1 -PropertyType DWord -Force | Out-Null
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         shell: pwsh
+        env:
+          PYTHONUTF8: "1"   # the verdict lines are Russian: without it the log shows \uXXXX escapes
         run: |
           python -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' `
             --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
-            --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll"
+            --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll" ${{ matrix.extra }}
       - name: crash report (faulting module, JVM hs_err, stack)
         if: failure()
         shell: pwsh
