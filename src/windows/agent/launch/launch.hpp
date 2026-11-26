@@ -16,6 +16,9 @@ struct Jli;
 
 struct Context {
     std::wstring java_home;
+    // The Java bin folder jli.dll is loaded from: its 8.3 form when the ANSI code page cannot
+    // express the long one (JLI reads its own path back in that code page).
+    std::wstring jli_dir;
     std::wstring exe_path;
     std::wstring exe_dir;
     std::wstring agent_path;
@@ -24,7 +27,8 @@ struct Context {
     std::vector<std::wstring> natives_dirs;
 };
 
-// JAVA_HOME from the launcher (LauncherGuard_lmodule sets it); closes if unusable.
+// JAVA_HOME from the launcher (LauncherGuard_lmodule sets it); closes if unusable — also when
+// the ANSI code page cannot express the folder and it has no 8.3 name (unsupported_path).
 void locate_java(Context& ctx);
 
 // ТЗ §4 steps 5–8: jli.dll by full path, AddDllDirectory, exports, JLI_InitArgProcessing

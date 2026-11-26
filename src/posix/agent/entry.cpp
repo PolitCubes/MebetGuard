@@ -285,6 +285,10 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
     while (g_java_home.size() > 1 && g_java_home.back() == '/') g_java_home.pop_back();
     if (g_java_home.empty()) close_now(config::Reason::java_not_found, "JAVA_HOME", report::Event{});
     g_agent_path = self_library_path();
+    // The JVM cuts -agentpath:<path>=<options> at the first "=", and there is no escape. Linux
+    // passes /proc/self/fd/N (the name the wrapper loaded the agent by); macOS passes the real path,
+    // and a guard folder with "=" in its name would end in "Could not find agent library".
+    if (g_agent_path.find('=') != std::string::npos) close_now(config::Reason::unsupported_path, g_agent_path, report::Event{});
 
     check_wsl();
     deny_debugging();

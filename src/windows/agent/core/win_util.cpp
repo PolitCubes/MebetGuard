@@ -67,11 +67,14 @@ std::wstring from_ansi(const std::string& s) {
 std::string to_ansi(const std::wstring& w, bool* lossless) {
     if (lossless) *lossless = true;
     if (w.empty()) return std::string();
-    BOOL used_default = FALSE;
     const int n = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
     std::string s(static_cast<std::size_t>(n > 0 ? n : 0), '\0');
-    if (n > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, &used_default);
-    if (lossless) *lossless = n > 0 && !used_default;
+    if (n > 0 && WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr) != n)
+        s.clear();
+    // Lossless only when it reads back as the same text. lpUsedDefaultChar misses the best fit,
+    // where Windows quietly writes a look-alike ("Łódź" → "Lódz", a fullwidth quote → '"'): another
+    // path, reported as exact. It also misses a lone surrogate turned into U+FFFD under UTF-8.
+    if (lossless) *lossless = !s.empty() && from_ansi(s) == w;
     return s;
 }
 
