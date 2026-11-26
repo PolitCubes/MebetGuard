@@ -62,7 +62,9 @@ std::atomic<HANDLE> g_worker{nullptr};
 std::atomic<HANDLE> g_watchdog{nullptr};
 std::atomic<HANDLE> g_watchdog_own{nullptr};
 std::atomic<bool> g_watchdog_created{false};
-std::atomic<DWORD> g_worker_tid{0};
+// Set by the worker on its own thread. Not its thread id: Windows hands the id of a thread that
+// has ended to the next new thread, and that thread would then beat for a dead worker.
+thread_local bool t_worker = false;
 std::atomic<int> g_worker_slow{0};  // SlowWork scopes open on the worker
 std::atomic<bool> g_ending{false};
 std::atomic<bool> g_told{false};  // report level: one report, the game keeps running
@@ -296,6 +298,53 @@ std::uint64_t hook_witnessed(std::uint64_t key, std::uint64_t now) {
     return g_hook_silent.fetch_add(dt, std::memory_order_relaxed) + dt;
 }
 
+// Test builds: what a hook sees while a beat is old or a close is pending, at most once a
+// second — a failed e2e run then says what the hooks took the guard threads for. No CRT, no
+// allocation.
+std::atomic<std::uint64_t> g_trace_last{0};
+void trace_hook(std::uint64_t now, HANDLE worker, HANDLE watchdog, bool closing) {
+    if (!config::kTestBuild) return;
+    if (!closing && !silent(g_beat_worker, now, kWatchdogSilentMax) && !silent(g_beat_watchdog, now, kWatchdogSilentMax))
+        return;
+    const std::uint64_t last = g_trace_last.load(std::memory_order_relaxed);
+    if (last && now - last < 1000 * kMs) return;
+    g_trace_last.store(now, std::memory_order_relaxed);
+    char line[160];
+    std::size_t n = 0;
+    auto put = [&](const char* text) {
+        while (*text && n + 1 < sizeof(line)) line[n++] = *text++;
+    };
+    auto num = [&](long long v) {
+        if (v < 0) {
+            put("-");
+            v = -v;
+        }
+        char digits[24];
+        int d = 0;
+        do {
+            digits[d++] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        } while (v && d < 23);
+        while (d && n + 1 < sizeof(line)) line[n++] = digits[--d];
+    };
+    put("[Mebet] hook: worker beat ");
+    num(static_cast<long long>((now - g_beat_worker.load(std::memory_order_relaxed)) / kMs));
+    put(" ms ended=");
+    num(ended(worker) ? 1 : 0);
+    put(" suspended=");
+    num(suspended(worker));
+    put(", watchdog beat ");
+    num(static_cast<long long>((now - g_beat_watchdog.load(std::memory_order_relaxed)) / kMs));
+    put(" ms ended=");
+    num(ended(watchdog) ? 1 : 0);
+    put(" suspended=");
+    num(suspended(watchdog));
+    put(closing ? ", closing\n" : "\n");
+    DWORD written = 0;
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (err && err != INVALID_HANDLE_VALUE) WriteFile(err, line, static_cast<DWORD>(n), &written, nullptr);
+}
+
 }  // namespace
 
 void start(HANDLE worker) {
@@ -335,7 +384,7 @@ void start(HANDLE worker) {
 
 void worker_tick() {
     static Witness watchdog;  // the worker thread only
-    if (!g_worker_tid.load(std::memory_order_relaxed)) g_worker_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    t_worker = true;
     const std::uint64_t now = now_100ns();
     g_beat_worker.store(now, std::memory_order_relaxed);
     if (!g_watchdog_created.load(std::memory_order_acquire)) return;
@@ -355,11 +404,11 @@ void worker_tick() {
 }
 
 void worker_beat() {
-    if (GetCurrentThreadId() != g_worker_tid.load(std::memory_order_relaxed)) return;
+    if (!t_worker) return;
     g_beat_worker.store(now_100ns(), std::memory_order_relaxed);
 }
 
-SlowWork::SlowWork() : on_worker_(GetCurrentThreadId() == g_worker_tid.load(std::memory_order_relaxed)) {
+SlowWork::SlowWork() : on_worker_(t_worker) {
     if (!on_worker_) return;
     g_beat_worker.store(now_100ns(), std::memory_order_relaxed);
     g_worker_slow.fetch_add(1, std::memory_order_relaxed);
@@ -375,6 +424,8 @@ std::uint64_t witnessed_100ns() { return g_witnessed.load(std::memory_order_rela
 
 void check_from_hook() {
     const HANDLE watchdog = g_watchdog.load(std::memory_order_acquire);
+    if (config::kTestBuild && g_watchdog_created.load(std::memory_order_relaxed))
+        trace_hook(now_100ns(), g_worker.load(std::memory_order_acquire), watchdog, guard::closing());
     if (!watchdog) return;
     const std::uint64_t now = now_100ns();
     if (!silent(g_beat_watchdog, now, kWatchdogSilentMax)) return;  // the fast path
