@@ -67,10 +67,12 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
 2. e2e      (каждая — после сборки своей ОС; джоб на архитектуру × фичу)
             Matrix: e2e-windows   x64 · x86 · arm64  ×  каждый сценарий из harness.SCENARIOS для Windows
                                   (на x86 — без сценариев FFM)
+                                  + x64 × paths-cyrillic · paths-specials · paths-beyond
             Matrix: e2e-linux     x64 · arm64  ×  clean_launch · thread_churn · jit_hot · ffm_benign ·
                                   env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent ·
                                   jvm_agents_agentpath
-            Matrix: e2e-macos     x64 · arm64  ×  то же, что linux
+                                  + x64 × paths-cyrillic · paths-specials · paths-beyond
+            Matrix: e2e-macos     x64 · arm64  ×  то же, что linux (paths-* — на arm64)
 3. ci-ok    зависит только от трёх e2e; красный, если любая упала, отменена или пропущена
             (пропущена = упала её сборка) — его требует правило ветки master
 4. sign     только на тегах v* (на pull request всегда skipped)
@@ -95,6 +97,38 @@ Liberica (BellSoft): гвард доверяет издателю Java игры,
 
 Что тесты не фейковые: подставь вместо гварда обычную `java` — все такие тесты падают (атака
 проходит, защиты нет). Проверено.
+
+## Неудобные пути (`--paths`)
+
+Игроки держат игру в `C:\Users\Иван\AppData\Roaming\.politcubes` и `D:\Игры\Мой клиент (копия) & моды`.
+`--paths <вариант>` копирует страж (два его файла) и JDK (настоящая копия: junction спрятал бы имя)
+и кладёт рабочую папку — папку клиента: текущий каталог, `-cp`, агент-маркер, неподписанный натив —
+в папки с такими именами; дальше выбранные сценарии идут как обычно, без гварда и через гвард
+(`paths.py`):
+
+| Вариант | Что в именах |
+|---|---|
+| `cyrillic` | `Игра Тест` |
+| `specials` | пробелы и `& ( ) [ ] ! % ^ ' ; , = # + ~`, на Linux/macOS ещё `$ \ * ?`; на Windows папка стража такой длины, что `MebetGuard.dll` — 254 символа |
+| `beyond` | символы вне кодовой страницы ANSI Windows: эмодзи, иероглифы, кириллица, `Ł` (Windows молча делает из неё `L`) |
+
+В папке стража — всё сразу: обычная java её не видит, страж обязан работать из неё всегда
+(на macOS без `=`: JVM режет `-agentpath:<путь>=<опции>` по нему, страж закрывается с
+`unsupported_path`, 226). В папке Java и папке клиента — только то, что принимает сама java на этой
+машине, иначе прогон без гварда падает и ничего не доказывает: на Windows — буквы кодовой
+страницы ANSI (раннеры CI — 1252: кириллица туда не входит), без `;` (разделитель путей) и `=`
+(java режет по нему `-javaagent:<jar>=<опции>`), без `:` на Linux/macOS, без `\` в папке клиента на
+Linux/macOS (экранирование в `JDK_JAVA_OPTIONS`), эмодзи — только у стража.
+
+Папки, которые кодовая страница ANSI не выражает вовсе, на Windows проверяет `test_paths.py`
+(`-k beyond_code_page`, с `--paths cyrillic` или `beyond`): обычная java из такой папки Java не
+стартует; страж запускает игру через имя 8.3 или, если его нет, закрывается с `unsupported_path`
+(226) — а не висит за окном JLI «could not find java.dll», как раньше. Из такой папки клиента страж
+заканчивается так же, как обычная java (её код выхода, без своего закрытия).
+
+```
+pytest tests/e2e -v -rP --paths cyrillic --guard <MebetGuard> --java <JAVA_HOME> [--work <dir>]
+```
 
 ## Виды сборки
 

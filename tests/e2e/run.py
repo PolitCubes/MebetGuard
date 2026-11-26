@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import harness
+import paths
 
 
 def main():
@@ -31,9 +32,17 @@ def main():
     ap.add_argument("--json", default="")
     ap.add_argument("--expect-dev-mode", action="store_true",
                     help="the guard is a release build and this machine is in dev mode: run the dev_mode scenario")
+    ap.add_argument("--paths", default=None, choices=paths.VARIANTS,
+                    help="run from awkward folders — copies of the guard and the JDK, the work dir (paths.py)")
     a = ap.parse_args()
 
-    ctx = harness.Ctx(a.guard, a.java, a.work, a.untrusted_native)
+    guard, java, work, native = a.guard, a.java, a.work, a.untrusted_native
+    if a.paths:
+        root = Path(work).resolve() / "paths" if work else harness.HERE / "_work" / "paths"
+        layout = paths.relocate(a.paths, harness.host_os(), guard, java, root, native)
+        print("--paths %s:\n%s" % (a.paths, layout.describe()))
+        guard, java, work, native = layout.guard, layout.java, layout.work, layout.native
+    ctx = harness.Ctx(guard, java, work, native)
     ctx.expect_dev_mode = a.expect_dev_mode
     if not ctx.guard.exists():
         sys.exit("guard not found: " + str(ctx.guard))

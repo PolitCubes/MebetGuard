@@ -170,6 +170,15 @@ jobs:
           - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
           # the prod build must close on a dev-mode runner (203)
           - { feature: dev_mode, variant: prod, extra: "--expect-dev-mode" }
+          # Awkward paths (tests/e2e/paths.py): the layers again, with the guard, a copy of the JDK
+          # and the client folder in folders players have — one job per variant. test_paths.py adds
+          # the folders plain java itself cannot use on this runner's ANSI code page (1252).
+          - { arch: x64, feature: paths-cyrillic, extra: "--paths cyrillic", runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie,
+              select: "clean_launch or trusted_native_load or module_trust_load or jvm_agent_module or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath or beyond_code_page" }
+          - { arch: x64, feature: paths-specials, extra: "--paths specials", runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie,
+              select: "clean_launch or trusted_native_load or module_trust_load or jvm_agent_module or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          - { arch: x64, feature: paths-beyond, extra: "--paths beyond", runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie,
+              select: "clean_launch or trusted_native_load or module_trust_load or jvm_agent_module or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath or beyond_code_page" }
         # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
         # attacks cannot exist there.
         exclude:
@@ -227,7 +236,7 @@ jobs:
         env:
           PYTHONUTF8: "1"   # the verdict lines are Russian: without it the log shows \uXXXX escapes
         run: |
-          python -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' `
+          python -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' `
             --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
             --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll" ${{ matrix.extra }}
       - name: crash report (faulting module, JVM hs_err, stack)
@@ -236,7 +245,7 @@ jobs:
         run: |
           Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error' } -MaxEvents 3 -ErrorAction SilentlyContinue |
             ForEach-Object { $_.TimeCreated; $_.Message; '-----' }
-          Get-ChildItem tests\e2e\_work -Filter 'hs_err_pid*.log' -ErrorAction SilentlyContinue |
+          Get-ChildItem tests\e2e\_work -Recurse -Filter 'hs_err_pid*.log' -ErrorAction SilentlyContinue |
             ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -TotalCount 80 }
           $harch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
           $cdb = Get-Item "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\$harch\cdb.exe" -ErrorAction SilentlyContinue
@@ -267,6 +276,13 @@ jobs:
         include:
           - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
           - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
+          # Awkward paths (tests/e2e/paths.py), one job per variant
+          - { arch: x64, feature: paths-cyrillic, extra: "--paths cyrillic", runner: ubuntu-24.04, dir: x86-64-linux,
+              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          - { arch: x64, feature: paths-specials, extra: "--paths specials", runner: ubuntu-24.04, dir: x86-64-linux,
+              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          - { arch: x64, feature: paths-beyond, extra: "--paths beyond", runner: ubuntu-24.04, dir: x86-64-linux,
+              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -283,8 +299,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y python3-pytest
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          python3 -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' \
-            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME"
+          python3 -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' \
+            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" ${{ matrix.extra }}
 
   e2e-macos:
     needs: build-macos-binaries
@@ -300,6 +316,13 @@ jobs:
         include:
           - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
           - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
+          # Awkward paths (tests/e2e/paths.py), one job per variant
+          - { arch: arm64, feature: paths-cyrillic, extra: "--paths cyrillic", runner: macos-15, dir: arm64-macosx,
+              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          - { arch: arm64, feature: paths-specials, extra: "--paths specials", runner: macos-15, dir: arm64-macosx,
+              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          - { arch: arm64, feature: paths-beyond, extra: "--paths beyond", runner: macos-15, dir: arm64-macosx,
+              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -316,8 +339,8 @@ jobs:
           python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
       - name: "attack ${{ matrix.feature }} with the guard and without it"
         run: |
-          /tmp/venv/bin/pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.feature }}' \
-            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME"
+          /tmp/venv/bin/pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' \
+            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" ${{ matrix.extra }}
 
   # ======= perf — what the guard costs: a report in the run summary, not part of ci-ok =======
   # tests/perf/bench.py: every workload gets 3 s of warm-up and at least 10 s measured, without
