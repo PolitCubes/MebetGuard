@@ -390,7 +390,10 @@ void sweep_memory(SweepMode mode) {
                     return gone;
                 });
                 if (!stays && !gone) continue;
-                if (!stays && !found.empty() && trust::decide_path(found).verdict.allowed) continue;
+                // Gone, and its name could not even be read when it was found: the kernel gives the
+                // name of any mapped image, so it was already being unmapped then — nothing ran from
+                // it. Otherwise it is forgiven only for a file the trust engine allows.
+                if (!stays && (found.empty() || trust::decide_path(found).verdict.allowed)) continue;
             }
             close_hidden_image(alloc, found);
             continue;
