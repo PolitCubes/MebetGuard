@@ -50,6 +50,8 @@ std::atomic<HANDLE> g_worker{nullptr};
 std::atomic<HANDLE> g_watchdog{nullptr};
 std::atomic<bool> g_ending{false};
 std::atomic<bool> g_told{false};  // report level: one report, the game keeps running
+// Time the watchdog thread has witnessed the process running (see witnessed_100ns); 0 = not started.
+std::atomic<std::uint64_t> g_witnessed{0};
 // What the hooks have witnessed of both guard threads being silent (see check_from_hook).
 std::atomic<std::uint64_t> g_hook_last{0};
 std::atomic<std::uint64_t> g_hook_beats{0};
@@ -201,9 +203,13 @@ void on_stall(const char* what, bool try_report) {
 
 DWORD WINAPI watchdog_main(void*) {
     Witness worker;
+    std::uint64_t previous = now_100ns();
+    g_witnessed.store(1, std::memory_order_relaxed);
     for (;;) {
         const std::uint64_t now = now_100ns();
         g_beat_watchdog.store(now, std::memory_order_relaxed);
+        g_witnessed.fetch_add(now - previous > kWatchdogStep ? kWatchdogStep : now - previous, std::memory_order_relaxed);
+        previous = now;
         const HANDLE w = g_worker.load(std::memory_order_acquire);
         worker.look(now, g_beat_worker.load(std::memory_order_relaxed), suspended(w) == 1, kWatchdogStep);
         if (!guard::closing()) {
@@ -260,6 +266,8 @@ void start(HANDLE worker) {
 }
 
 void worker_beat() { g_beat_worker.store(now_100ns(), std::memory_order_relaxed); }
+
+std::uint64_t witnessed_100ns() { return g_witnessed.load(std::memory_order_relaxed); }
 
 void worker_tick() {
     static Witness watchdog;  // the worker thread only

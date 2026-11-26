@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "hooks/load_gate.hpp"
 #include "mebet_trust_data.hpp"
@@ -359,6 +360,7 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
     }
 
     const LARGE_INTEGER t0 = qpc();
+    const std::uint64_t witnessed0 = watchdog::witnessed_100ns();
     Verdict& v = d.verdict;
     bool decided = false;
 
@@ -415,7 +417,17 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
     }
 
     d.ms = ms_since(t0);
-    if (d.ms > static_cast<double>(config::opt::verify_timeout_ms)) {
+    // The limit is on the time the check took, not on the time the game was held meanwhile: a
+    // game paused as a whole (Suspend in a task manager) in the middle of a library load came
+    // back with half a minute on the clock, and a correctly signed system DLL was refused as
+    // verify_timeout. With the watchdog running, no more is counted than it saw the process run
+    // (plus its own granularity).
+    double judged_ms = d.ms;
+    if (witnessed0) {
+        const double seen_ms = static_cast<double>(watchdog::witnessed_100ns() - witnessed0) / 10000.0 + 1500.0;
+        if (seen_ms < judged_ms) judged_ms = seen_ms;
+    }
+    if (judged_ms > static_cast<double>(config::opt::verify_timeout_ms)) {
         v.allowed = false;
         v.reason = config::Reason::verify_timeout;
         v.rule = "timeout";

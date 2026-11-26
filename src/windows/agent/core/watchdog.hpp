@@ -19,6 +19,8 @@
 // process does nothing before the kill that a frozen thread could block.
 #pragma once
 
+#include <cstdint>
+
 #include "nt.hpp"
 
 namespace mebet::watchdog {
@@ -31,5 +33,9 @@ void worker_tick();
 void worker_beat();
 // Every NT hook: one load and one compare on the fast path; no TLS, no locks, no allocation.
 void check_from_hook();
+// A clock that stands still while the whole process is held: the time, in 100 ns units, the
+// watchdog thread has seen the process running (it looks every 250 ms; a longer gap counts as
+// one second). 0 until the watchdog runs. For limits that must not count a pause of the game.
+std::uint64_t witnessed_100ns();
 
 }  // namespace mebet::watchdog
