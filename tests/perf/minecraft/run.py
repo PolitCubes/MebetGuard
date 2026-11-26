@@ -142,6 +142,10 @@ def one(a, mode, copy, pristine, profile, cp, run_no):
 
 
 def main():
+    # The report is Russian; a Windows console defaults to a legacy code page.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--client", required=True)
     ap.add_argument("--java", required=True)
@@ -180,11 +184,11 @@ def main():
             print("run %d (%s): %s" % (k, mode, json.dumps(rec, ensure_ascii=False)), flush=True)
 
     md = render(runs, a)
-    print(md)
     if a.markdown:
         Path(a.markdown).write_text(md, encoding="utf-8")
     if a.json:
         Path(a.json).write_text(json.dumps(runs, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(md)
 
 
 ROWS = [("avg_fps", "средний FPS", True), ("low1_fps", "1 % low FPS", True),

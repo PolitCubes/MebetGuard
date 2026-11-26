@@ -89,6 +89,10 @@ def guard_time(out):
 
 
 def main():
+    # The report is Russian; a Windows console (and the CI runner) defaults to a legacy code page.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--guard", required=True)
     ap.add_argument("--java", required=True)
@@ -166,7 +170,7 @@ def main():
     mean = (math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1) * 100 if ratios else 0.0
 
     md = render(rows, mean, spent, a.reps, a.warmup, a.measure, frames)
-    print(md)
+    # Files first: a console that cannot print the report must not lose a 20-minute measurement.
     if a.markdown:
         Path(a.markdown).write_text(md, encoding="utf-8")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -175,6 +179,7 @@ def main():
     if a.json:
         Path(a.json).write_text(json.dumps(dict(rows=rows, mean_overhead_pct=mean, guard_spent_ms=spent),
                                            ensure_ascii=False, indent=2), encoding="utf-8")
+    print(md)
 
 
 def _spread(xs):
