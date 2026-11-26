@@ -294,6 +294,18 @@ bool hidden_image_now(std::uintptr_t alloc) {
     return !first_sighting(alloc);
 }
 
+// The file of an image the loader lists was refused by the periodic walk. Is the refusal about
+// what is mapped there now? A library unloaded while its file was being judged leaves nothing to
+// read — an empty name, an "unreadable" file — and another library may already sit at the same
+// address; the game was closed for an "untrusted module" with no name. The refusal stands when
+// the same file is still mapped; anything else is a suspect for the next sweep.
+bool refusal_stands(std::uintptr_t alloc, const std::wstring& judged_path) {
+    if (image_recorded(alloc)) return false;  // gone, or recorded by a hook meanwhile
+    if (!judged_path.empty() && iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), judged_path))
+        return true;
+    return !first_sighting(alloc);
+}
+
 bool region_recorded(std::uintptr_t base) {
     MEMORY_BASIC_INFORMATION m{};  // freed or no longer executable: nothing left to judge
     if (!VirtualQuery(reinterpret_cast<void*>(base), &m, sizeof(m)) || m.State != MEM_COMMIT || !(m.Protect & 0xF0) ||
@@ -348,9 +360,15 @@ void sweep_memory(SweepMode mode) {
                 const trust::Decision d = trust::decide_path(path);
                 if (d.verdict.allowed) {
                     MODULEINFO mi{};
-                    if (GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(alloc), &mi, sizeof(mi)))
+                    if (GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(alloc), &mi, sizeof(mi))) {
                         modules::add(alloc, mi.SizeOfImage, d.verdict.trust, d.facts.path);
-                } else {
+                        // Unloaded while its file was judged: do not leave the address allowed.
+                        MEMORY_BASIC_INFORMATION now{};
+                        if (!VirtualQuery(reinterpret_cast<void*>(alloc), &now, sizeof(now)) || now.Type != MEM_IMAGE ||
+                            reinterpret_cast<std::uintptr_t>(now.AllocationBase) != alloc)
+                            modules::remove(alloc);
+                    }
+                } else if (!periodic || refusal_stands(alloc, path)) {
                     gate::deny_module(d, d.verdict.reason, mode == SweepMode::startup ? "startup" : "sweep");
                 }
                 continue;
