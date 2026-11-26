@@ -2,6 +2,7 @@
 // Copyright (c) 2026 PolitCubes
 #include "core/module_table.hpp"
 
+#include <atomic>
 #include <map>
 
 #include "core/range_set.hpp"
@@ -16,20 +17,28 @@ struct Payload {
     bool operator==(const Payload& o) const { return trust == o.trust && base == o.base; }
 };
 
-RangeSet<Payload>& ranges() {
-    static RangeSet<Payload>* r = new RangeSet<Payload>();
-    return *r;
+// No function-local statics here: every use of one reads the TLS block of the thread, and the
+// hooks look modules up and forget them on threads that have none (nt_hooks.cpp). Leaked on purpose.
+template <typename T>
+T& once(std::atomic<T*>& slot) {
+    T* v = slot.load(std::memory_order_acquire);
+    if (v) return *v;
+    T* fresh = new T();
+    if (slot.compare_exchange_strong(v, fresh, std::memory_order_acq_rel)) return *fresh;
+    delete fresh;
+    return *v;
 }
+
+std::atomic<RangeSet<Payload>*> g_ranges{nullptr};
+RangeSet<Payload>& ranges() { return once(g_ranges); }
 
 struct Names {
     SRWLOCK lock = SRWLOCK_INIT;
     std::map<std::uintptr_t, Record> records;
 };
 
-Names& names() {
-    static Names* n = new Names();
-    return *n;
-}
+std::atomic<Names*> g_names{nullptr};
+Names& names() { return once(g_names); }
 
 struct Span {
     std::uintptr_t begin = 0, end = 0;

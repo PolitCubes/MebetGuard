@@ -10,8 +10,16 @@ namespace mebet::exec {
 
 namespace {
 
+// Not a function-local static: every use of one reads the TLS block of the thread, and the hooks
+// look regions up on threads that have none (nt_hooks.cpp). Leaked on purpose.
+std::atomic<RangeSet<Owner>*> g_table{nullptr};
+
 RangeSet<Owner>& table() {
-    static RangeSet<Owner>* t = new RangeSet<Owner>();
+    RangeSet<Owner>* t = g_table.load(std::memory_order_acquire);
+    if (t) return *t;
+    auto* fresh = new RangeSet<Owner>();
+    if (g_table.compare_exchange_strong(t, fresh, std::memory_order_acq_rel)) return *fresh;
+    delete fresh;
     return *t;
 }
 

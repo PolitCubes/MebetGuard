@@ -100,7 +100,17 @@ Requester find_requester() {
         // A request whose first frame is in that code (JIT, interpreter, a downcall stub) is
         // Java code calling the OS through the Foreign Function API: a mod's way to shellcode
         // without a DLL of its own.
+        //
+        // Not on 32-bit x86. There the stack is walked by frame pointers, jvm.dll is built
+        // without them, and the walk can skip its frames and land in the Java code that called
+        // into the JVM: the code cache growing would look like such a request and close the
+        // game. And there is nothing to catch: 32-bit Windows Java has no Foreign Function
+        // linker at all. The periodic sweep covers executable memory there as everywhere.
+#if defined(_M_IX86)
+        r.from_jvm_code = false;
+#else
         r.from_jvm_code = owner.trust == trust::Trust::java;
+#endif
         r.allowed = owner.trust != trust::Trust::unknown && !r.from_jvm_code;
     }
     return r;

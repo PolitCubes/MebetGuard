@@ -18,6 +18,7 @@
 #include "core/exec_table.hpp"
 #include "core/guard.hpp"
 #include "core/module_table.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "hooks/exec_guard.hpp"
 #include "hooks/load_gate.hpp"
@@ -254,6 +255,10 @@ enum class SweepMode { startup, periodic };
 // on the next sweep, it is judged. The sweep used to skip everything while anything was in
 // flight, and a thread killed inside a hook left the counter up for good: the periodic sweep
 // never ran again. Worker thread only, so no lock.
+//
+// Whether calls are in flight is asked when a region is judged, not once before the walk: a
+// call that starts while the walk is on its way makes its region just as unrecorded for a
+// moment, and a game that only loaded a library was closed for a "hidden image".
 std::vector<std::uintptr_t>* g_suspects_prev = new std::vector<std::uintptr_t>();
 std::vector<std::uintptr_t>* g_suspects_now = new std::vector<std::uintptr_t>();
 
@@ -268,8 +273,40 @@ void rotate_suspects() {
     g_suspects_now->clear();
 }
 
+bool image_recorded(std::uintptr_t alloc) {
+    if (modules::find(alloc)) return true;
+    MEMORY_BASIC_INFORMATION m{};  // unmapped again: nothing left to judge
+    return !VirtualQuery(reinterpret_cast<void*>(alloc), &m, sizeof(m)) || m.Type != MEM_IMAGE ||
+           reinterpret_cast<std::uintptr_t>(m.AllocationBase) != alloc;
+}
+
+bool region_recorded(std::uintptr_t base) {
+    MEMORY_BASIC_INFORMATION m{};  // freed or no longer executable: nothing left to judge
+    if (!VirtualQuery(reinterpret_cast<void*>(base), &m, sizeof(m)) || m.State != MEM_COMMIT || !(m.Protect & 0xF0) ||
+        (m.Protect & PAGE_GUARD) || m.Type == MEM_IMAGE)
+        return true;
+    const auto b = reinterpret_cast<std::uintptr_t>(m.BaseAddress);
+    return exec::covers(b, b + m.RegionSize);
+}
+
+// The periodic walk found something nobody recorded: judge it now? Calls in flight are read
+// before the table: a call that ended in between has recorded its region, and with none in
+// flight nobody is about to. With calls in flight the region gets a moment and a second look;
+// still unrecorded and calls still in flight (the counter may be stuck, M-07), it becomes a
+// suspect for the next sweep.
+template <typename Recorded>
+bool judge_now(std::uintptr_t base, Recorded recorded) {
+    for (int look = 0; look < 2; ++look) {
+        const bool in_flight = exec::ops_in_flight();
+        if (recorded(base)) return false;
+        if (!in_flight) return true;
+        if (look == 0) Sleep(2);
+    }
+    return !first_sighting(base);
+}
+
 void sweep_memory(SweepMode mode) {
-    const bool in_flight = mode == SweepMode::periodic && exec::ops_in_flight();
+    const bool periodic = mode == SweepMode::periodic;
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
     auto addr = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
@@ -283,6 +320,7 @@ void sweep_memory(SweepMode mode) {
         const std::uintptr_t next = base + mbi.RegionSize;
         if (next <= addr) break;
         addr = next;
+        watchdog::worker_beat();  // a walk over a big process is work, not silence
         if (mbi.State != MEM_COMMIT || !(mbi.Protect & 0xF0) || (mbi.Protect & PAGE_GUARD)) continue;
         if (mbi.Type == MEM_IMAGE) {
             const auto alloc = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase);
@@ -304,7 +342,7 @@ void sweep_memory(SweepMode mode) {
                 continue;
             }
             if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
-            if (in_flight && first_sighting(alloc)) continue;
+            if (periodic && !judge_now(alloc, &image_recorded)) continue;
             close_hidden_image(alloc);
             continue;
         }
@@ -315,10 +353,10 @@ void sweep_memory(SweepMode mode) {
             exec::allow(base, next, exec::Owner{trust::Trust::os, 0, exec::Source::preexisting});
             continue;
         }
-        if (in_flight && first_sighting(base)) continue;
+        if (periodic && !judge_now(base, &region_recorded)) continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");
     }
-    if (mode == SweepMode::periodic) rotate_suspects();
+    if (periodic) rotate_suspects();
 }
 
 void sweep_threads(SweepMode mode) {
@@ -332,6 +370,7 @@ void sweep_threads(SweepMode mode) {
         if (!nt::ok(a.NtGetNextThread(nt::current_process(), prev, THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &next)) || !next) break;
         if (prev) CloseHandle(prev);
         prev = next;
+        watchdog::worker_beat();
         const DWORD tid = GetThreadId(next);
         const std::uint64_t created = creation_time(next);
         AcquireSRWLockShared(&t.lock);

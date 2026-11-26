@@ -13,6 +13,10 @@
 //   - every NT hook, on whatever thread it runs, compares the two beats: when neither guard
 //     thread has beaten for several seconds, both are frozen and the hook ends the process.
 // A stalled guard ends the process with guard_stalled (225) without needing the worker.
+//
+// Silence counts only while the one who watches was running itself: a game paused as a whole
+// (Suspend in a task manager) and resumed is not a stalled guard. And the thread that ends the
+// process does nothing before the kill that a frozen thread could block.
 #pragma once
 
 #include "nt.hpp"
@@ -23,6 +27,8 @@ namespace mebet::watchdog {
 void start(HANDLE worker);
 // The worker, once per loop: heartbeat + checks the watchdog thread.
 void worker_tick();
+// The worker, inside a task that can run long (file after file on a slow disk): heartbeat only.
+void worker_beat();
 // Every NT hook: one load and one compare on the fast path; no TLS, no locks, no allocation.
 void check_from_hook();
 

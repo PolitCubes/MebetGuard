@@ -49,9 +49,13 @@ constexpr NTSTATUS kAccessDenied = nt::kStatusAccessDenied;
 // a function-local static) only after its early init, and loses it before it is gone; the heap
 // still allocates and decommits on such a thread (at exit) and lands in these hooks. Touching
 // TLS there reads address 8 * _tls_index and kills the process — seen on Windows ARM64 as
-// hook_NtFreeVirtualMemory → guard::shutting_down() → core() while a thread exits. So every
-// hook passes such a thread straight through. Direct syscalls skip these hooks anyway; the
-// periodic sweep still judges whatever memory the thread ends up with.
+// hook_NtFreeVirtualMemory → guard::shutting_down() → core() while a thread exits. So the hooks
+// that judge (section, map, allocate, protect) pass such a thread straight through: direct
+// syscalls skip these hooks anyway, and the periodic sweep still judges whatever memory the
+// thread ends up with. The two that only forget (unmap, free) still forget: skipped, a region
+// freed by a thread on its way out stayed in the tables as allowed, and whatever was allocated
+// at that address later was taken for it. Everything they touch works without TLS (the tables
+// and the shutdown flag are plain globals).
 inline bool tls_ready() {
     // TEB: NT_TIB (7 pointers), EnvironmentPointer, ClientId (2), ActiveRpcHandle, then
     // ThreadLocalStoragePointer — pointer slot 11 on x86, x64 and ARM64 alike.
@@ -133,10 +137,7 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
 // 3. NtUnmapViewOfSection — forget what is gone.
 NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
     if (is_token(base, 2)) return canary(2);
-    if (!tls_ready()) {
-        return real_NtUnmapViewOfSection(process, base);
-    }
-    watchdog::check_from_hook();
+    if (tls_ready()) watchdog::check_from_hook();
     if (guard::shutting_down() || !base) return real_NtUnmapViewOfSection(process, base);
     const auto addr = reinterpret_cast<std::uintptr_t>(base);
     const bool tracked = exec::find(addr) || modules::find(addr);
@@ -210,10 +211,7 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
 // 6. NtFreeVirtualMemory — fast path: nothing recorded at the address (lock-free lookup).
 NTSTATUS NTAPI hook_NtFreeVirtualMemory(HANDLE process, PVOID* base, PSIZE_T size, ULONG type) {
     if (is_token(base, 5)) return canary(5);
-    if (!tls_ready()) {
-        return real_NtFreeVirtualMemory(process, base, size, type);
-    }
-    watchdog::check_from_hook();
+    if (tls_ready()) watchdog::check_from_hook();
     if (guard::shutting_down() || !base || !*base || !exec::find(reinterpret_cast<std::uintptr_t>(*base))) {
         return real_NtFreeVirtualMemory(process, base, size, type);
     }

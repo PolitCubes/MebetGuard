@@ -3,6 +3,7 @@
 #include "core/win_util.hpp"
 
 #include <cwchar>
+#include <utility>
 
 #include "strings.hpp"
 
@@ -211,12 +212,51 @@ HANDLE open_for_name(const std::wstring& path) {
 // The DOS root of a volume ("\Device\HarddiskVolume3") from the mount manager: "C:", or
 // "C:\Mount\Data" for a volume mounted only into a folder; empty when it has none. Asked through
 // the volume's root folder, so WOW64 never redirects it.
-std::wstring dos_root_of_volume(const std::wstring& device) {
+std::wstring ask_dos_root_of_volume(const std::wstring& device) {
     const HANDLE h = open_for_name(L"\\\\?\\GLOBALROOT" + device + L"\\");
     if (h == INVALID_HANDLE_VALUE) return std::wstring();
     std::wstring root = strip_long_prefix(final_name(h, FILE_NAME_OPENED | VOLUME_NAME_DOS));
     CloseHandle(h);
     while (!root.empty() && (root.back() == L'\\' || root.back() == L'/')) root.pop_back();
+    return root;
+}
+
+// Devices that are not volumes: their "root folder" is a server or a pipe namespace. Opening it
+// can wait on the network, and this runs inside the load hook; a path on them has no DOS root to
+// find anyway.
+bool not_a_volume(const std::wstring& device) {
+    static const wchar_t* const kNames[] = {L"\\Device\\Mup",              L"\\Device\\LanmanRedirector",
+                                            L"\\Device\\WebDavRedirector", L"\\Device\\NamedPipe",
+                                            L"\\Device\\Mailslot",         L"\\Device\\Afd",
+                                            L"\\Device\\Null",             L"\\Device\\ConDrv"};
+    for (const wchar_t* n : kNames)
+        if (iequals_ascii(device, n)) return true;
+    return false;
+}
+
+// Asked once per volume: the answer does not change while the volume is mounted, and the question
+// opens a handle — it used to be asked again for every module path, inside the load hook too.
+struct VolumeRoots {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<std::pair<std::wstring, std::wstring>> known;  // device → DOS root ("" = none)
+};
+
+std::wstring dos_root_of_volume(const std::wstring& device) {
+    static VolumeRoots* const roots = new VolumeRoots();  // leaked: hooks use it while the process exits
+    VolumeRoots& v = *roots;
+    AcquireSRWLockShared(&v.lock);
+    for (const auto& kv : v.known) {
+        if (iequals_ascii(kv.first, device)) {
+            const std::wstring root = kv.second;
+            ReleaseSRWLockShared(&v.lock);
+            return root;
+        }
+    }
+    ReleaseSRWLockShared(&v.lock);
+    const std::wstring root = ask_dos_root_of_volume(device);
+    AcquireSRWLockExclusive(&v.lock);
+    if (v.known.size() < 64) v.known.emplace_back(device, root);
+    ReleaseSRWLockExclusive(&v.lock);
     return root;
 }
 
@@ -248,8 +288,10 @@ std::wstring nt_to_dos(const std::wstring& nt_path) {
         // client Java", 209; the WOW64 layer "hidden", 214). The mount manager answers any token —
         // and also names a volume mounted only into a folder.
         const std::size_t end = nt_path.find(L'\\', 8);
+        const std::wstring device = nt_path.substr(0, end);
+        if (not_a_volume(device)) return nt_path;  // a redirector, a pipe: as the kernel names it
         if (end != std::wstring::npos) {
-            const std::wstring root = dos_root_of_volume(nt_path.substr(0, end));
+            const std::wstring root = dos_root_of_volume(device);
             if (!root.empty()) return root + nt_path.substr(end);
         }
         // A volume with no DOS name at all: the GLOBALROOT form still opens with every Win32 file API.

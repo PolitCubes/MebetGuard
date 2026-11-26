@@ -12,6 +12,7 @@
 
 #include "config.hpp"
 #include "core/guard.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "json_writer.hpp"
 #include "report/cards.hpp"
@@ -423,6 +424,7 @@ void report_drivers() {
     unsigned listed = 0;
     for (const auto& kernel_path : kernel_modules()) {
         if (listed >= config::kLimit_list_items) break;
+        watchdog::worker_beat();  // a signature and a hash per driver: minutes on a slow disk
         const std::wstring path = kernel_path_to_dos(kernel_path);
         const trust::Decision d = trust::decide_path(path);
         if (d.verdict.trust == trust::Trust::os) continue;  // Microsoft

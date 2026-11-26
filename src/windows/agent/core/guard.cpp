@@ -33,10 +33,13 @@ struct Periodic {
     std::uint64_t next_ms;
 };
 
+// Read by every hook, also on a thread that has no TLS block (see nt_hooks.cpp): a plain
+// global, not a member of the function-local static below.
+std::atomic<bool> g_shutdown{false};
+
 struct Core {
     const BootInfo* boot = nullptr;
     std::atomic<bool> closing{false};
-    std::atomic<bool> shutdown{false};
     std::atomic<bool> armed{false};
     std::atomic<bool> flow_started{false};
     std::atomic<int> exit_code{0};
@@ -73,6 +76,7 @@ void drain_deferred() {
     ReleaseSRWLockExclusive(&c.deferred_lock);
     for (auto& fn : items) {
         if (fn) fn();
+        watchdog::worker_beat();
     }
 }
 
@@ -150,6 +154,7 @@ DWORD WINAPI worker_main(void*) {
                 p.task();
             }
             p.next_ms = win::now_ms() + p.interval_ms;
+            watchdog::worker_beat();
             if (CloseRequest* r = c.close.load()) run_close(*r);
         }
     }
@@ -166,8 +171,8 @@ void init(const BootInfo* boot) {
 const BootInfo& boot() { return *core().boot; }
 
 bool closing() { return core().closing.load(std::memory_order_acquire); }
-bool shutting_down() { return core().shutdown.load(std::memory_order_relaxed); }
-void set_shutting_down() { core().shutdown.store(true); }
+bool shutting_down() { return g_shutdown.load(std::memory_order_relaxed); }
+void set_shutting_down() { g_shutdown.store(true); }
 bool armed() { return core().armed.load(std::memory_order_acquire); }
 void arm() { core().armed.store(true, std::memory_order_release); }
 

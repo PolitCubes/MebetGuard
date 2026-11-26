@@ -62,40 +62,39 @@ jobs:
 
   build-linux-binaries:
     name: linux ${{ matrix.arch }} ${{ matrix.variant }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    # Built inside manylinux_2_28 (AlmaLinux 8), each arch on its own runner: the binaries need
+    # nothing newer than glibc 2.28 and start on Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck.
+    # Built straight on the runner (glibc 2.39) they would not start there at all.
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.machine }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   dir: x86-64-linux, variant: prod, kind: release }
-          - { arch: x64,   dir: x86-64-linux, variant: dev,  kind: devtest }
-          - { arch: arm64, dir: arm64-linux,  variant: prod, kind: release }
-          - { arch: arm64, dir: arm64-linux,  variant: dev,  kind: devtest }
+          - { arch: x64,   runner: ubuntu-24.04,     machine: x86_64,  dir: x86-64-linux, variant: prod, kind: release }
+          - { arch: x64,   runner: ubuntu-24.04,     machine: x86_64,  dir: x86-64-linux, variant: dev,  kind: devtest }
+          - { arch: arm64, runner: ubuntu-24.04-arm, machine: aarch64, dir: arm64-linux,  variant: prod, kind: release }
+          - { arch: arm64, runner: ubuntu-24.04-arm, machine: aarch64, dir: arm64-linux,  variant: dev,  kind: devtest }
     steps:
+      - name: tools
+        run: |
+          dnf install -y java-17-openjdk-devel git
+          /opt/python/cp312-cp312/bin/python -m pip install --no-cache-dir cmake==3.31.6
+          echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-      - name: aarch64 cross toolchain
-        if: matrix.arch == 'arm64'
-        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu
       - name: build
         run: |
-          CROSS=""
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            CROSS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"
-          fi
-          bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} $CROSS
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DPython3_EXECUTABLE=/opt/python/cp312-cp312/bin/python
+      - name: starts on glibc 2.28 (Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck)
+        run: bash tools/ci/check-glibc.sh dist/${{ matrix.kind }}/${{ matrix.dir }}/*
       - uses: actions/upload-artifact@v4
         with:
           name: bin-linux-${{ matrix.arch }}-${{ matrix.variant }}
           path: dist/${{ matrix.kind }}/
-      - name: starts on glibc 2.28 (Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck)
-        run: bash tools/ci/check-glibc.sh dist/${{ matrix.kind }}/${{ matrix.dir }}/*
 
   build-macos-binaries:
     name: macos ${{ matrix.arch }} ${{ matrix.variant }}
