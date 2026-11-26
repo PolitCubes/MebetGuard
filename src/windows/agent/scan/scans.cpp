@@ -258,7 +258,7 @@ enum class SweepMode { startup, periodic };
 //
 // Whether calls are in flight is asked when a region is judged, not once before the walk: a
 // call that starts while the walk is on its way makes its region just as unrecorded for a
-// moment, and a game that only loaded a library was closed for a "hidden image".
+// moment (judge_now). Images have a rule of their own (hidden_image_now).
 std::vector<std::uintptr_t>* g_suspects_prev = new std::vector<std::uintptr_t>();
 std::vector<std::uintptr_t>* g_suspects_now = new std::vector<std::uintptr_t>();
 
@@ -278,6 +278,20 @@ bool image_recorded(std::uintptr_t alloc) {
     MEMORY_BASIC_INFORMATION m{};  // unmapped again: nothing left to judge
     return !VirtualQuery(reinterpret_cast<void*>(alloc), &m, sizeof(m)) || m.Type != MEM_IMAGE ||
            reinterpret_cast<std::uintptr_t>(m.AllocationBase) != alloc;
+}
+
+// The periodic walk found an image that is neither in the module table nor in the list of the
+// loader. A hidden image stays that way. A library that is being loaded or unloaded looks the
+// same for a moment, with no hooked call in flight at all: the loader drops a module from its
+// list (and tells the guard, which forgets it) just before it unmaps the image, and maps an
+// image just before it lists it — on some systems with a call the hooks do not see. A game
+// that only unloaded a library was closed for a "hidden image". So the image gets a second look
+// after a moment, and if it is still there it becomes a suspect: closed when the next sweep
+// finds it again, a few seconds later.
+bool hidden_image_now(std::uintptr_t alloc) {
+    Sleep(2);
+    if (image_recorded(alloc) || loader_knows(alloc)) return false;  // listed by now: the next sweep judges its file
+    return !first_sighting(alloc);
 }
 
 bool region_recorded(std::uintptr_t base) {
@@ -342,7 +356,7 @@ void sweep_memory(SweepMode mode) {
                 continue;
             }
             if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
-            if (periodic && !judge_now(alloc, &image_recorded)) continue;
+            if (periodic && !hidden_image_now(alloc)) continue;
             close_hidden_image(alloc);
             continue;
         }
