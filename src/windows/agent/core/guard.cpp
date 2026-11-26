@@ -130,42 +130,48 @@ report::Event close_event(const CloseRequest& r, report::Event ev) {
         sent.store(true);
     }
 
-    // 3. Reason and code in the launcher log too (no log file, ТЗ §3).
-    std::fprintf(stderr, "[Mebet] closed: %s (code %d) %s\n", def.id, def.exit_code, to_utf8(r.detail).c_str());
-    std::fflush(stderr);
+    // 3. Reason and code in the launcher log too (no log file, ТЗ §3). Steps 3 and 4 allocate:
+    //    out of memory, an exception there would end the process with a crash code instead of the
+    //    reason's — it ends with the reason's code all the same, without them.
+    try {
+        std::fprintf(stderr, "[Mebet] closed: %s (code %d) %s\n", def.id, def.exit_code, to_utf8(r.detail).c_str());
+        std::fflush(stderr);
 
-    // 4. The reason window (draft layout until the mockups are chosen). Test builds on CI
-    //    skip it when MEBET_TEST_NO_UI is set, so a smoke test cannot hang on a dialog.
-    //    It waits for the player, but not for ever: the game is hidden but its threads still run
-    //    behind it, and nothing else of the guard works meanwhile. A window nobody dismisses
-    //    (covered, hidden by code in the process, a player who walked away) used to keep that
-    //    state for good — on every path, before the worker and the watchdog exist too. So the
-    //    window has a thread of its own, and the close goes on after close_window_max_ms.
-    std::wstring title;
-    const std::wstring text = reason_text(r.reason, r.detail, &title);
-    const bool no_ui = config::kTestBuild && !win::env(L"MEBET_TEST_NO_UI").empty();
-    if (!no_ui) {
-        const HANDLE dismissed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        bool own_thread = false;
-        if (dismissed) {
-            try {
-                std::thread([title, text, dismissed] {
-                    reason_window::show(title, text);
-                    SetEvent(dismissed);
-                }).detach();
-                own_thread = true;
-            } catch (...) {
-                // No thread for the window (out of resources): an exception here would abort the
-                // process instead of closing it with the reason's code.
+        // 4. The reason window (draft layout until the mockups are chosen). Test builds on CI
+        //    skip it when MEBET_TEST_NO_UI is set, so a smoke test cannot hang on a dialog.
+        //    It waits for the player, but not for ever: the game is hidden but its threads still run
+        //    behind it, and nothing else of the guard works meanwhile. A window nobody dismisses
+        //    (covered, hidden by code in the process, a player who walked away) used to keep that
+        //    state for good — on every path, before the worker and the watchdog exist too. So the
+        //    window has a thread of its own, and the close goes on after close_window_max_ms.
+        std::wstring title;
+        const std::wstring text = reason_text(r.reason, r.detail, &title);
+        const bool no_ui = config::kTestBuild && !win::env(L"MEBET_TEST_NO_UI").empty();
+        if (!no_ui) {
+            const HANDLE dismissed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            bool own_thread = false;
+            if (dismissed) {
+                try {
+                    std::thread([title, text, dismissed] {
+                        reason_window::show(title, text);
+                        SetEvent(dismissed);
+                    }).detach();
+                    own_thread = true;
+                } catch (...) {
+                    // No thread for the window (out of resources): an exception here would abort the
+                    // process instead of closing it with the reason's code.
+                }
+            }
+            // No thread for the window (out of resources): no window — shown here instead it would wait
+            // for the player with no time limit. The line in the launcher log says why.
+            if (own_thread && WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
+                std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
+                             config::opt::close_window_max_ms / 1000);
+                std::fflush(stderr);
             }
         }
-        // No thread for the window (out of resources): no window — shown here instead it would wait
-        // for the player with no time limit. The line in the launcher log says why.
-        if (own_thread && WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
-            std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
-                         config::opt::close_window_max_ms / 1000);
-            std::fflush(stderr);
-        }
+    } catch (...) {
+        std::fputs("[Mebet] closed: the reason could not be shown (out of memory)\n", stderr);
     }
 
     // 5. Wait for the report at most until 3 s after the close started.
@@ -225,7 +231,9 @@ void init(const BootInfo* boot) {
 
 const BootInfo& boot() { return *core().boot; }
 
-bool closing() { return core().closing.load(std::memory_order_acquire); }
+// A close is pending once its request is published — the request is what the worker acts on, and a
+// requester stopped right after publishing it must not leave "no close" visible.
+bool closing() { return core().close.load(std::memory_order_acquire) != nullptr; }
 bool close_running() { return core().flow_started.load(std::memory_order_acquire); }
 
 void send_pending_close_report(unsigned timeout_ms) {
@@ -316,11 +324,14 @@ void start_worker() {
 
 DWORD worker_thread_id() { return core().worker_tid; }
 
-int pending_exit_code() { return closing() ? core().exit_code.load() : 0; }
+int pending_exit_code() {
+    const CloseRequest* r = core().close.load(std::memory_order_acquire);
+    return r ? config::reason(r->reason).exit_code : 0;
+}
 
 const char* pending_reason_id() {
-    const int r = core().reason.load();
-    return r >= 0 && r < static_cast<int>(config::Reason::count_) ? config::reason(static_cast<config::Reason>(r)).id : nullptr;
+    const CloseRequest* r = core().close.load(std::memory_order_acquire);
+    return r ? config::reason(r->reason).id : nullptr;
 }
 
 std::wstring reason_text(config::Reason reason, const std::wstring& detail, std::wstring* title) {

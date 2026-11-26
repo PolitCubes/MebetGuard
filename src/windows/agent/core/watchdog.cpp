@@ -69,8 +69,9 @@ std::atomic<std::uint64_t> g_created_at{0};  // when start() ran: the clock of t
 // worker: wherever that matters, an ended worker is told by its handle first.
 std::atomic<DWORD> g_worker_tid{0};
 std::atomic<int> g_worker_slow{0};  // SlowWork scopes open on the worker
-std::atomic<bool> g_ending{false};
-std::atomic<std::uint64_t> g_ending_at{0};  // when the thread that won g_ending started the end
+// The claim to end the process, and when it was made: one value, so that a claimer stopped right
+// after claiming still starts the clock other threads finish the job by.
+std::atomic<std::uint64_t> g_ending_at{0};
 // The thread ending the process may be held up (frozen with the rest, say): after this, any hook
 // finishes the job.
 constexpr std::uint64_t kEndingMax = 5000 * kMs;
@@ -219,7 +220,7 @@ struct LastWords {
     int code = 0;
     Report report = Report::none;
 };
-LastWords g_words;        // written once by the thread that won g_ending, before g_say is set
+LastWords g_words;        // written once by the thread that won g_ending_at, before g_say is set
 HANDLE g_say = nullptr;   // wakes the last-words thread for the end
 HANDLE g_said = nullptr;  // it has finished
 HANDLE g_tell = nullptr;  // wakes it for the report of the report level
@@ -258,19 +259,29 @@ DWORD WINAPI last_words_main(void*) {
     }
 }
 
+// A thread that did not win the end finishes it: with the winner's code, and the line in the launcher
+// log the winner (or its last-words thread) may never have written.
+[[noreturn]] void finish_end(int fallback_code) {
+    const int code = g_words.code ? g_words.code : fallback_code;
+    const auto& stalled = config::reason(config::Reason::guard_stalled);
+    if (!win::stderr_is_console())
+        write_close_line(g_words.code ? g_words.id : stalled.id, code, g_words.code ? g_words.what : "the guard ended the process");
+    kill_process(code);
+}
+
 [[noreturn]] void end_process(const char* id, const char* what, int code, Report report) {
-    bool expected = false;
-    if (!g_ending.compare_exchange_strong(expected, true)) {
+    std::uint64_t unclaimed = 0;
+    const std::uint64_t now = now_100ns();
+    if (!g_ending_at.compare_exchange_strong(unclaimed, now ? now : 1, std::memory_order_acq_rel)) {
         // Another thread is ending the process — unless it was stopped half-way: give it the
         // time it may take, then finish the job, with its code.
         Sleep(kLastWordsReportMs + 1000);
-        kill_process(g_words.code ? g_words.code : code);
+        finish_end(code);
     }
     g_words.id = id;
     g_words.what = what;
     g_words.code = code;
     g_words.report = report;
-    g_ending_at.store(now_100ns(), std::memory_order_release);
     bool said = false;
     if (g_say && g_said) {
         SetEvent(g_say);
@@ -524,14 +535,13 @@ void check_from_hook() {
     // and only its silence counts.
     const HANDLE watchdog = g_watchdog.load(std::memory_order_acquire);
     const std::uint64_t now = now_100ns();
-    if (g_ending.load(std::memory_order_acquire)) {
+    if (const std::uint64_t at = g_ending_at.load(std::memory_order_acquire)) {
         // The process is being ended. Every hooked call on the way — the report of the close goes
         // out through WinHTTP, which maps and allocates — would otherwise find the same stall, lose
         // the race to end the process and wait in it, and the report never left. Only when the end
         // takes far longer than it can (its thread frozen too) does a hook finish it.
-        const std::uint64_t at = g_ending_at.load(std::memory_order_acquire);
-        if (!at || now < at || now - at < kEndingMax) return;
-        kill_process(g_words.code ? g_words.code : config::reason(config::Reason::guard_stalled).exit_code);
+        if (now < at || now - at < kEndingMax) return;
+        finish_end(config::reason(config::Reason::guard_stalled).exit_code);
     }
     if (config::kTestBuild) trace_hook(now, g_worker.load(std::memory_order_acquire), watchdog, guard::closing());
     if (!silent(g_beat_watchdog, now, kWatchdogSilentMax)) return;  // the fast path

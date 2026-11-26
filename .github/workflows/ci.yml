@@ -89,8 +89,19 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DPython3_EXECUTABLE=/opt/python/cp312-cp312/bin/python
-      - name: starts on glibc 2.28 (Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck)
+      - name: needs nothing newer than glibc 2.28 and the GCC 8 runtime (symbol versions)
         run: bash tools/ci/check-glibc.sh dist/${{ matrix.kind }}/${{ matrix.dir }}/*
+      # And really starts there: the guard and a JVM inside this very container (AlmaLinux 8,
+      # glibc 2.28, its own Java 17) — the oldest system promised. The release build too: on Linux it
+      # differs only in the WSL check, which a GitHub runner does not trip.
+      - name: starts a JVM on glibc 2.28 (the guard of this build, Java 17)
+        run: |
+          export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
+          mkdir -p tests/out
+          "$JAVA_HOME/bin/javac" -d tests/out tests/java/MebetSmoke.java
+          dist/${{ matrix.kind }}/${{ matrix.dir }}/MebetGuard -XX:+DisableAttachMechanism -Dmebet.reports=false \
+            -Dmebet.errors=false -cp tests/out MebetSmoke | tee smoke.out
+          grep -q mebet-smoke-ok smoke.out
       - uses: actions/upload-artifact@v4
         with:
           name: bin-linux-${{ matrix.arch }}-${{ matrix.variant }}
@@ -331,6 +342,9 @@ jobs:
         include:
           - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
           - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
+          # The release build — what players get — on the start scenarios (no VM check on macOS).
+          - { arch: x64,   feature: prod-start, variant: prod, select: "clean_launch or env_hardening or jvm_agents", runner: macos-15-intel, dir: x86-64-macosx }
+          - { arch: arm64, feature: prod-start, variant: prod, select: "clean_launch or env_hardening or jvm_agents", runner: macos-15, dir: arm64-macosx }
           # Awkward paths (tests/e2e/paths.py): every scenario of the OS again, one job per variant
           - { arch: arm64, feature: paths-cyrillic, extra: "--paths cyrillic", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
           - { arch: arm64, feature: paths-ukrainian, extra: "--paths ukrainian", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
@@ -345,7 +359,7 @@ jobs:
           java-version: "25"
       - uses: actions/download-artifact@v4
         with:
-          name: bin-macos-${{ matrix.arch }}-dev
+          name: bin-macos-${{ matrix.arch }}-${{ matrix.variant || 'dev' }}
           path: guard
       - name: prepare
         run: |

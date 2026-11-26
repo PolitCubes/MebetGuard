@@ -37,7 +37,46 @@ void allow(std::uintptr_t begin, std::uintptr_t end, const Owner& owner) {
     table().add(begin, end, owner, true);
 }
 
-void forget(std::uintptr_t begin, std::uintptr_t end) { table().remove(begin, end); }
+namespace {
+struct Forgotten {
+    std::uintptr_t begin, end;
+    std::uint64_t generation;
+};
+constexpr std::size_t kForgottenKept = 256;
+struct ForgottenRing {
+    SRWLOCK lock = SRWLOCK_INIT;
+    Forgotten items[kForgottenKept] = {};
+    std::uint64_t generation = 0;
+};
+ForgottenRing* const g_forgotten = new ForgottenRing();  // leaked: hooks use it while the process exits
+}  // namespace
+
+void forget(std::uintptr_t begin, std::uintptr_t end) {
+    table().remove(begin, end);
+    ForgottenRing& r = *g_forgotten;
+    AcquireSRWLockExclusive(&r.lock);
+    ++r.generation;
+    r.items[r.generation % kForgottenKept] = Forgotten{begin, end, r.generation};
+    ReleaseSRWLockExclusive(&r.lock);
+}
+
+std::uint64_t forget_generation() {
+    ForgottenRing& r = *g_forgotten;
+    AcquireSRWLockShared(&r.lock);
+    const std::uint64_t g = r.generation;
+    ReleaseSRWLockShared(&r.lock);
+    return g;
+}
+
+bool forgotten_since(std::uintptr_t begin, std::uintptr_t end, std::uint64_t generation) {
+    ForgottenRing& r = *g_forgotten;
+    bool hit = false;
+    AcquireSRWLockShared(&r.lock);
+    for (const Forgotten& f : r.items)
+        if (f.generation > generation && f.begin < end && f.end > begin) hit = true;
+    ReleaseSRWLockShared(&r.lock);
+    return hit;
+}
 
 bool find(std::uintptr_t addr, Owner* out) {
     RangeSet<Owner>::Entry e{};

@@ -35,6 +35,12 @@ bool find(std::uintptr_t addr, Owner* out = nullptr);
 bool covers(std::uintptr_t begin, std::uintptr_t end);
 bool overlaps(std::uintptr_t begin, std::uintptr_t end);
 
+// Every forget() counts: forget_generation() before looking at a region, forgotten_since() after —
+// memory recorded and freed again in between (a short-lived thunk of a trusted module) was never
+// foreign, though no look ever found it recorded.
+std::uint64_t forget_generation();
+bool forgotten_since(std::uintptr_t begin, std::uintptr_t end, std::uint64_t generation);
+
 // A hooked call is between its real call and its record. Every one is kept in a slot with its
 // thread and its start, so that the sweep can wait for one that is still running (a thread
 // descheduled right after its real call) and need not wait for one whose thread is gone (killed

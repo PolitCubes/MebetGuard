@@ -62,12 +62,13 @@ constexpr NTSTATUS kAccessDenied = nt::kStatusAccessDenied;
 // static: its guard reads TLS).
 nt::NtQuerySectionFn g_query_section = nullptr;
 
-// The section maps an executable image. TLS-free.
-bool image_section(HANDLE section) {
+// The section maps an executable image — or cannot be asked (a handle without SECTION_QUERY): on a
+// thread that cannot judge, unknown counts as an image. TLS-free.
+bool image_section_or_unknown(HANDLE section) {
     nt::SectionBasicInformation info{};
     SIZE_T ret = 0;
     if (!g_query_section || !nt::ok(g_query_section(section, nt::kSectionBasicInformation, &info, sizeof(info), &ret)))
-        return false;
+        return true;
     return (info.AllocationAttributes & nt::kSecImage) != 0 &&
            (info.AllocationAttributes & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
 }
@@ -118,7 +119,7 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
                                        ULONG allocation, ULONG protect) {
     if (is_token(base, 1)) return canary(1);
     if (!tls_ready()) {
-        if (execguard::is_current_process(process) && (execguard::executable(protect) || image_section(section)))
+        if (execguard::is_current_process(process) && (execguard::executable(protect) || image_section_or_unknown(section)))
             return kAccessDenied;  // cannot be judged here (see tls_ready)
         return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
                                        allocation, protect);
@@ -128,7 +129,7 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
         return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
                                        allocation, protect);
     }
-    const bool image = section_is_image(section);
+    bool image = section_is_image(section);
     execguard::Requester req;
     if (!image && execguard::executable(protect)) {
         req = execguard::find_requester();
@@ -137,6 +138,12 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
     const int op = exec::op_begin();
     const NTSTATUS s =
         real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit, allocation, protect);
+    if (nt::ok(s) && base && *base && view_size && !image) {
+        // A section that could not be asked (no SECTION_QUERY on the handle) was taken for data, and
+        // its image mapped with nobody judging it. The view itself tells, whatever the handle allows.
+        MEMORY_BASIC_INFORMATION mbi{};
+        image = VirtualQuery(*base, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE && mbi.AllocationBase == *base;
+    }
     if (nt::ok(s) && base && *base && view_size) {
         if (image) {
             if (!gate::on_image_view(section, *base, *view_size)) {

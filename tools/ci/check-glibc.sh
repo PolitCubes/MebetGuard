@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 PolitCubes
 # The Linux guard must start on the oldest systems we promise: glibc 2.28 (Ubuntu 18.10+,
-# Debian 10+, RHEL 8+, Steam Deck) with the libstdc++ of GCC 8. Fails when a binary asks the
-# loader for a newer symbol version — on such a system it would not start at all.
+# Debian 10+, RHEL 8+, Steam Deck) with the C++ runtime of GCC 8 (libstdc++, its ABI, libgcc_s).
+# Fails when a binary asks the loader for a newer symbol version — on such a system it would not
+# start at all. A static check: the build job also starts the guard in the oldest container.
 #   check-glibc.sh <file>...
 set -euo pipefail
 
 GLIBC_FLOOR="GLIBC_2.28"
 GLIBCXX_FLOOR="GLIBCXX_3.4.25"
+CXXABI_FLOOR="CXXABI_1.3.11"
+GCC_FLOOR="GCC_7.0.0"
 
 newest() {  # newest "<prefix>_<version>" the files need, empty when none
   # grep finds nothing when no such symbol is needed: that is an answer, not a failure.
@@ -16,7 +19,7 @@ newest() {  # newest "<prefix>_<version>" the files need, empty when none
 }
 
 bad=0
-for pair in "GLIBC:$GLIBC_FLOOR" "GLIBCXX:$GLIBCXX_FLOOR"; do
+for pair in "GLIBC:$GLIBC_FLOOR" "GLIBCXX:$GLIBCXX_FLOOR" "CXXABI:$CXXABI_FLOOR" "GCC:$GCC_FLOOR"; do
   prefix="${pair%%:*}"
   floor="${pair#*:}"
   need="$(newest "$prefix" "$@")"

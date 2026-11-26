@@ -59,9 +59,9 @@ def _plain_java_cannot(base):
         "обычная java запустилась из этой папки — проверка ничего не доказывает\n" + base["out"]
 
 
-def _java_beyond(ctx):
+def _java_beyond(ctx, suffix=" java"):
     name = _beyond(ctx)
-    java = paths.copy_java(ctx.layout.java_src, ctx.layout.root / (name + " java"))
+    java = paths.copy_java(ctx.layout.java_src, ctx.layout.root / (name + suffix))
     c = copy.copy(ctx)
     c.java_home, c.java = java, java / "bin" / "java.exe"
     # JAVA_HOME is this folder now — not the layout's own Java folder in the other case (paths.py),
@@ -94,8 +94,10 @@ def test_java_home_beyond_code_page(ctx):
 
 
 def test_java_home_beyond_code_page_no_short_name(ctx):
-    """The same folder with its 8.3 name removed (fsutil, administrator): the guard must close (226)."""
-    c = _java_beyond(ctx)
+    """A folder like it with its 8.3 name removed (fsutil, administrator): the guard must close (226).
+    A copy of its own: stripped on the shared one, the name stays gone in a reused work folder, and
+    the test above would no longer try the 8.3 way at all."""
+    c = _java_beyond(ctx, " java nosn")
     if not ctx.admin:
         _skip(ctx, "снять имя 8.3 может только администратор (на раннерах CI так и есть)")
     folder = c.java_home

@@ -25,24 +25,29 @@ struct ThreadState {
     HANDLE last_section;         // section the gate just approved on this thread
     trust::Trust last_trust;
     std::wstring* last_path;     // owned
+    trust::FileIdentity* last_id;  // owned; the judged file
 };
-thread_local ThreadState t_gate = {false, nullptr, trust::Trust::unknown, nullptr};
+thread_local ThreadState t_gate = {false, nullptr, trust::Trust::unknown, nullptr, nullptr};
 thread_local int t_own_read = 0;
 
 std::atomic<bool> g_jvm_started{false};
 PVOID g_cookie = nullptr;
 
-void set_last(HANDLE section, trust::Trust t, const std::wstring& path) {
+void set_last(HANDLE section, trust::Trust t, const std::wstring& path, const trust::FileIdentity* id) {
     t_gate.last_section = section;
     t_gate.last_trust = t;
     delete t_gate.last_path;
     t_gate.last_path = new std::wstring(path);
+    delete t_gate.last_id;
+    t_gate.last_id = id ? new trust::FileIdentity(*id) : nullptr;
 }
 
 void clear_last() {
     t_gate.last_section = nullptr;
     delete t_gate.last_path;
     t_gate.last_path = nullptr;
+    delete t_gate.last_id;
+    t_gate.last_id = nullptr;
 }
 
 bool system_path(const std::wstring& path) {
@@ -169,7 +174,8 @@ VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data,
     const trust::Decision d = trust::decide_path(path);
     if (d.verdict.allowed) {
         // The size the kernel has mapped, not the one in the loader's data.
-        if (const std::size_t extent = win::image_extent(base)) modules::add(base, extent, d.verdict.trust, d.facts.path);
+        if (const std::size_t extent = win::image_extent(base))
+            modules::add(base, extent, d.verdict.trust, d.facts.path, d.facts.identity_known ? &d.facts.identity : nullptr);
         report_inventory(d);
     } else {
         deny_module(d, d.verdict.reason, "loader_notification");
@@ -213,7 +219,8 @@ bool on_image_section(HANDLE file) {
     }
     t_gate.busy = false;
     const bool allow = decide_and_apply(d, jvm_started() ? "game" : "prestart");
-    if (allow) set_last(nullptr, d.verdict.allowed ? d.verdict.trust : trust::Trust::unknown, d.facts.path);
+    if (allow) set_last(nullptr, d.verdict.allowed ? d.verdict.trust : trust::Trust::unknown, d.facts.path,
+                        d.facts.identity_known ? &d.facts.identity : nullptr);
     return allow;
 }
 
@@ -228,7 +235,7 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         return true;
     }
     if (section && section == t_gate.last_section) {
-        modules::add(b, size, t_gate.last_trust, t_gate.last_path ? *t_gate.last_path : std::wstring());
+        modules::add(b, size, t_gate.last_trust, t_gate.last_path ? *t_gate.last_path : std::wstring(), t_gate.last_id);
         clear_last();
         return true;
     }
@@ -265,7 +272,7 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         d = trust::decide_path(path);
     }
     if (d.verdict.allowed) {
-        modules::add(b, size, d.verdict.trust, d.facts.path);
+        modules::add(b, size, d.verdict.trust, d.facts.path, d.facts.identity_known ? &d.facts.identity : nullptr);
         report_inventory(d);
         return true;
     }

@@ -3,6 +3,7 @@
 #include "core/module_table.hpp"
 
 #include <atomic>
+#include <cstring>
 #include <map>
 
 #include "core/range_set.hpp"
@@ -40,6 +41,8 @@ struct Unloaded {
     std::uint64_t at_ms = 0;
     bool trusted = false;
     std::wstring path;  // the file the record named
+    trust::FileIdentity id{};
+    bool id_known = false;
 };
 constexpr std::size_t kUnloadedKept = 32;
 
@@ -91,7 +94,7 @@ void init() {
 // The range and the record of a module change together, under the lock of the names: with the
 // two steps apart, a record removed by one thread and added again by another could end up
 // without its range (or with the range of the one that is gone).
-void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path) {
+void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path, const trust::FileIdentity* id) {
     if (!base || !size) return;
     Names& n = names();
     AcquireSRWLockExclusive(&n.lock);
@@ -101,7 +104,8 @@ void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstri
     if (it != n.records.end() && it->second.size > size)
         ranges().remove_where(base, base + it->second.size, [base](const Payload& p) { return p.base == base; });
     ranges().add(base, base + size, Payload{t, base}, false);
-    n.records[base] = Record{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1};
+    n.records[base] = Record{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1,
+                             id ? *id : trust::FileIdentity{}, id != nullptr};
     n.pending.erase(base);
     ReleaseSRWLockExclusive(&n.lock);
 }
@@ -116,15 +120,16 @@ void add_pending(std::uintptr_t base) {
 
 bool pending_within(std::uintptr_t base, std::uint64_t max_ms) {
     Names& n = names();
-    const std::uint64_t now = GetTickCount64();
     AcquireSRWLockShared(&n.lock);
+    const std::uint64_t now = GetTickCount64();  // under the lock: never older than a tick stored meanwhile
     auto it = n.pending.find(base);
-    const bool fresh = it != n.pending.end() && now - it->second < max_ms;
+    const bool fresh = it != n.pending.end() && (now <= it->second || now - it->second < max_ms);
     ReleaseSRWLockShared(&n.lock);
     return fresh;
 }
 
-std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path) {
+std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path,
+                            const trust::FileIdentity* id) {
     if (!base || !size) return 0;
     Names& n = names();
     std::uint64_t serial = 0;
@@ -141,7 +146,7 @@ std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust 
     if (!others && n.records.find(base) == n.records.end()) {
         serial = g_serial.fetch_add(1, std::memory_order_relaxed) + 1;
         ranges().add(base, base + size, Payload{t, base}, false);
-        n.records[base] = Record{base, size, t, path, serial};
+        n.records[base] = Record{base, size, t, path, serial, id ? *id : trust::FileIdentity{}, id != nullptr};
     }
     ReleaseSRWLockExclusive(&n.lock);
     return serial;
@@ -161,27 +166,56 @@ void remove_unloading(std::uintptr_t base) {
     AcquireSRWLockExclusive(&n.lock);
     auto it = n.records.find(base);
     if (it != n.records.end()) {
-        n.unloaded[n.unloaded_next++ % kUnloadedKept] =
-            Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown, it->second.path};
+        n.unloaded[n.unloaded_next++ % kUnloadedKept] = Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown,
+                                                                 it->second.path, it->second.id, it->second.id_known};
         remove_locked(n, it);
     }
     ReleaseSRWLockExclusive(&n.lock);
 }
 
-bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms, const std::wstring* path) {
+namespace {
+// The newest unload from `base` within `max_age_ms`, copied out of the lock.
+bool newest_unload(std::uintptr_t base, std::uint64_t max_age_ms, Unloaded* out) {
     Names& n = names();
-    const std::uint64_t now = GetTickCount64();
-    bool trusted = false;
-    std::uint64_t newest = 0;
+    bool found = false;
     AcquireSRWLockShared(&n.lock);
+    const std::uint64_t now = GetTickCount64();
     for (const Unloaded& u : n.unloaded) {
-        if (u.base == base && u.at_ms && now - u.at_ms <= max_age_ms && u.at_ms >= newest) {
-            newest = u.at_ms;
-            trusted = u.trusted && (!path || (!u.path.empty() && win::name_equals(u.path, *path)));
+        if (u.base == base && u.at_ms && now - u.at_ms <= max_age_ms && (!found || u.at_ms >= out->at_ms)) {
+            *out = u;
+            found = true;
         }
     }
     ReleaseSRWLockShared(&n.lock);
-    return trusted;
+    return found;
+}
+}  // namespace
+
+bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms) {
+    Unloaded u;
+    return newest_unload(base, max_age_ms, &u) && u.trusted;
+}
+
+bool unloaded_recently_file(std::uintptr_t base, std::uint64_t max_age_ms, const std::wstring& path) {
+    Unloaded u;
+    if (path.empty() || !newest_unload(base, max_age_ms, &u) || !u.trusted) return false;
+    if (!u.id_known) return !u.path.empty() && win::name_equals(u.path, path);
+    const HANDLE h = trust::open_read(path);  // outside the lock: an open can take a while
+    if (h == INVALID_HANDLE_VALUE) return false;
+    trust::FileIdentity now{};
+    const bool ok = trust::identity_of(h, now);
+    CloseHandle(h);
+    return ok && now.volume == u.id.volume && std::memcmp(now.file_id, u.id.file_id, sizeof(now.file_id)) == 0;
+}
+
+bool record_at(std::uintptr_t base, Record* out) {
+    Names& n = names();
+    AcquireSRWLockShared(&n.lock);
+    auto it = n.records.find(base);
+    const bool found = it != n.records.end();
+    if (found && out) *out = it->second;
+    ReleaseSRWLockShared(&n.lock);
+    return found;
 }
 
 void remove(std::uintptr_t base) {

@@ -261,7 +261,7 @@ enum class SweepMode { startup, periodic };
 // sees then looks like foreign code or a hidden image: games were closed for only loading or
 // unloading a library. So before it judges such a find the walk looks again a few times over a
 // quarter of a second — and while a hooked call is still between its real call and its record (a
-// thread preempted right there), up to two seconds longer. What has not settled by then is judged
+// thread preempted right there), up to ten seconds longer. What has not settled by then is judged
 // in this very sweep; nothing is carried over to the next one.
 //
 // What counts as settled is narrow on purpose. Executable memory: only a record made meanwhile.
@@ -279,19 +279,21 @@ constexpr DWORD kInFlightStepMs = 50;
 // A view whose file the load gate is judging: as long as a check may take, and some.
 std::uint64_t pending_max_ms() { return static_cast<std::uint64_t>(config::opt::verify_timeout_ms) + 5000; }
 
+// False — "nothing to judge" — as soon as a close is pending: the worker carries the close out
+// only once the sweep returns, and the game must not run on for these seconds behind it.
 template <typename Settled>
 bool still_there(Settled settled) {
     for (const DWORD wait : kSettleMs) {
-        if (settled()) return false;
+        if (guard::closing() || settled()) return false;
         Sleep(wait);
         watchdog::worker_beat();
     }
     for (DWORD waited = 0; waited < kInFlightMaxMs && exec::live_op_within(kInFlightMaxMs); waited += kInFlightStepMs) {
-        if (settled()) return false;
+        if (guard::closing() || settled()) return false;
         Sleep(kInFlightStepMs);
         watchdog::worker_beat();
     }
-    return !settled();
+    return !guard::closing() && !settled();
 }
 
 // No image has its base at `alloc` any more.
@@ -365,6 +367,7 @@ void sweep_memory(SweepMode mode) {
     if (addr < 0x10000) addr = 0x10000;
     std::uintptr_t last_image_base = 0;
     while (addr < max && !guard::closing()) {
+        const std::uint64_t forgotten_before = exec::forget_generation();  // before the look (exec::forgotten_since)
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi))) break;
         const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
@@ -377,7 +380,17 @@ void sweep_memory(SweepMode mode) {
             const auto alloc = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase);
             if (alloc == last_image_base) continue;
             last_image_base = alloc;
-            if (modules::find(alloc)) continue;
+            modules::Record rec;
+            if (modules::record_at(alloc, &rec)) {
+                // A record holds only while the file mapped there is the one judged. A view unmapped
+                // by a call the hooks do not see (NtUnmapViewOfSectionEx) left its record behind, and
+                // another image mapped at that base was taken for the old trusted one for good.
+                trust::FileIdentity now{};
+                if (!rec.id_known || !mapped_file_id(alloc, now) || same_file(now, rec.id)) continue;
+                modules::remove_if(alloc, rec.serial);  // stale: judged below like any image
+            } else if (modules::find(alloc)) {
+                continue;
+            }
             if (!config::enabled(config::Module::hidden_images)) continue;
             if (modules::pending_within(alloc, pending_max_ms())) continue;  // its file is being judged
             if (loader_knows(alloc)) {
@@ -397,7 +410,8 @@ void sweep_memory(SweepMode mode) {
                     };
                     const std::size_t extent = win::image_extent(alloc);
                     if (extent && still_judged_file()) {
-                        const std::uint64_t serial = modules::add_if_absent(alloc, extent, d.verdict.trust, d.facts.path);
+                        const std::uint64_t serial = modules::add_if_absent(alloc, extent, d.verdict.trust, d.facts.path,
+                                                                            &d.facts.identity);
                         if (serial && !still_judged_file()) modules::remove_if(alloc, serial);
                     }
                 } else if (!periodic || refusal_stands(alloc, d)) {
@@ -407,8 +421,9 @@ void sweep_memory(SweepMode mode) {
             }
             if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
             const std::wstring found = win::mapped_file_name(reinterpret_cast<void*>(alloc));
-            if (periodic) {
-                // Neither recorded nor listed. A hidden image stays so. A library in the middle of
+            {
+                // Neither recorded nor listed (at start-up as well: other threads load meanwhile). A
+                // hidden image stays so. A library in the middle of
                 // loading or unloading does not: a moment later it is recorded or listed — or gone.
                 // Gone is forgiven only for what is known to be harmless: a library the loader has
                 // just unloaded (its trust is remembered from its record), or a file proven to be the
@@ -434,7 +449,7 @@ void sweep_memory(SweepMode mode) {
                     // purpose and map its own image there.
                     forgiven = (mapped != INVALID_HANDLE_VALUE && trust::decide(mapped, found).verdict.allowed) ||
                                (found.empty() && modules::unloaded_recently(alloc, kUnloadedForgetMs)) ||
-                               (!found.empty() && modules::unloaded_recently(alloc, kUnloadedForgetMs, &found) &&
+                               (!found.empty() && modules::unloaded_recently_file(alloc, kUnloadedForgetMs, found) &&
                                 trust::decide_path(found).verdict.allowed);
                 }
                 if (mapped != INVALID_HANDLE_VALUE) CloseHandle(mapped);
@@ -450,7 +465,10 @@ void sweep_memory(SweepMode mode) {
             exec::allow(base, next, exec::Owner{trust::Trust::os, 0, exec::Source::preexisting});
             continue;
         }
-        if (periodic && !still_there([&] { return exec::covers(base, next); })) continue;
+        if (periodic && !still_there([&] {
+                return exec::covers(base, next) || exec::forgotten_since(base, next, forgotten_before);
+            }))
+            continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");
     }
 }
@@ -530,7 +548,7 @@ void check_loaded_module(HMODULE m, const std::vector<std::wstring>& known) {
     }
     const trust::Decision d = gate::decide_loaded_module(base, extent, win::module_path(m));
     if (d.verdict.allowed) {
-        modules::add(base, extent, d.verdict.trust, d.facts.path);
+        modules::add(base, extent, d.verdict.trust, d.facts.path, d.facts.identity_known ? &d.facts.identity : nullptr);
     } else if (config::enabled(config::Module::startup_self_check)) {
         modules::add(base, extent, trust::Trust::unknown, d.facts.path);
         gate::deny_module(d, config::Reason::early_module, "startup");

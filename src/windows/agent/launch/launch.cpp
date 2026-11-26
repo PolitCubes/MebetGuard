@@ -260,7 +260,7 @@ void check_files(const Context& ctx) {
     const std::wstring exe_name = listed_name_of(ctx.exe_path);
     const std::wstring agent_name = listed_name_of(ctx.agent_path);
     for (const auto& name : win::list_dir(ctx.exe_dir)) {
-        if (iequals_ascii(name, exe_name) || iequals_ascii(name, agent_name)) continue;
+        if (win::name_equals(name, exe_name) || win::name_equals(name, agent_name)) continue;
         report::Event ev = event("close.extra_file", "Closed: foreign file in the guard folder ");
         ev.title += to_utf8(name);
         JsonWriter w;

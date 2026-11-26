@@ -207,7 +207,9 @@ pytest tests/e2e -v -rP --paths cyrillic --guard <MebetGuard> --java <JAVA_HOME>
 скрытый).
 
 Сборка Linux дополнительно проверяется `tools/ci/check-glibc.sh`: бинарники не должны требовать
-glibc новее 2.28 — иначе на Debian 10 / RHEL 8 / Ubuntu 18.10 страж не запустится вовсе.
+glibc новее 2.28 и C++-рантайма новее GCC 8 — иначе на Debian 10 / RHEL 8 / Ubuntu 18.10 страж не
+запустится вовсе; а в самом контейнере сборки (AlmaLinux 8) страж обеих сборок — и release —
+запускает JVM (Java 17). Release-сборка macOS проходит сценарии старта (`prod-start`).
 
 FFM-атаки (Foreign Function & Memory API, Java 22+) — это чит-мод без своей DLL: Java-код
 сам зовёт `VirtualAlloc`, `SuspendThread`, `FreeLibrary`. На 32-битной Windows их нет: у 32-битной
