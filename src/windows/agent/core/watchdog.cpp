@@ -70,6 +70,10 @@ std::atomic<std::uint64_t> g_created_at{0};  // when start() ran: the clock of t
 std::atomic<DWORD> g_worker_tid{0};
 std::atomic<int> g_worker_slow{0};  // SlowWork scopes open on the worker
 std::atomic<bool> g_ending{false};
+std::atomic<std::uint64_t> g_ending_at{0};  // when the thread that won g_ending started the end
+// The thread ending the process may be held up (frozen with the rest, say): after this, any hook
+// finishes the job.
+constexpr std::uint64_t kEndingMax = 5000 * kMs;
 // Report level: one report from each side (the watchdog about the worker, the worker about the
 // watchdog); the game keeps running.
 std::atomic<bool> g_told_by_watchdog{false};
@@ -257,6 +261,7 @@ DWORD WINAPI last_words_main(void*) {
     g_words.what = what;
     g_words.code = code;
     g_words.report = report;
+    g_ending_at.store(now_100ns(), std::memory_order_release);
     bool said = false;
     if (g_say && g_said) {
         SetEvent(g_say);
@@ -286,12 +291,13 @@ void on_stall(const char* what, bool try_report) {
 }
 
 // A close is pending and nobody is left to carry it out, or it was not finished in time: the
-// process ends with the code of that close, and with its report if the close has not sent it.
-// Never with 0 — a launcher reads 0 as a normal exit.
+// process ends with the code and the reason of that close — in the launcher log too — and with
+// its report if the close has not sent it. Never with 0: a launcher reads 0 as a normal exit.
 [[noreturn]] void end_pending_close(const char* what) {
     const int pending = guard::pending_exit_code();
-    end_process("pending_close", what, pending ? pending : config::reason(config::Reason::guard_stalled).exit_code,
-                Report::pending);
+    const char* id = guard::pending_reason_id();
+    const auto& stalled = config::reason(config::Reason::guard_stalled);
+    end_process(id && pending ? id : stalled.id, what, pending ? pending : stalled.exit_code, Report::pending);
 }
 
 HANDLE query_copy(HANDLE t) {
@@ -343,6 +349,7 @@ DWORD WINAPI watchdog_main(void*) {
             const bool too_silent = worker.silent > (slow ? kWorkerSlowMax : kWorkerSilentMax);
             if (too_silent && closing) end_pending_close("worker thread silent before the close");
             if (too_silent) on_stall("worker thread silent", true);
+            if (worker.unstarted > kStartMax && closing) end_pending_close("worker thread did not start");
             if (worker.unstarted > kStartMax) on_stall("worker thread did not start", true);
         }
         Sleep(kTickMs);
@@ -368,7 +375,7 @@ std::uint64_t hook_witnessed(std::uint64_t key, std::uint64_t now) {
 // allocation.
 std::atomic<std::uint64_t> g_trace_last{0};
 void trace_hook(std::uint64_t now, HANDLE worker, HANDLE watchdog, bool closing) {
-    if (!config::kTestBuild) return;
+    if (!config::kTestBuild || win::stderr_is_console()) return;  // a held console would hold the hook
     if (!closing && !silent(g_beat_worker, now, kWatchdogSilentMax) && !silent(g_beat_watchdog, now, kWatchdogSilentMax))
         return;
     const std::uint64_t last = g_trace_last.load(std::memory_order_relaxed);
@@ -499,6 +506,15 @@ void check_from_hook() {
     // and only its silence counts.
     const HANDLE watchdog = g_watchdog.load(std::memory_order_acquire);
     const std::uint64_t now = now_100ns();
+    if (g_ending.load(std::memory_order_acquire)) {
+        // The process is being ended. Every hooked call on the way — the report of the close goes
+        // out through WinHTTP, which maps and allocates — would otherwise find the same stall, lose
+        // the race to end the process and wait in it, and the report never left. Only when the end
+        // takes far longer than it can (its thread frozen too) does a hook finish it.
+        const std::uint64_t at = g_ending_at.load(std::memory_order_acquire);
+        if (!at || now < at || now - at < kEndingMax) return;
+        kill_process(g_words.code ? g_words.code : config::reason(config::Reason::guard_stalled).exit_code);
+    }
     if (config::kTestBuild) trace_hook(now, g_worker.load(std::memory_order_acquire), watchdog, guard::closing());
     if (!silent(g_beat_watchdog, now, kWatchdogSilentMax)) return;  // the fast path
     const HANDLE worker = g_worker.load(std::memory_order_acquire);
@@ -525,7 +541,12 @@ void check_from_hook() {
             if (stopped(worker)) end_pending_close("guard threads stopped during the close");
             return;
         }
-        const std::uint64_t limit = guard::close_running() ? close_budget() : kWorkerSlowMax;
+        // Before the close starts, the same limit the watchdog thread would apply: the long one
+        // only while the worker is inside slow work. The long one always gave a cheat that froze
+        // the watchdog and set off a detection on purpose three minutes instead of thirty seconds.
+        const bool slow = g_worker_slow.load(std::memory_order_relaxed) > 0;
+        const std::uint64_t limit =
+            guard::close_running() ? close_budget() : (slow ? kWorkerSlowMax : kWorkerSilentMax);
         if (hook_witnessed(~seen, now) > limit) end_pending_close("the close was not finished in time");
         return;
     }

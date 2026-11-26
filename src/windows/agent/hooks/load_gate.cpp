@@ -155,7 +155,7 @@ VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data,
     if (!data || guard::shutting_down()) return;
     const auto base = reinterpret_cast<std::uintptr_t>(data->DllBase);
     if (reason == nt::kLdrDllNotificationUnloaded) {
-        modules::remove(base);
+        modules::remove_unloading(base);
         return;
     }
     if (reason != nt::kLdrDllNotificationLoaded) return;
@@ -292,8 +292,10 @@ trust::Decision decide_loaded_module(std::uintptr_t base, std::size_t, const std
 }
 
 void deny_module(const trust::Decision& d, config::Reason reason, const char* phase) {
-    // Test builds: which rule refused the file, so a failed e2e run says why.
-    if (config::kTestBuild) {
+    // Test builds: which rule refused the file, so a failed e2e run says why. Not into a console:
+    // this can run inside the load hook, and a console held by a text selection would hold the
+    // loading thread with it.
+    if (config::kTestBuild && !win::stderr_is_console()) {
         std::fprintf(stderr, "[Mebet] refused: %s rule=%s identity=%s phase=%s path=%s\n", config::reason(reason).id,
                      d.verdict.rule.empty() ? "-" : d.verdict.rule.c_str(), d.facts.identity_known ? "yes" : "no",
                      phase, to_utf8(d.facts.path).c_str());

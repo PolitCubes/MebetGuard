@@ -57,6 +57,8 @@ std::wstring exact_path(const std::wstring& path);
 // in memory the process can write, and a rewritten header made a range of almost the whole
 // address space "the system's own image". 0 when no image starts at `base`.
 std::size_t image_extent(std::uintptr_t base);
+// stderr is a console (not a pipe or a file): a write to it can block while a selection is held.
+bool stderr_is_console();
 // An existing file or folder as the file system names it (GetFinalPathNameByHandleW): long names,
 // junctions and symbolic links resolved, the DOS form where its volume has one, else the GLOBALROOT
 // form; empty when it cannot be opened. Not for System32 paths in a WOW64 process (redirected).

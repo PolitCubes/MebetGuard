@@ -314,6 +314,25 @@ bool mapped_file_id(std::uintptr_t alloc, trust::FileIdentity& id) {
     return ok;
 }
 
+// Opens the file mapped as an image at `alloc`, proven to be that very file: opened by the name the
+// kernel gives for the mapping, and that name still the mapping's — and the opened file's — after
+// the open (two files cannot have one name at the same moment). INVALID_HANDLE_VALUE when that
+// cannot be proven, for instance because the image or its name changed in between.
+HANDLE open_mapped_file(std::uintptr_t alloc) {
+    const std::wstring name = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+    if (name.empty()) return INVALID_HANDLE_VALUE;
+    const HANDLE h = trust::open_read(name);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    if (!iequals_ascii(trust::final_path(h), name) || !iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), name)) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+// How long the trust of a library the loader has unloaded is remembered for its image (scans).
+constexpr std::uint64_t kUnloadedForgetMs = 5000;
+
 bool same_file(const trust::FileIdentity& a, const trust::FileIdentity& b) {
     return a.volume == b.volume && std::memcmp(a.file_id, b.file_id, sizeof(a.file_id)) == 0;
 }
@@ -380,20 +399,26 @@ void sweep_memory(SweepMode mode) {
             const std::wstring found = win::mapped_file_name(reinterpret_cast<void*>(alloc));
             if (periodic) {
                 // Neither recorded nor listed. A hidden image stays so. A library in the middle of
-                // loading or unloading does not: a moment later it is recorded or listed, or gone —
-                // and then its file is one the trust engine allows. An image of any other file was
-                // mapped around the loader, however briefly.
+                // loading or unloading does not: a moment later it is recorded or listed — or gone.
+                // Gone is forgiven only for what is known to be harmless: a library the loader has
+                // just unloaded (its trust is remembered from its record), or a file proven to be the
+                // one that was mapped and allowed by the trust engine. Never by a name alone: the
+                // file found under a name a moment later can be another one, and a name can be too
+                // long to read.
+                const HANDLE mapped = open_mapped_file(alloc);
                 bool gone = false;
                 const bool stays = still_there([&] {
                     if (modules::find(alloc) || loader_knows(alloc)) return true;
                     gone = image_gone(alloc);
                     return gone;
                 });
-                if (!stays && !gone) continue;
-                // Gone, and its name could not even be read when it was found: the kernel gives the
-                // name of any mapped image, so it was already being unmapped then — nothing ran from
-                // it. Otherwise it is forgiven only for a file the trust engine allows.
-                if (!stays && (found.empty() || trust::decide_path(found).verdict.allowed)) continue;
+                bool forgiven = !stays && !gone;
+                if (!stays && gone) {
+                    forgiven = modules::unloaded_recently(alloc, kUnloadedForgetMs) ||
+                               (mapped != INVALID_HANDLE_VALUE && trust::decide(mapped, found).verdict.allowed);
+                }
+                if (mapped != INVALID_HANDLE_VALUE) CloseHandle(mapped);
+                if (forgiven) continue;
             }
             close_hidden_image(alloc, found);
             continue;

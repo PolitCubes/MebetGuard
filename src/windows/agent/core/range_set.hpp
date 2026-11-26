@@ -129,6 +129,28 @@ public:
         ReleaseSRWLockExclusive(&lock_);
     }
 
+    // Removes [begin, end) only from the entries whose payload `pred` accepts: the range of one
+    // module, not the ranges of others that were mapped inside a stale span of it.
+    template <typename Pred>
+    void remove_where(std::uintptr_t begin, std::uintptr_t end, Pred pred) {
+        if (begin >= end || !overlaps(begin, end)) return;
+        AcquireSRWLockExclusive(&lock_);
+        const Snapshot* old = current_.load(std::memory_order_relaxed);
+        std::vector<Entry> v;
+        v.reserve(old->count + 1);
+        for (std::size_t i = 0; i < old->count; ++i) {
+            const Entry& e = old->entries[i];
+            if (e.end <= begin || e.begin >= end || !pred(e.payload)) {
+                v.push_back(e);
+                continue;
+            }
+            if (e.begin < begin) v.push_back({e.begin, begin, e.payload});
+            if (e.end > end) v.push_back({end, e.end, e.payload});
+        }
+        publish(v);
+        ReleaseSRWLockExclusive(&lock_);
+    }
+
     std::vector<Entry> entries() const {
         const Snapshot* s = current_.load(std::memory_order_acquire);
         return std::vector<Entry>(s->entries, s->entries + s->count);

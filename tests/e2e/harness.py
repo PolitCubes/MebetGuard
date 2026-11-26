@@ -65,6 +65,36 @@ def java_feature(java_home):
     return int(m.group(2) or 0) if major == 1 else major
 
 
+def java_arch(java_home):
+    """x86 / x64 / arm64 of a JDK from its `release` file (OS_ARCH), "" when unknown."""
+    try:
+        text = (Path(java_home) / "release").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.search(r'OS_ARCH="([^"]+)"', text)
+    a = m.group(1).lower() if m else ""
+    if a in ("x86_64", "amd64"):
+        return "x64"
+    if a in ("x86", "i386", "i486", "i586", "i686"):
+        return "x86"
+    if a in ("aarch64", "arm64"):
+        return "arm64"
+    return ""
+
+
+def pe_arch(path):
+    """x86 / x64 / arm64 of a PE file by its machine type, "" when it is not one."""
+    try:
+        data = Path(path).read_bytes()[:4096]
+        off = int.from_bytes(data[0x3C:0x40], "little")
+        if data[:2] != b"MZ" or data[off:off + 4] != b"PE\0\0":
+            return ""
+        machine = int.from_bytes(data[off + 4:off + 6], "little")
+    except (OSError, ValueError):
+        return ""
+    return {0x14C: "x86", 0x8664: "x64", 0xAA64: "arm64"}.get(machine, "")
+
+
 class Ctx:
     def __init__(self, guard, java, work=None, untrusted_native=None):
         self.os = host_os()
@@ -216,12 +246,23 @@ def _build_native(ctx):
     out_dir = ctx.work / "native"
     out_dir.mkdir(parents=True, exist_ok=True)
     if ctx.os == "windows":
+        # Built for the game's Java, not for this machine: a 32-bit JVM cannot load an x64 DLL, and
+        # every "the attack works" baseline then failed. Whatever a compiler made is checked by its
+        # PE machine type; one that does not fit is not used.
         lib = out_dir / "mebet_fake_cheat.dll"
-        for cc in ("clang", "gcc"):
-            if shutil.which(cc) and run_cmd([cc, "-shared", "-o", lib, src], os.environ.copy(), 120)[0] == 0:
+        arch = java_arch(ctx.java_home)
+        targets = {"x86": "i686-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}
+        tries = []
+        if arch in targets:
+            tries.append(["clang", "--target=" + targets[arch], "-shared", "-o", lib, src])
+        tries.append(["gcc"] + (["-m32"] if arch == "x86" else []) + ["-shared", "-o", lib, src])
+        for cmd in tries:
+            if lib.exists():
+                lib.unlink()
+            if shutil.which(cmd[0]) and run_cmd(cmd, os.environ.copy(), 120)[0] == 0 and pe_arch(lib) == arch:
                 return lib
         if shutil.which("cl") and run_cmd(["cl", "/LD", "/nologo", src, "/Fe:" + str(lib)],
-                                          os.environ.copy(), 120, cwd=out_dir)[0] == 0 and lib.exists():
+                                          os.environ.copy(), 120, cwd=out_dir)[0] == 0 and pe_arch(lib) == arch:
             return lib
         return None
     lib = out_dir / ("libmebet_fake_cheat." + ("dylib" if ctx.os == "macos" else "so"))

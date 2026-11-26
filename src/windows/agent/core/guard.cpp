@@ -44,6 +44,7 @@ struct Core {
     std::atomic<bool> flow_started{false};
     std::atomic<bool> report_claimed{false};  // the report of the close: sent by run_close or by the watchdog
     std::atomic<int> exit_code{0};
+    std::atomic<int> reason{-1};  // of the pending close, set together with exit_code
     std::atomic<CloseRequest*> close{nullptr};
     HANDLE wake = nullptr;
     DWORD worker_tid = 0;
@@ -113,10 +114,14 @@ report::Event close_event(const CloseRequest& r, report::Event ev) {
     std::thread sender;
     if (!c.report_claimed.exchange(true)) {
         report::Event ev = close_event(r, std::move(r.event));
-        sender = std::thread([&sent, ev]() mutable {
-            report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
-            sent.store(true);
-        });
+        try {
+            sender = std::thread([&sent, ev]() mutable {
+                report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+                sent.store(true);
+            });
+        } catch (...) {
+            sent.store(true);  // no thread to send it: the close goes on without the report
+        }
     } else {
         sent.store(true);
     }
@@ -137,11 +142,20 @@ report::Event close_event(const CloseRequest& r, report::Event ev) {
     const bool no_ui = config::kTestBuild && !win::env(L"MEBET_TEST_NO_UI").empty();
     if (!no_ui) {
         const HANDLE dismissed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        bool own_thread = false;
         if (dismissed) {
-            std::thread([title, text, dismissed] {
-                reason_window::show(title, text);
-                SetEvent(dismissed);
-            }).detach();
+            try {
+                std::thread([title, text, dismissed] {
+                    reason_window::show(title, text);
+                    SetEvent(dismissed);
+                }).detach();
+                own_thread = true;
+            } catch (...) {
+                // No thread for the window (out of resources): an exception here would abort the
+                // process instead of closing it with the reason's code.
+            }
+        }
+        if (own_thread) {
             if (WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
                 std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
                              config::opt::close_window_max_ms / 1000);
@@ -230,6 +244,7 @@ void request_close(config::Reason reason, const std::wstring& detail, report::Ev
     // code 0 — a launcher reads that as a normal exit.
     int none = 0;
     if (!c.exit_code.compare_exchange_strong(none, config::reason(reason).exit_code)) return;
+    c.reason.store(static_cast<int>(reason));
     c.close.store(new CloseRequest{reason, detail, std::move(ev)});
     c.closing.store(true, std::memory_order_release);
     if (c.wake) SetEvent(c.wake);
@@ -238,9 +253,22 @@ void request_close(config::Reason reason, const std::wstring& detail, report::Ev
 void close_now(config::Reason reason, const std::wstring& detail, report::Event ev) {
     request_close(reason, detail, std::move(ev));
     Core& c = core();
+    // The close may be another thread's, requested a moment ago: its request appears right after
+    // its exit code. It is carried out here either way (run_close lets only one thread through).
+    // Waiting for good on someone else's close hung the start before the worker existed, with
+    // nobody left to carry it out; a request that never appears — its thread stopped in between —
+    // still ends the process, with its code.
     CloseRequest* r = c.close.load();
+    for (int i = 0; !r && i < 5000; ++i) {
+        Sleep(1);
+        r = c.close.load();
+    }
     if (!r) {
-        for (;;) Sleep(INFINITE);  // another thread is closing
+        const int code = c.exit_code.load();
+        const auto& a = nt::api();
+        if (a.NtTerminateProcess) a.NtTerminateProcess(nt::current_process(), static_cast<NTSTATUS>(code));
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+        for (;;) Sleep(INFINITE);
     }
     run_close(*r);
 }
@@ -294,6 +322,11 @@ void start_worker() {
 DWORD worker_thread_id() { return core().worker_tid; }
 
 int pending_exit_code() { return closing() ? core().exit_code.load() : 0; }
+
+const char* pending_reason_id() {
+    const int r = core().reason.load();
+    return r >= 0 && r < static_cast<int>(config::Reason::count_) ? config::reason(static_cast<config::Reason>(r)).id : nullptr;
+}
 
 std::wstring reason_text(config::Reason reason, const std::wstring& detail, std::wstring* title) {
     const auto& d = config::reason(reason);

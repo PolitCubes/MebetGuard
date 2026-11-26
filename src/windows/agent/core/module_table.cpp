@@ -32,9 +32,20 @@ T& once(std::atomic<T*>& slot) {
 std::atomic<RangeSet<Payload>*> g_ranges{nullptr};
 RangeSet<Payload>& ranges() { return once(g_ranges); }
 
+// What the loader has just unloaded: a library leaves the table at the loader's notification a
+// moment before its image is unmapped, and the sweep may find it in between (scans.cpp).
+struct Unloaded {
+    std::uintptr_t base;
+    std::uint64_t at_ms;
+    bool trusted;
+};
+constexpr std::size_t kUnloadedKept = 32;
+
 struct Names {
     SRWLOCK lock = SRWLOCK_INIT;
     std::map<std::uintptr_t, Record> records;
+    Unloaded unloaded[kUnloadedKept] = {};
+    std::size_t unloaded_next = 0;
 };
 
 std::atomic<Names*> g_names{nullptr};
@@ -82,7 +93,10 @@ void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstri
     Names& n = names();
     AcquireSRWLockExclusive(&n.lock);
     auto it = n.records.find(base);
-    if (it != n.records.end() && it->second.size > size) ranges().remove(base, base + it->second.size);
+    // A stale bigger record at the same base: only its own range goes — modules mapped inside it
+    // since then keep theirs.
+    if (it != n.records.end() && it->second.size > size)
+        ranges().remove_where(base, base + it->second.size, [base](const Payload& p) { return p.base == base; });
     ranges().add(base, base + size, Payload{t, base}, false);
     n.records[base] = Record{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1};
     ReleaseSRWLockExclusive(&n.lock);
@@ -107,9 +121,36 @@ void remove_locked(Names& n, std::map<std::uintptr_t, Record>::iterator it) {
     const std::uintptr_t base = it->second.base;
     const std::size_t size = it->second.size;
     n.records.erase(it);
-    if (size) ranges().remove(base, base + size);
+    if (size) ranges().remove_where(base, base + size, [base](const Payload& p) { return p.base == base; });
 }
 }  // namespace
+
+void remove_unloading(std::uintptr_t base) {
+    Names& n = names();
+    AcquireSRWLockExclusive(&n.lock);
+    auto it = n.records.find(base);
+    if (it != n.records.end()) {
+        n.unloaded[n.unloaded_next++ % kUnloadedKept] = Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown};
+        remove_locked(n, it);
+    }
+    ReleaseSRWLockExclusive(&n.lock);
+}
+
+bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms) {
+    Names& n = names();
+    const std::uint64_t now = GetTickCount64();
+    bool trusted = false;
+    std::uint64_t newest = 0;
+    AcquireSRWLockShared(&n.lock);
+    for (const Unloaded& u : n.unloaded) {
+        if (u.base == base && u.at_ms && now - u.at_ms <= max_age_ms && u.at_ms >= newest) {
+            newest = u.at_ms;
+            trusted = u.trusted;
+        }
+    }
+    ReleaseSRWLockShared(&n.lock);
+    return trusted;
+}
 
 void remove(std::uintptr_t base) {
     Names& n = names();

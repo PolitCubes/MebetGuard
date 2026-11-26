@@ -364,14 +364,28 @@ std::wstring canonical_path(const std::wstring& path) {
 std::wstring mapped_file_name(const void* address) {
     const auto& a = nt::api();
     if (!a.NtQueryVirtualMemory) return std::wstring();
-    alignas(8) unsigned char buf[sizeof(UNICODE_STRING) + 2 * 4096];
+    alignas(8) unsigned char small[sizeof(UNICODE_STRING) + 2 * 4096];
     SIZE_T ret = 0;
-    if (!nt::ok(a.NtQueryVirtualMemory(nt::current_process(), const_cast<void*>(address),
-                                       nt::kMemoryMappedFilenameInformation, buf, sizeof(buf), &ret)))
-        return std::wstring();
-    const auto* us = reinterpret_cast<const UNICODE_STRING*>(buf);
-    if (!us->Buffer || !us->Length) return std::wstring();
+    NTSTATUS s = a.NtQueryVirtualMemory(nt::current_process(), const_cast<void*>(address),
+                                        nt::kMemoryMappedFilenameInformation, small, sizeof(small), &ret);
+    const UNICODE_STRING* us = reinterpret_cast<const UNICODE_STRING*>(small);
+    // A path longer than the small buffer (up to the 32767 characters NTFS allows): asked again
+    // with the size the kernel named. An empty answer must mean "nothing is mapped there", never
+    // "the name is long".
+    std::vector<unsigned char> big;
+    if (!nt::ok(s) && ret > sizeof(small) && ret <= sizeof(UNICODE_STRING) + 2 * 32768 + 16) {
+        big.resize(ret + 16);
+        s = a.NtQueryVirtualMemory(nt::current_process(), const_cast<void*>(address),
+                                   nt::kMemoryMappedFilenameInformation, big.data(), big.size(), &ret);
+        us = reinterpret_cast<const UNICODE_STRING*>(big.data());
+    }
+    if (!nt::ok(s) || !us->Buffer || !us->Length) return std::wstring();
     return nt_to_dos(std::wstring(us->Buffer, us->Length / sizeof(wchar_t)));
+}
+
+bool stderr_is_console() {
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    return err && err != INVALID_HANDLE_VALUE && GetFileType(err) == FILE_TYPE_CHAR;
 }
 
 std::wstring reg_string(HKEY root, const wchar_t* subkey, const wchar_t* value, REGSAM extra) {

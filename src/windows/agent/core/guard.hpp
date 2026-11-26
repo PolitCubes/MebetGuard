@@ -56,6 +56,8 @@ DWORD worker_thread_id();
 
 // Exit code to force if the process exits while a close is pending.
 int pending_exit_code();
+// Id of the reason of the pending close ("untrusted_module"), nullptr when none.
+const char* pending_reason_id();
 
 // Text of a reason in the player's language with {file} filled in.
 std::wstring reason_text(config::Reason reason, const std::wstring& detail, std::wstring* title);

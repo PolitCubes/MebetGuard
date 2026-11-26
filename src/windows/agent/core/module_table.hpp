@@ -30,6 +30,11 @@ void remove(std::uintptr_t base);
 // serial of the new record, 0 when nothing was added; remove_if removes only that very record.
 std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path);
 void remove_if(std::uintptr_t base, std::uint64_t serial);
+// The loader's unload notification: removes the module and remembers that it went, and whether it
+// was trusted — its image stays mapped for a moment after the notification.
+void remove_unloading(std::uintptr_t base);
+// A trusted module was unloaded from `base` within the last `max_age_ms`.
+bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms);
 
 // Lock-free lookups.
 bool find(std::uintptr_t addr, trust::Trust* t = nullptr, std::uintptr_t* base = nullptr);
