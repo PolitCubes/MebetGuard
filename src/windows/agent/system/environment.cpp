@@ -167,10 +167,14 @@ std::vector<std::wstring> kernel_modules() {
     return out;
 }
 
+// Drivers that load only inside a guest. Not one that a host loads too: vmci.sys is the VMware VMCI
+// driver of the guest tools and of VMware Workstation on a real PC alike — with Hyper-V or Memory
+// Integrity on (the hypervisor bit set), such a PC had both signs and was closed as a virtual
+// machine. The Hyper-V root uses vmbusr.sys, not vmbus.sys.
 std::vector<std::string> guest_drivers() {
     static const char* const kGuest[] = {"vmbus.sys", "storvsc.sys", "netvsc.sys", "hyperkbd.sys", "vmbushid.sys",
                                          "vboxguest.sys", "vboxmouse.sys", "vboxsf.sys", "vboxwddm.sys", "vmhgfs.sys",
-                                         "vmmouse.sys", "vm3dmp.sys", "vmci.sys", "vmmemctl.sys", "prl_fs.sys",
+                                         "vmmouse.sys", "vm3dmp.sys", "vmmemctl.sys", "prl_fs.sys",
                                          "prl_tg.sys", "prl_eth5.sys", "xenbus.sys", "xenvbd.sys", "viostor.sys",
                                          "vioscsi.sys", "netkvm.sys", "balloon.sys", "qemupciserial.sys"};
     std::vector<std::string> found;
@@ -317,7 +321,16 @@ void check_virtual_machine() {
     ev.extra_json = w.take();
     ev.fingerprint = {ev.type, cls, hv.vendor};
     if (close && config::closes(config::Module::virtual_machine)) {
-        guard::close_now(config::Reason::virtual_machine, std::wstring(), std::move(ev));
+        // The signs go into the launcher log line too: without a report channel it is the only
+        // trace of why a PC was taken for a virtual machine.
+        std::string why = cls + ": hypervisor '" + (hv.present ? hv.vendor : std::string("none")) + "'";
+        if (!hv.vendor_100.empty()) why += " / '" + hv.vendor_100 + "'";
+        if (bios_vm) why += ", SMBIOS '" + bios.manufacturer + " | " + bios.product + " | " + bios.bios_vendor + "'";
+        if (!guests.empty()) {
+            why += ", guest drivers:";
+            for (const auto& g : guests) why += " " + g;
+        }
+        guard::close_now(config::Reason::virtual_machine, win::wide(why), std::move(ev));
     }
     if (config::enabled(config::Module::virtual_machine)) {
         ev.dedupe_key = ev.type;
