@@ -41,8 +41,10 @@ public class MebetTarget {
         System.out.flush();
 
         String cmdFile = System.getProperty("mebet.cmd", "");
+        String cmdAction = "";
         if (!cmdFile.isEmpty() && Files.exists(Paths.get(cmdFile))) {
             String action = Files.readAllLines(Paths.get(cmdFile)).get(0).trim();
+            cmdAction = action;
             System.out.println("TARGET action: " + action);
             System.out.flush();
             runAction(action);  // models what a cheat jar does from inside the JVM
@@ -58,6 +60,9 @@ public class MebetTarget {
         }
         System.out.println("TARGET exit");
         System.out.flush();
+        // Threads killed by TerminateThread (ffm-jam-sweep) leave the JVM's own bookkeeping broken:
+        // its normal shutdown then sometimes ends with exit code 1, the attack's doing, not the app's.
+        if (cmdAction.startsWith("ffm-jam-sweep")) Runtime.getRuntime().halt(0);
     }
 
     // Prints "TARGET did ..." only if the action actually succeeded, so the guard closing the

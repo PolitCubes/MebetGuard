@@ -425,13 +425,17 @@ void sweep_memory(SweepMode mode) {
                 });
                 bool forgiven = !stays && !gone;
                 if (!stays && gone) {
-                    // A file proven to be the mapped one and allowed. Or no file at all: the name was
-                    // already unreadable when the image was found, so it was being unmapped then —
-                    // that only for a base a trusted library was just unloaded from (an image that
-                    // can be read is never forgiven by its base alone: a cheat could unload a signed
-                    // library at that base on purpose).
+                    // A file proven to be the mapped one and allowed. Or the library the loader has
+                    // just unloaded from this base — told by its own record: the very file it named,
+                    // still one the trust engine allows (the image was found between the unload
+                    // notification and the unmap, and was gone before it could be proven). Or no
+                    // name at all, already unreadable when it was found: unmapped right then. Never
+                    // by the base alone: a cheat could unload a signed library at that base on
+                    // purpose and map its own image there.
                     forgiven = (mapped != INVALID_HANDLE_VALUE && trust::decide(mapped, found).verdict.allowed) ||
-                               (found.empty() && modules::unloaded_recently(alloc, kUnloadedForgetMs));
+                               (found.empty() && modules::unloaded_recently(alloc, kUnloadedForgetMs)) ||
+                               (!found.empty() && modules::unloaded_recently(alloc, kUnloadedForgetMs, &found) &&
+                                trust::decide_path(found).verdict.allowed);
                 }
                 if (mapped != INVALID_HANDLE_VALUE) CloseHandle(mapped);
                 if (forgiven) continue;

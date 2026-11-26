@@ -38,8 +38,9 @@ bool pending_within(std::uintptr_t base, std::uint64_t max_ms);
 // The loader's unload notification: removes the module and remembers that it went, and whether it
 // was trusted — its image stays mapped for a moment after the notification.
 void remove_unloading(std::uintptr_t base);
-// A trusted module was unloaded from `base` within the last `max_age_ms`.
-bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms);
+// A trusted module was unloaded from `base` within the last `max_age_ms` — with `path`, one whose record
+// named that very file.
+bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms, const std::wstring* path = nullptr);
 
 // Lock-free lookups.
 bool find(std::uintptr_t addr, trust::Trust* t = nullptr, std::uintptr_t* base = nullptr);

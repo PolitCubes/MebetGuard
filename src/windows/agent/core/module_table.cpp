@@ -6,6 +6,7 @@
 #include <map>
 
 #include "core/range_set.hpp"
+#include "core/win_util.hpp"
 
 namespace mebet::modules {
 
@@ -35,9 +36,10 @@ RangeSet<Payload>& ranges() { return once(g_ranges); }
 // What the loader has just unloaded: a library leaves the table at the loader's notification a
 // moment before its image is unmapped, and the sweep may find it in between (scans.cpp).
 struct Unloaded {
-    std::uintptr_t base;
-    std::uint64_t at_ms;
-    bool trusted;
+    std::uintptr_t base = 0;
+    std::uint64_t at_ms = 0;
+    bool trusted = false;
+    std::wstring path;  // the file the record named
 };
 constexpr std::size_t kUnloadedKept = 32;
 
@@ -159,13 +161,14 @@ void remove_unloading(std::uintptr_t base) {
     AcquireSRWLockExclusive(&n.lock);
     auto it = n.records.find(base);
     if (it != n.records.end()) {
-        n.unloaded[n.unloaded_next++ % kUnloadedKept] = Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown};
+        n.unloaded[n.unloaded_next++ % kUnloadedKept] =
+            Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown, it->second.path};
         remove_locked(n, it);
     }
     ReleaseSRWLockExclusive(&n.lock);
 }
 
-bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms) {
+bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms, const std::wstring* path) {
     Names& n = names();
     const std::uint64_t now = GetTickCount64();
     bool trusted = false;
@@ -174,7 +177,7 @@ bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms) {
     for (const Unloaded& u : n.unloaded) {
         if (u.base == base && u.at_ms && now - u.at_ms <= max_age_ms && u.at_ms >= newest) {
             newest = u.at_ms;
-            trusted = u.trusted;
+            trusted = u.trusted && (!path || (!u.path.empty() && win::name_equals(u.path, *path)));
         }
     }
     ReleaseSRWLockShared(&n.lock);
