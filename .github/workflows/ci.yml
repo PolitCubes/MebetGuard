@@ -472,11 +472,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The API answers 502 now and then: asked again, never taken for "nothing is wrong".
+          # Pages of 30: a page of 100 of this run's ~150 jobs is answered 502 every time. And the API
+          # answers 502 now and then anyway: asked again, never taken for "nothing is wrong".
           ok=""
           for attempt in 1 2 3 4 5 6; do
             if bad=$(gh api --paginate \
-                "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+                "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=30" \
                 --jq '.jobs[] | select(.name != "ci-ok" and .name != "sign" and (.name | startswith("perf ") | not))
                       | select(.conclusion != "success") | "\(.name): \(.conclusion // .status)"'); then
               ok=1
