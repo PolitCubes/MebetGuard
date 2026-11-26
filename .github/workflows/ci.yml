@@ -472,10 +472,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          bad=$(gh api --paginate \
-            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name != "ci-ok" and .name != "sign" and (.name | startswith("perf ") | not))
-                  | select(.conclusion != "success") | "\(.name): \(.conclusion // .status)"')
+          # The API answers 502 now and then: asked again, never taken for "nothing is wrong".
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if bad=$(gh api --paginate \
+                "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+                --jq '.jobs[] | select(.name != "ci-ok" and .name != "sign" and (.name | startswith("perf ") | not))
+                      | select(.conclusion != "success") | "\(.name): \(.conclusion // .status)"'); then
+              ok=1
+              break
+            fi
+            echo "the GitHub API did not answer (attempt $attempt), asking again"
+            sleep 20
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::the jobs of this run could not be read: not green"
+            exit 1
+          fi
           if [ -n "$bad" ]; then
             echo "$bad"
             echo "::error::not every build and e2e job ran and passed"
