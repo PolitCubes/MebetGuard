@@ -255,10 +255,10 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
     // Any other image section (created before the hooks, by NtCreateSectionEx, or handed
     // over from another process): judge the file that is actually mapped. That can take seconds
     // on a cold disk, and the sweep must not take the view for an image mapped around the loader
-    // meanwhile: until the verdict it is in the table — as untrusted, so nothing in it counts as
-    // allowed code.
+    // meanwhile: it is marked as being judged. Not recorded: a record would exempt it from every
+    // later sweep, and a judging thread that never finishes would leave it so for good.
     const std::wstring path = win::mapped_file_name(base);
-    modules::add(b, size, trust::Trust::unknown, path);
+    modules::add_pending(b);
     trust::Decision d;
     {
         timing::Scope scope(config::Module::module_trust);

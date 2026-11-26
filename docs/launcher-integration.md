@@ -48,7 +48,7 @@
 ```
 
 Файлы кладутся в `LaunchServer/launcher-pack/guard/<папка>/` из артефактов CI
-(`mebet-<платформа>-release`). С `renameExeFile` exe называется `<projectName>.exe`
+`bin-<os>-<arch>-prod` (сборка `release`; `bin-*-dev` — только для тестов, игрокам не давать). С `renameExeFile` exe называется `<projectName>.exe`
 (`PolitCubes.exe`); агент обёртка ищет рядом по фиксированному имени.
 
 ## Коды выхода

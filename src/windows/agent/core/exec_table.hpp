@@ -35,10 +35,13 @@ bool find(std::uintptr_t addr, Owner* out = nullptr);
 bool covers(std::uintptr_t begin, std::uintptr_t end);
 bool overlaps(std::uintptr_t begin, std::uintptr_t end);
 
-// A hooked call is between its real call and its record. The sweep gives memory it finds
-// unrecorded a little longer while any is (scans.cpp, still_there); it never waits on it for good.
-void op_begin();
-void op_end();
-bool ops_in_flight();
+// A hooked call is between its real call and its record. Every one is kept in a slot with its
+// thread and its start, so that the sweep can wait for one that is still running (a thread
+// descheduled right after its real call) and need not wait for one whose thread is gone (killed
+// inside a hook: it never ends). op_begin returns the slot for op_end; -1 when all are taken.
+int op_begin();
+void op_end(int slot);
+// Some call is in flight on a thread that still runs, and started less than max_ms ago.
+bool live_op_within(std::uint64_t max_ms);
 
 }  // namespace mebet::exec

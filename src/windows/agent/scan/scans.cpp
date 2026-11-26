@@ -270,10 +270,14 @@ enum class SweepMode { startup, periodic };
 // record, the loader listing it, or the image gone with a file the trust engine allows.
 //
 // M-07, for the record: the sweep once skipped everything while a call was in flight, and a
-// thread killed inside a hook left that count up for good. Now a stuck count costs two seconds.
+// thread killed inside a hook left that count up for good. Now only calls on live threads count.
 constexpr DWORD kSettleMs[] = {2, 18, 60, 170};
-constexpr DWORD kInFlightMaxMs = 2000;
+// A call still between its real call and its record, on a thread that still runs (descheduled
+// right there, say) gets this long. A thread killed inside a hook is not waited for at all.
+constexpr DWORD kInFlightMaxMs = 10000;
 constexpr DWORD kInFlightStepMs = 50;
+// A view whose file the load gate is judging: as long as a check may take, and some.
+std::uint64_t pending_max_ms() { return static_cast<std::uint64_t>(config::opt::verify_timeout_ms) + 5000; }
 
 template <typename Settled>
 bool still_there(Settled settled) {
@@ -282,7 +286,7 @@ bool still_there(Settled settled) {
         Sleep(wait);
         watchdog::worker_beat();
     }
-    for (DWORD waited = 0; waited < kInFlightMaxMs && exec::ops_in_flight(); waited += kInFlightStepMs) {
+    for (DWORD waited = 0; waited < kInFlightMaxMs && exec::live_op_within(kInFlightMaxMs); waited += kInFlightStepMs) {
         if (settled()) return false;
         Sleep(kInFlightStepMs);
         watchdog::worker_beat();
@@ -297,11 +301,6 @@ bool image_gone(std::uintptr_t alloc) {
            reinterpret_cast<std::uintptr_t>(m.AllocationBase) != alloc;
 }
 
-// The same file is still mapped as an image at `alloc`.
-bool same_file_mapped(std::uintptr_t alloc, const std::wstring& path) {
-    return !path.empty() && iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), path);
-}
-
 // Volume and file id of the file mapped at `alloc` (not size and time: those its owner can change
 // while the image is mapped). False when it cannot be read.
 bool mapped_file_id(std::uintptr_t alloc, trust::FileIdentity& id) {
@@ -314,22 +313,6 @@ bool mapped_file_id(std::uintptr_t alloc, trust::FileIdentity& id) {
     return ok;
 }
 
-// Opens the file mapped as an image at `alloc`, proven to be that very file: opened by the name the
-// kernel gives for the mapping, and that name still the mapping's — and the opened file's — after
-// the open (two files cannot have one name at the same moment). INVALID_HANDLE_VALUE when that
-// cannot be proven, for instance because the image or its name changed in between.
-HANDLE open_mapped_file(std::uintptr_t alloc) {
-    const std::wstring name = win::mapped_file_name(reinterpret_cast<void*>(alloc));
-    if (name.empty()) return INVALID_HANDLE_VALUE;
-    const HANDLE h = trust::open_read(name);
-    if (h == INVALID_HANDLE_VALUE) return h;
-    if (!iequals_ascii(trust::final_path(h), name) || !iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), name)) {
-        CloseHandle(h);
-        return INVALID_HANDLE_VALUE;
-    }
-    return h;
-}
-
 // How long the trust of a library the loader has unloaded is remembered for its image (scans).
 constexpr std::uint64_t kUnloadedForgetMs = 5000;
 
@@ -337,19 +320,39 @@ bool same_file(const trust::FileIdentity& a, const trust::FileIdentity& b) {
     return a.volume == b.volume && std::memcmp(a.file_id, b.file_id, sizeof(a.file_id)) == 0;
 }
 
-// The file of an image the loader lists was refused by the periodic walk. Is the refusal about
-// what is mapped there? A library unloaded while its file was being judged leaves nothing to
-// read, and another library may already sit at its address: a game was closed for an "untrusted
-// module" with no name. The refusal stands unless, look after look, the image was recorded by a
-// hook, went away, or another file sits there now — told by its file id, never by its name: the
-// name of a mapped file follows a rename, and a module that kept renaming its file escaped.
+// Opens the file mapped as an image at `alloc`, proven to be that very file: opened by the name the
+// kernel gives for the mapping, and that name, read again, still leading to the same file.
+// INVALID_HANDLE_VALUE when that cannot be proven, for instance because the image or its file
+// changed in between.
+HANDLE open_mapped_file(std::uintptr_t alloc) {
+    const std::wstring name = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+    if (name.empty()) return INVALID_HANDLE_VALUE;
+    const HANDLE h = trust::open_read(name);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    // Proven by file id, not by comparing names: the name of the opened file comes back in another
+    // form (long instead of 8.3, a volume instead of a mapped drive letter). The mapping's name,
+    // read again after the open, must lead to this very file.
+    trust::FileIdentity opened{}, mapped{};
+    if (!trust::identity_of(h, opened) || !mapped_file_id(alloc, mapped) || !same_file(opened, mapped)) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+// The file of an image the loader lists was refused by the periodic walk. A file that was read and
+// judged was there — refused, whatever happens to the image next: one that vanished for an instant
+// while it was judged escaped every sweep. Only a refusal without a readable file is looked at
+// again: a library unloaded while its file was being judged leaves nothing to read, and another
+// library may already sit at its address (a game was closed for an "untrusted module" with no
+// name). That one stands unless the image was recorded by a hook, went away, or another file can
+// be read there now (the next sweep judges it).
 bool refusal_stands(std::uintptr_t alloc, const trust::Decision& d) {
+    if (d.facts.identity_known) return true;
     return still_there([&] {
         if (modules::find(alloc) || image_gone(alloc)) return true;
         trust::FileIdentity now{};
-        if (!mapped_file_id(alloc, now)) return false;  // cannot tell: the refusal stands
-        // Judged without a readable file (the image was going away): judge again next sweep.
-        return !d.facts.identity_known || !same_file(now, d.facts.identity);
+        return mapped_file_id(alloc, now);  // readable now: the next sweep judges that file
     });
 }
 
@@ -376,6 +379,7 @@ void sweep_memory(SweepMode mode) {
             last_image_base = alloc;
             if (modules::find(alloc)) continue;
             if (!config::enabled(config::Module::hidden_images)) continue;
+            if (modules::pending_within(alloc, pending_max_ms())) continue;  // its file is being judged
             if (loader_knows(alloc)) {
                 // Loaded by a path the hooks do not see (NtMapViewOfSectionEx): judge the file now.
                 const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(alloc));
@@ -385,10 +389,16 @@ void sweep_memory(SweepMode mode) {
                     // library may have been unloaded since, and another loaded at its address:
                     // recorded only if that file is still what is mapped, never over a record a
                     // hook has made meanwhile, and taken back if the image went away in between.
+                    // The same file — told by its id, as the trust engine judged it: a name says
+                    // nothing of the file found under it a moment later.
+                    auto still_judged_file = [&] {
+                        trust::FileIdentity now{};
+                        return d.facts.identity_known && mapped_file_id(alloc, now) && same_file(now, d.facts.identity);
+                    };
                     const std::size_t extent = win::image_extent(alloc);
-                    if (extent && same_file_mapped(alloc, path)) {
+                    if (extent && still_judged_file()) {
                         const std::uint64_t serial = modules::add_if_absent(alloc, extent, d.verdict.trust, d.facts.path);
-                        if (serial && !same_file_mapped(alloc, path)) modules::remove_if(alloc, serial);
+                        if (serial && !still_judged_file()) modules::remove_if(alloc, serial);
                     }
                 } else if (!periodic || refusal_stands(alloc, d)) {
                     gate::deny_module(d, d.verdict.reason, mode == SweepMode::startup ? "startup" : "sweep");
@@ -408,14 +418,20 @@ void sweep_memory(SweepMode mode) {
                 const HANDLE mapped = open_mapped_file(alloc);
                 bool gone = false;
                 const bool stays = still_there([&] {
-                    if (modules::find(alloc) || loader_knows(alloc)) return true;
+                    if (modules::find(alloc) || loader_knows(alloc) || modules::pending_within(alloc, pending_max_ms()))
+                        return true;
                     gone = image_gone(alloc);
                     return gone;
                 });
                 bool forgiven = !stays && !gone;
                 if (!stays && gone) {
-                    forgiven = modules::unloaded_recently(alloc, kUnloadedForgetMs) ||
-                               (mapped != INVALID_HANDLE_VALUE && trust::decide(mapped, found).verdict.allowed);
+                    // A file proven to be the mapped one and allowed. Or no file at all: the name was
+                    // already unreadable when the image was found, so it was being unmapped then —
+                    // that only for a base a trusted library was just unloaded from (an image that
+                    // can be read is never forgiven by its base alone: a cheat could unload a signed
+                    // library at that base on purpose).
+                    forgiven = (mapped != INVALID_HANDLE_VALUE && trust::decide(mapped, found).verdict.allowed) ||
+                               (found.empty() && modules::unloaded_recently(alloc, kUnloadedForgetMs));
                 }
                 if (mapped != INVALID_HANDLE_VALUE) CloseHandle(mapped);
                 if (forgiven) continue;

@@ -266,6 +266,9 @@ struct VolumeRoots {
 // moment without resources). Remembered for the whole session, one such failure turned every
 // later path on that volume into the GLOBALROOT form, which compares unequal to every DOS folder.
 constexpr std::uint64_t kNoRootRetryMs = 5000;
+// And a letter can be changed while the volume stays mounted (Disk Management, mountvol): a known
+// answer is asked again after this long.
+constexpr std::uint64_t kRootRetryMs = 30000;
 
 std::wstring dos_root_of_volume(const std::wstring& device) {
     static VolumeRoots* const roots = new VolumeRoots();  // leaked: hooks use it while the process exits
@@ -273,7 +276,7 @@ std::wstring dos_root_of_volume(const std::wstring& device) {
     const std::uint64_t now = GetTickCount64();
     AcquireSRWLockShared(&v.lock);
     for (const VolumeRoot& k : v.known) {
-        if (iequals_ascii(k.device, device) && (!k.root.empty() || now - k.asked_ms < kNoRootRetryMs)) {
+        if (iequals_ascii(k.device, device) && now - k.asked_ms < (k.root.empty() ? kNoRootRetryMs : kRootRetryMs)) {
             const std::wstring root = k.root;
             ReleaseSRWLockShared(&v.lock);
             return root;

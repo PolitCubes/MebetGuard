@@ -53,7 +53,10 @@ def classpath(client, copy):
         if m:
             out = []
             for p in m.group(1).strip().split(os.pathsep):
-                rel = os.path.relpath(p, client)
+                try:
+                    rel = os.path.relpath(p, client)
+                except ValueError:  # on another drive than the client: not one of its files
+                    continue
                 if not rel.startswith(".."):
                     out.append(str(copy / rel))
             if out:

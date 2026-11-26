@@ -445,6 +445,7 @@ SCENARIOS = [
     # itself (close_window_max_ms) instead of waiting for ever.
     _sc(id="dev_mode", kind="attack", module="dev_mode", os=WIN, guard="close:dev_mode", needs_dev_mode=True,
         timeout=100, title="Запуск prod-сборки в dev-режиме → закрытие", marker="TARGET up pid=",
+        proof=[r"\[Mebet\] the reason window was not closed in \d+ s"],
         build=lambda ctx, native, jar: dict()),
 
     # ---- attacks: inside the running game --------------------------------------------------------

@@ -133,6 +133,14 @@ public class MebetBenchMod {
     }
 
     private void finish() throws Exception {
+        if (n == 0) {
+            // No frame in the measure window (a zero-second smoke run): an error result, and the client
+            // still shuts down — it used to stay in the world until run.py's timeout.
+            write("{\"error\":\"no frames were measured\"}");
+            log("no frames were measured");
+            shutdown.invoke(mc);
+            return;
+        }
         long[] s = Arrays.copyOf(frames, n);
         Arrays.sort(s);
         double sum = 0;

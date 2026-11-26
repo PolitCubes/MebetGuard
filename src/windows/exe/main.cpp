@@ -71,11 +71,10 @@ DWORD WINAPI fail_box_main(void* p) {
         box.text += std::to_wstring(d.exit_code);
         box.title = L"Mebet Anticheat — ";
         box.title += ru ? d.title_ru : d.title_en;
+        // No thread for it (out of resources): no box — shown here it would wait with no time limit.
         if (HANDLE t = CreateThread(nullptr, 0, &fail_box_main, &box, 0, nullptr)) {
             WaitForSingleObject(t, mebet::config::opt::close_window_max_ms);
             CloseHandle(t);
-        } else {
-            fail_box_main(&box);
         }
     }
     ExitProcess(static_cast<UINT>(d.exit_code));

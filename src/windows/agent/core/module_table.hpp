@@ -30,6 +30,11 @@ void remove(std::uintptr_t base);
 // serial of the new record, 0 when nothing was added; remove_if removes only that very record.
 std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path);
 void remove_if(std::uintptr_t base, std::uint64_t serial);
+// A view whose file is being judged right now (the load gate's slow path): the sweep leaves it alone
+// for a while — not for good: a judging thread that never finishes (suspended, killed, a file that
+// never opens) must not leave an image unjudged. Cleared by add() and remove().
+void add_pending(std::uintptr_t base);
+bool pending_within(std::uintptr_t base, std::uint64_t max_ms);
 // The loader's unload notification: removes the module and remembers that it went, and whether it
 // was trusted — its image stays mapped for a moment after the notification.
 void remove_unloading(std::uintptr_t base);

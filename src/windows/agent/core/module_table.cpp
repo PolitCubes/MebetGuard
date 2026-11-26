@@ -44,6 +44,7 @@ constexpr std::size_t kUnloadedKept = 32;
 struct Names {
     SRWLOCK lock = SRWLOCK_INIT;
     std::map<std::uintptr_t, Record> records;
+    std::map<std::uintptr_t, std::uint64_t> pending;  // base → when its judging started (ms)
     Unloaded unloaded[kUnloadedKept] = {};
     std::size_t unloaded_next = 0;
 };
@@ -99,7 +100,26 @@ void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstri
         ranges().remove_where(base, base + it->second.size, [base](const Payload& p) { return p.base == base; });
     ranges().add(base, base + size, Payload{t, base}, false);
     n.records[base] = Record{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1};
+    n.pending.erase(base);
     ReleaseSRWLockExclusive(&n.lock);
+}
+
+void add_pending(std::uintptr_t base) {
+    if (!base) return;
+    Names& n = names();
+    AcquireSRWLockExclusive(&n.lock);
+    n.pending[base] = GetTickCount64();
+    ReleaseSRWLockExclusive(&n.lock);
+}
+
+bool pending_within(std::uintptr_t base, std::uint64_t max_ms) {
+    Names& n = names();
+    const std::uint64_t now = GetTickCount64();
+    AcquireSRWLockShared(&n.lock);
+    auto it = n.pending.find(base);
+    const bool fresh = it != n.pending.end() && now - it->second < max_ms;
+    ReleaseSRWLockShared(&n.lock);
+    return fresh;
 }
 
 std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path) {
@@ -107,7 +127,16 @@ std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust 
     Names& n = names();
     std::uint64_t serial = 0;
     AcquireSRWLockExclusive(&n.lock);
-    if (n.records.find(base) == n.records.end()) {
+    // Never over another module: a range of its own inside [base, base + size) means the image the
+    // sweep judged is gone and another one sits there now — recorded by its own hook.
+    bool others = false;
+    for (const auto& e : ranges().entries()) {
+        if (e.begin < base + size && e.end > base && e.payload.base != base) {
+            others = true;
+            break;
+        }
+    }
+    if (!others && n.records.find(base) == n.records.end()) {
         serial = g_serial.fetch_add(1, std::memory_order_relaxed) + 1;
         ranges().add(base, base + size, Payload{t, base}, false);
         n.records[base] = Record{base, size, t, path, serial};
@@ -157,6 +186,7 @@ void remove(std::uintptr_t base) {
     AcquireSRWLockExclusive(&n.lock);
     auto it = n.records.find(base);
     if (it != n.records.end()) remove_locked(n, it);
+    n.pending.erase(base);
     ReleaseSRWLockExclusive(&n.lock);
 }
 

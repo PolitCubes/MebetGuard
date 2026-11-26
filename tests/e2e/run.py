@@ -23,6 +23,11 @@ import paths
 
 
 def main():
+    # The verdicts are Russian: printed into a pipe or a file with a legacy code page they ended the
+    # run with UnicodeEncodeError after every scenario had run, and the --json file was lost.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--guard", required=True)
     ap.add_argument("--java", required=True)
@@ -73,6 +78,9 @@ def main():
             rows.append(dict(id=rid, state=state, baseline=bv, guard=gv,
                              base_exit=base["exit"], guard_exit=guarded["exit"]))
 
+    if a.json:  # first: the table below must not be able to cost it
+        Path(a.json).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
     w = max((len(r["id"]) for r in rows), default=4)
     print("\n%-5s %-*s  %-30s  %s" % ("", w, "scenario", "без гварда", "через гвард"))
     for r in rows:
@@ -81,8 +89,6 @@ def main():
     print("\n%d/%d scenarios passed (%d skipped)" %
           (len(ran) - failed, len(ran), len(rows) - len(ran)))
 
-    if a.json:
-        Path(a.json).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     sys.exit(1 if failed else 0)
 
 

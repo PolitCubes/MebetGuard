@@ -116,7 +116,11 @@ report::Event close_event(const CloseRequest& r, report::Event ev) {
         report::Event ev = close_event(r, std::move(r.event));
         try {
             sender = std::thread([&sent, ev]() mutable {
-                report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+                try {
+                    report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+                } catch (...) {
+                    // out of memory or threads: no report, but never an abort instead of the close
+                }
                 sent.store(true);
             });
         } catch (...) {
@@ -155,14 +159,12 @@ report::Event close_event(const CloseRequest& r, report::Event ev) {
                 // process instead of closing it with the reason's code.
             }
         }
-        if (own_thread) {
-            if (WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
-                std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
-                             config::opt::close_window_max_ms / 1000);
-                std::fflush(stderr);
-            }
-        } else {
-            reason_window::show(title, text);
+        // No thread for the window (out of resources): no window — shown here instead it would wait
+        // for the player with no time limit. The line in the launcher log says why.
+        if (own_thread && WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
+            std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
+                         config::opt::close_window_max_ms / 1000);
+            std::fflush(stderr);
         }
     }
 
@@ -239,13 +241,20 @@ void arm() { core().armed.store(true, std::memory_order_release); }
 
 void request_close(config::Reason reason, const std::wstring& detail, report::Event ev) {
     Core& c = core();
-    // The first reason wins, and its exit code and request are in place before anyone can see
-    // the close as pending: whoever ends a pending close (the watchdog, a hook) must not find
-    // code 0 — a launcher reads that as a normal exit.
-    int none = 0;
-    if (!c.exit_code.compare_exchange_strong(none, config::reason(reason).exit_code)) return;
+    // The first reason wins, by publishing its request: the worker acts on the request itself, so a
+    // requester stopped right after winning (a thread parked there on purpose) still gets its
+    // close carried out. Winning by the exit code first, as before, left a window in which every
+    // later close was refused and none was ever published. The code and the reason follow before
+    // the close is visible as pending: whoever ends a pending close must not find code 0.
+    if (c.close.load(std::memory_order_acquire)) return;
+    auto* request = new CloseRequest{reason, detail, std::move(ev)};
+    CloseRequest* none = nullptr;
+    if (!c.close.compare_exchange_strong(none, request, std::memory_order_acq_rel)) {
+        delete request;
+        return;
+    }
     c.reason.store(static_cast<int>(reason));
-    c.close.store(new CloseRequest{reason, detail, std::move(ev)});
+    c.exit_code.store(config::reason(reason).exit_code);
     c.closing.store(true, std::memory_order_release);
     if (c.wake) SetEvent(c.wake);
 }
@@ -253,24 +262,10 @@ void request_close(config::Reason reason, const std::wstring& detail, report::Ev
 void close_now(config::Reason reason, const std::wstring& detail, report::Event ev) {
     request_close(reason, detail, std::move(ev));
     Core& c = core();
-    // The close may be another thread's, requested a moment ago: its request appears right after
-    // its exit code. It is carried out here either way (run_close lets only one thread through).
-    // Waiting for good on someone else's close hung the start before the worker existed, with
-    // nobody left to carry it out; a request that never appears — its thread stopped in between —
-    // still ends the process, with its code.
-    CloseRequest* r = c.close.load();
-    for (int i = 0; !r && i < 5000; ++i) {
-        Sleep(1);
-        r = c.close.load();
-    }
-    if (!r) {
-        const int code = c.exit_code.load();
-        const auto& a = nt::api();
-        if (a.NtTerminateProcess) a.NtTerminateProcess(nt::current_process(), static_cast<NTSTATUS>(code));
-        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
-        for (;;) Sleep(INFINITE);
-    }
-    run_close(*r);
+    // A request is published now — this one or another thread's, which won the race. It is carried
+    // out here either way (run_close lets only one thread through): waiting for good on someone
+    // else's close hung the start before the worker existed, with nobody left to carry it out.
+    run_close(*c.close.load(std::memory_order_acquire));
 }
 
 void defer(std::function<void()> fn) {

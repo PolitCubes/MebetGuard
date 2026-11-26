@@ -23,7 +23,12 @@ RangeSet<Owner>& table() {
     return *t;
 }
 
-std::atomic<long> g_in_flight{0};
+struct OpSlot {
+    std::atomic<DWORD> tid{0};
+    std::atomic<std::uint64_t> since_ms{0};
+};
+constexpr int kOpSlots = 64;
+OpSlot g_ops[kOpSlots];
 
 }  // namespace
 
@@ -44,8 +49,40 @@ bool find(std::uintptr_t addr, Owner* out) {
 bool covers(std::uintptr_t begin, std::uintptr_t end) { return table().covers(begin, end); }
 bool overlaps(std::uintptr_t begin, std::uintptr_t end) { return table().overlaps(begin, end); }
 
-void op_begin() { g_in_flight.fetch_add(1, std::memory_order_acq_rel); }
-void op_end() { g_in_flight.fetch_sub(1, std::memory_order_acq_rel); }
-bool ops_in_flight() { return g_in_flight.load(std::memory_order_acquire) > 0; }
+int op_begin() {
+    const DWORD me = GetCurrentThreadId();
+    const std::uint64_t now = GetTickCount64();
+    for (int i = 0; i < kOpSlots; ++i) {
+        DWORD free_slot = 0;
+        if (g_ops[i].tid.load(std::memory_order_relaxed) == 0 &&
+            g_ops[i].tid.compare_exchange_strong(free_slot, me, std::memory_order_acq_rel)) {
+            g_ops[i].since_ms.store(now, std::memory_order_release);
+            return i;
+        }
+    }
+    return -1;  // 64 calls at once: this one is not waited for — the sweep looks again anyway
+}
+
+void op_end(int slot) {
+    if (slot < 0 || slot >= kOpSlots) return;
+    g_ops[slot].since_ms.store(0, std::memory_order_release);
+    g_ops[slot].tid.store(0, std::memory_order_release);
+}
+
+bool live_op_within(std::uint64_t max_ms) {
+    const std::uint64_t now = GetTickCount64();
+    for (OpSlot& s : g_ops) {
+        const DWORD tid = s.tid.load(std::memory_order_acquire);
+        const std::uint64_t since = s.since_ms.load(std::memory_order_acquire);
+        if (!tid || !since || now - since >= max_ms) continue;
+        // A thread killed inside a hook leaves its slot taken for good: not a call in flight.
+        const HANDLE h = OpenThread(SYNCHRONIZE, FALSE, tid);
+        if (!h) continue;
+        const bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        CloseHandle(h);
+        if (alive) return true;
+    }
+    return false;
+}
 
 }  // namespace mebet::exec

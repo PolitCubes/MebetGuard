@@ -232,17 +232,26 @@ DWORD WINAPI last_words_main(void*) {
         if (r == WAIT_OBJECT_0) {
             const LastWords words = g_words;
             write_close_line(words.id, words.code, words.what);
-            if (words.report == Report::stalled) {
-                report::Reporter::instance().send_now(stalled_event(words.what, true), 1500);
-            } else if (words.report == Report::pending) {
-                guard::send_pending_close_report(1500);
+            // Nothing may escape this thread: an exception would end the process with a crash code
+            // instead of the close's own, before the caller kills it.
+            try {
+                if (words.report == Report::stalled) {
+                    report::Reporter::instance().send_now(stalled_event(words.what, true), 1500);
+                } else if (words.report == Report::pending) {
+                    guard::send_pending_close_report(1500);
+                }
+            } catch (...) {
             }
             SetEvent(g_said);
             for (;;) Sleep(INFINITE);  // the caller ends the process
         }
         if (r == WAIT_OBJECT_0 + 1) {
-            if (const char* what = g_tell_what.exchange(nullptr))
-                report::Reporter::instance().send_now(stalled_event(what, false), 1500);
+            if (const char* what = g_tell_what.exchange(nullptr)) {
+                try {
+                    report::Reporter::instance().send_now(stalled_event(what, false), 1500);
+                } catch (...) {
+                }
+            }
             continue;
         }
         Sleep(1000);  // the wait failed: do not spin
@@ -253,9 +262,9 @@ DWORD WINAPI last_words_main(void*) {
     bool expected = false;
     if (!g_ending.compare_exchange_strong(expected, true)) {
         // Another thread is ending the process — unless it was stopped half-way: give it the
-        // time it may take, then finish the job.
+        // time it may take, then finish the job, with its code.
         Sleep(kLastWordsReportMs + 1000);
-        kill_process(code);
+        kill_process(g_words.code ? g_words.code : code);
     }
     g_words.id = id;
     g_words.what = what;
@@ -374,12 +383,21 @@ std::uint64_t hook_witnessed(std::uint64_t key, std::uint64_t now) {
 // second — a failed e2e run then says what the hooks took the guard threads for. No CRT, no
 // allocation.
 std::atomic<std::uint64_t> g_trace_last{0};
+std::atomic<int> g_trace_console{-1};  // stderr is a console: asked once
 void trace_hook(std::uint64_t now, HANDLE worker, HANDLE watchdog, bool closing) {
-    if (!config::kTestBuild || win::stderr_is_console()) return;  // a held console would hold the hook
+    if (!config::kTestBuild) return;
+    // The cheap tests first: this runs on every hooked call of a test build, and the benchmarks
+    // measure the test build.
     if (!closing && !silent(g_beat_worker, now, kWatchdogSilentMax) && !silent(g_beat_watchdog, now, kWatchdogSilentMax))
         return;
     const std::uint64_t last = g_trace_last.load(std::memory_order_relaxed);
     if (last && now - last < 1000 * kMs) return;
+    int console = g_trace_console.load(std::memory_order_relaxed);
+    if (console < 0) {
+        console = win::stderr_is_console() ? 1 : 0;
+        g_trace_console.store(console, std::memory_order_relaxed);
+    }
+    if (console) return;  // a held console would hold the hook
     g_trace_last.store(now, std::memory_order_relaxed);
     char line[160];
     std::size_t n = 0;
