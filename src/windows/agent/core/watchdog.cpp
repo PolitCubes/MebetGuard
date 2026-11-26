@@ -262,10 +262,19 @@ DWORD WINAPI last_words_main(void*) {
 // A thread that did not win the end finishes it: with the winner's code, and the line in the launcher
 // log the winner (or its last-words thread) may never have written.
 [[noreturn]] void finish_end(int fallback_code) {
-    const int code = g_words.code ? g_words.code : fallback_code;
     const auto& stalled = config::reason(config::Reason::guard_stalled);
-    if (!win::stderr_is_console())
-        write_close_line(g_words.code ? g_words.id : stalled.id, code, g_words.code ? g_words.what : "the guard ended the process");
+    int code = g_words.code;
+    const char* id = g_words.id;
+    const char* what = g_words.what;
+    if (!code) {
+        // Claimed and stopped before its words were written: a close that was pending keeps its own
+        // reason (the launcher shows that one), else the guard was stalled.
+        const char* pending = guard::closing() ? guard::pending_reason_id() : nullptr;
+        code = pending ? guard::pending_exit_code() : fallback_code;
+        id = pending ? pending : stalled.id;
+        what = "the guard ended the process";
+    }
+    if (!win::stderr_is_console()) write_close_line(id, code, what);
     kill_process(code);
 }
 

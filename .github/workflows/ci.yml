@@ -157,6 +157,7 @@ jobs:
           - ffm_benign
           - process_hold
           - native_load_churn
+          - resource_read_unsigned
           # attacks on the JVM start
           - env_hardening_jto
           - env_hardening_jdk
@@ -168,6 +169,10 @@ jobs:
           - jvm_agent_module
           - foreign_exec_alloc
           - foreign_exec_protect
+          - ex_exec_alloc
+          - ex_image_map
+          - stale_unmap_exec
+          - limited_handle_exec
           - process_dacl_open
           - close_window_timeout
           # attacks on the guard itself
@@ -213,6 +218,11 @@ jobs:
           - { arch: x86, feature: native_load_churn }
           - { arch: x86, feature: foreign_exec_alloc }
           - { arch: x86, feature: foreign_exec_protect }
+          - { arch: x86, feature: resource_read_unsigned }
+          - { arch: x86, feature: ex_exec_alloc }
+          - { arch: x86, feature: ex_image_map }
+          - { arch: x86, feature: stale_unmap_exec }
+          - { arch: x86, feature: limited_handle_exec }
           - { arch: x86, feature: tamper_freeze_guard }
           - { arch: x86, feature: tamper_kill_guard }
           - { arch: x86, feature: tamper_unload_guard }

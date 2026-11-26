@@ -129,7 +129,9 @@ struct LdrDllNotificationData {
 };
 using LdrDllNotificationFn = VOID(NTAPI*)(ULONG reason, const LdrDllNotificationData* data, PVOID context);
 
-// Hooked functions (ТЗ §5: only these six ntdll functions are patched).
+// Hooked functions. ТЗ §5 named six; their Ex variants (below) are hooked too where ntdll has them:
+// without them an image could be mapped, a view unmapped and executable memory allocated past
+// the hooks, and only the periodic sweep (every 5 s) saw it.
 using NtCreateSectionFn = NTSTATUS(NTAPI*)(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
                                            POBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize,
                                            ULONG SectionPageProtection, ULONG AllocationAttributes,
@@ -145,6 +147,20 @@ using NtProtectVirtualMemoryFn = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* B
                                                   ULONG NewProtect, PULONG OldProtect);
 using NtFreeVirtualMemoryFn = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize,
                                                ULONG FreeType);
+// The Ex variants (Windows 8 for the unmap, Windows 10 1803/1809 for the others; nullptr where absent).
+// MEM_EXTENDED_PARAMETER is passed through untouched, so it is a plain pointer here.
+using NtCreateSectionExFn = NTSTATUS(NTAPI*)(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
+                                             POBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize,
+                                             ULONG SectionPageProtection, ULONG AllocationAttributes,
+                                             HANDLE FileHandle, PVOID ExtendedParameters, ULONG ExtendedParameterCount);
+using NtMapViewOfSectionExFn = NTSTATUS(NTAPI*)(HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* BaseAddress,
+                                                PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, ULONG AllocationType,
+                                                ULONG PageProtection, PVOID ExtendedParameters,
+                                                ULONG ExtendedParameterCount);
+using NtUnmapViewOfSectionExFn = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, ULONG Flags);
+using NtAllocateVirtualMemoryExFn = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize,
+                                                     ULONG AllocationType, ULONG PageProtection,
+                                                     PVOID ExtendedParameters, ULONG ExtendedParameterCount);
 
 // Queries.
 using NtQueryVirtualMemoryFn = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, int InformationClass,
@@ -179,6 +195,10 @@ struct Api {
     NtAllocateVirtualMemoryFn NtAllocateVirtualMemory = nullptr;
     NtProtectVirtualMemoryFn NtProtectVirtualMemory = nullptr;
     NtFreeVirtualMemoryFn NtFreeVirtualMemory = nullptr;
+    NtCreateSectionExFn NtCreateSectionEx = nullptr;
+    NtMapViewOfSectionExFn NtMapViewOfSectionEx = nullptr;
+    NtUnmapViewOfSectionExFn NtUnmapViewOfSectionEx = nullptr;
+    NtAllocateVirtualMemoryExFn NtAllocateVirtualMemoryEx = nullptr;
     NtQueryVirtualMemoryFn NtQueryVirtualMemory = nullptr;
     NtQuerySectionFn NtQuerySection = nullptr;
     NtQuerySystemInformationFn NtQuerySystemInformation = nullptr;

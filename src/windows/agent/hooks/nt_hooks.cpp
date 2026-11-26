@@ -31,11 +31,16 @@ nt::NtUnmapViewOfSectionFn real_NtUnmapViewOfSection = nullptr;
 nt::NtAllocateVirtualMemoryFn real_NtAllocateVirtualMemory = nullptr;
 nt::NtProtectVirtualMemoryFn real_NtProtectVirtualMemory = nullptr;
 nt::NtFreeVirtualMemoryFn real_NtFreeVirtualMemory = nullptr;
+nt::NtCreateSectionExFn real_NtCreateSectionEx = nullptr;
+nt::NtMapViewOfSectionExFn real_NtMapViewOfSectionEx = nullptr;
+nt::NtUnmapViewOfSectionExFn real_NtUnmapViewOfSectionEx = nullptr;
+nt::NtAllocateVirtualMemoryExFn real_NtAllocateVirtualMemoryEx = nullptr;
 
 // Canary tokens: an argument pointer only the self-check passes (ТЗ §7 «канарейка»).
 // With our hook in place the call never reaches the kernel; without it the kernel sees
 // arguments that fail validation and does nothing.
-volatile PVOID g_tokens[6];
+volatile PVOID g_tokens[kHookCount];
+unsigned g_installed = 0;  // installed_mask()
 volatile LONG g_canary_hits = 0;
 inline bool is_token(const volatile void* p, int i) { return p == &g_tokens[i]; }
 inline NTSTATUS canary(int i) {
@@ -58,19 +63,17 @@ constexpr NTSTATUS kAccessDenied = nt::kStatusAccessDenied;
 // freed by a thread on its way out stayed in the tables as allowed, and whatever was allocated
 // at that address later was taken for it. Everything they touch works without TLS (the tables
 // and the shutdown flag are plain globals).
-// NtQuerySection, kept where a thread without TLS can reach it (nt::api() is a function-local
-// static: its guard reads TLS).
-nt::NtQuerySectionFn g_query_section = nullptr;
 
-// The section maps an executable image — or cannot be asked (a handle without SECTION_QUERY): on a
-// thread that cannot judge, unknown counts as an image. TLS-free.
-bool image_section_or_unknown(HANDLE section) {
-    nt::SectionBasicInformation info{};
-    SIZE_T ret = 0;
-    if (!g_query_section || !nt::ok(g_query_section(section, nt::kSectionBasicInformation, &info, sizeof(info), &ret)))
-        return true;
-    return (info.AllocationAttributes & nt::kSecImage) != 0 &&
-           (info.AllocationAttributes & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
+// What a view just mapped at `base` is, as the view itself tells: an image that can run code (SEC_IMAGE:
+// its allocation protection is PAGE_EXECUTE_WRITECOPY), or something else — data, or an image mapped
+// with SEC_IMAGE_NO_EXECUTE (LoadLibraryEx AS_IMAGE_RESOURCE: icons, version info), PAGE_READONLY.
+// NtQuerySection cannot tell the last: such a section reads back as a plain image, and every icon
+// read from an unsigned file was judged as code and closed the game. TLS-free.
+enum class View { unknown, code_image, other };
+View view_kind(void* base) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(base, &mbi, sizeof(mbi)) || mbi.AllocationBase != base) return View::unknown;
+    return mbi.Type == MEM_IMAGE && execguard::executable(mbi.AllocationProtect) ? View::code_image : View::other;
 }
 
 inline bool tls_ready() {
@@ -81,70 +84,99 @@ inline bool tls_ready() {
     return slots && slots[_tls_index];
 }
 
+// The logic of each hook lives in a template that takes the real call as a lambda: the hook of
+// the ТЗ and its Ex variant run the very same judge, only the call behind it differs.
+
 // ---------------------------------------------------------------------------------------
-// 1. NtCreateSection — the load gate.
-NTSTATUS NTAPI hook_NtCreateSection(PHANDLE section, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-                                    PLARGE_INTEGER max_size, ULONG page_protection, ULONG allocation, HANDLE file) {
-    if (is_token(section, 0)) return canary(0);
+// 1. NtCreateSection / 7. NtCreateSectionEx — the load gate.
+bool image_attributes(ULONG allocation) {
+    return (allocation & nt::kSecImage) != 0 && (allocation & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
+}
+
+template <typename Real>
+NTSTATUS create_section(PHANDLE section, ULONG allocation, HANDLE file, Real real) {
     if (!tls_ready()) {
-        const bool image = (allocation & nt::kSecImage) != 0 && (allocation & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
-        if (image && file) return kAccessDenied;  // cannot be judged here (see tls_ready)
-        return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
+        if (image_attributes(allocation) && file) return kAccessDenied;  // cannot be judged here (see tls_ready)
+        return real();
     }
     watchdog::check_from_hook();
-    const bool image = (allocation & nt::kSecImage) != 0 && (allocation & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
-    if (!image || !file || guard::shutting_down() || gate::own_read_on_this_thread()) {  // fast path
-        return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
+    if (!image_attributes(allocation) || !file || guard::shutting_down() || gate::own_read_on_this_thread()) {
+        return real();  // fast path
     }
     if (!gate::on_image_section(file)) return kAccessDenied;
-    const NTSTATUS s = real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
+    const NTSTATUS s = real();
     if (nt::ok(s) && section) gate::on_section_created(*section);
     return s;
 }
 
+NTSTATUS NTAPI hook_NtCreateSection(PHANDLE section, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
+                                    PLARGE_INTEGER max_size, ULONG page_protection, ULONG allocation, HANDLE file) {
+    if (is_token(section, 0)) return canary(0);
+    return create_section(section, allocation, file, [&] {
+        return real_NtCreateSection(section, access, attributes, max_size, page_protection, allocation, file);
+    });
+}
+
+NTSTATUS NTAPI hook_NtCreateSectionEx(PHANDLE section, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
+                                      PLARGE_INTEGER max_size, ULONG page_protection, ULONG allocation, HANDLE file,
+                                      PVOID extended, ULONG extended_count) {
+    if (is_token(section, 6)) return canary(6);
+    return create_section(section, allocation, file, [&] {
+        return real_NtCreateSectionEx(section, access, attributes, max_size, page_protection, allocation, file,
+                                      extended, extended_count);
+    });
+}
+
 // ---------------------------------------------------------------------------------------
-// 2. NtMapViewOfSection — safety net for images, accounting for executable data views.
+// 2. NtMapViewOfSection / 8. NtMapViewOfSectionEx — safety net for images, accounting for
+//    executable data views.
 bool section_is_image(HANDLE section) {
     nt::SectionBasicInformation info{};
     SIZE_T ret = 0;
     const auto& a = nt::api();
     if (!a.NtQuerySection || !nt::ok(a.NtQuerySection(section, nt::kSectionBasicInformation, &info, sizeof(info), &ret)))
         return false;
-    return (info.AllocationAttributes & nt::kSecImage) != 0 &&
-           (info.AllocationAttributes & nt::kSecImageNoExecute) != nt::kSecImageNoExecute;
+    return image_attributes(info.AllocationAttributes);
 }
 
-NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* base, ULONG_PTR zero_bits,
-                                       SIZE_T commit, PLARGE_INTEGER offset, PSIZE_T view_size, ULONG inherit,
-                                       ULONG allocation, ULONG protect) {
-    if (is_token(base, 1)) return canary(1);
+template <typename Real>
+NTSTATUS map_view(const char* operation, HANDLE section, HANDLE process, PVOID* base, PSIZE_T view_size, ULONG protect,
+                  Real real) {
     if (!tls_ready()) {
-        if (execguard::is_current_process(process) && (execguard::executable(protect) || image_section_or_unknown(section)))
-            return kAccessDenied;  // cannot be judged here (see tls_ready)
-        return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
-                                       allocation, protect);
+        if (!execguard::is_current_process(process)) return real();
+        if (execguard::executable(protect)) return kAccessDenied;  // cannot be judged here (see tls_ready)
+        // Whether it is an image that can run code, only the view tells (view_kind): such a view is
+        // taken back, as it cannot be judged here either.
+        const NTSTATUS s = real();
+        if (nt::ok(s) && base && *base && view_kind(*base) != View::other) {
+            real_NtUnmapViewOfSection(process, *base);
+            *base = nullptr;
+            return kAccessDenied;
+        }
+        return s;
     }
     watchdog::check_from_hook();
-    if (guard::shutting_down() || !execguard::is_current_process(process)) {
-        return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
-                                       allocation, protect);
-    }
+    if (guard::shutting_down() || !execguard::is_current_process(process)) return real();
     bool image = section_is_image(section);
     execguard::Requester req;
     if (!image && execguard::executable(protect)) {
         req = execguard::find_requester();
-        if (!execguard::may_create_exec(req, "NtMapViewOfSection", 0, view_size ? *view_size : 0)) return kAccessDenied;
+        if (!execguard::may_create_exec(req, operation, 0, view_size ? *view_size : 0)) return kAccessDenied;
     }
     const int op = exec::op_begin();
-    const NTSTATUS s =
-        real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit, allocation, protect);
-    if (nt::ok(s) && base && *base && view_size && !image) {
-        // A section that could not be asked (no SECTION_QUERY on the handle) was taken for data, and
-        // its image mapped with nobody judging it. The view itself tells, whatever the handle allows.
-        MEMORY_BASIC_INFORMATION mbi{};
-        image = VirtualQuery(*base, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE && mbi.AllocationBase == *base;
-    }
+    const NTSTATUS s = real();
+    bool no_code_image = false;
     if (nt::ok(s) && base && *base && view_size) {
+        // The view itself tells what was mapped, whatever the handle allows: a section that could not
+        // be asked (no SECTION_QUERY) was taken for data and its image mapped unjudged; and an image
+        // mapped for its resources only can run no code, and is no module to judge (view_kind).
+        const View k = view_kind(*base);
+        if (k != View::unknown) {
+            no_code_image = image && k == View::other;
+            image = k == View::code_image;
+        }
+    }
+    if (nt::ok(s) && base && *base && view_size && !no_code_image) {
         if (image) {
             if (!gate::on_image_view(section, *base, *view_size)) {
                 real_NtUnmapViewOfSection(process, *base);
@@ -160,23 +192,42 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
     return s;
 }
 
+NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* base, ULONG_PTR zero_bits,
+                                       SIZE_T commit, PLARGE_INTEGER offset, PSIZE_T view_size, ULONG inherit,
+                                       ULONG allocation, ULONG protect) {
+    if (is_token(base, 1)) return canary(1);
+    return map_view("NtMapViewOfSection", section, process, base, view_size, protect, [&] {
+        return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
+                                       allocation, protect);
+    });
+}
+
+NTSTATUS NTAPI hook_NtMapViewOfSectionEx(HANDLE section, HANDLE process, PVOID* base, PLARGE_INTEGER offset,
+                                         PSIZE_T view_size, ULONG allocation, ULONG protect, PVOID extended,
+                                         ULONG extended_count) {
+    if (is_token(base, 7)) return canary(7);
+    return map_view("NtMapViewOfSectionEx", section, process, base, view_size, protect, [&] {
+        return real_NtMapViewOfSectionEx(section, process, base, offset, view_size, allocation, protect, extended,
+                                         extended_count);
+    });
+}
+
 // ---------------------------------------------------------------------------------------
-// 3. NtUnmapViewOfSection — forget what is gone.
-NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
-    if (is_token(base, 2)) return canary(2);
+// 3. NtUnmapViewOfSection / 9. NtUnmapViewOfSectionEx — forget what is gone.
+template <typename Real>
+NTSTATUS unmap_view(HANDLE process, PVOID base, Real real) {
     if (tls_ready()) watchdog::check_from_hook();
-    if (guard::shutting_down() || !base) return real_NtUnmapViewOfSection(process, base);
+    if (guard::shutting_down() || !base) return real();
     const auto addr = reinterpret_cast<std::uintptr_t>(base);
     // The kernel takes any address inside the view, so the module is found by range and
     // forgotten by its own base: forgotten by the address the caller passed, a view unmapped
     // through an address in its middle stayed in the table with its trust.
     std::uintptr_t module_base = 0;
     const bool is_module = modules::find(addr, nullptr, &module_base);
-    if ((!is_module && !exec::find(addr)) || !execguard::is_current_process(process))
-        return real_NtUnmapViewOfSection(process, base);
+    if ((!is_module && !exec::find(addr)) || !execguard::is_current_process(process)) return real();
     std::uintptr_t begin = 0, end = 0;
     const bool range = execguard::allocation_range(addr, &begin, &end);
-    const NTSTATUS s = real_NtUnmapViewOfSection(process, base);
+    const NTSTATUS s = real();
     if (nt::ok(s)) {
         if (range) exec::forget(begin, end);
         if (is_module) gate::on_view_unmapped(reinterpret_cast<void*>(module_base));
@@ -184,30 +235,56 @@ NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
     return s;
 }
 
+NTSTATUS NTAPI hook_NtUnmapViewOfSection(HANDLE process, PVOID base) {
+    if (is_token(base, 2)) return canary(2);
+    return unmap_view(process, base, [&] { return real_NtUnmapViewOfSection(process, base); });
+}
+
+NTSTATUS NTAPI hook_NtUnmapViewOfSectionEx(HANDLE process, PVOID base, ULONG flags) {
+    if (is_token(base, 8)) return canary(8);
+    return unmap_view(process, base, [&] { return real_NtUnmapViewOfSectionEx(process, base, flags); });
+}
+
 // ---------------------------------------------------------------------------------------
-// 4. NtAllocateVirtualMemory — fast path: executable protection not requested.
-NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_PTR zero_bits, PSIZE_T size,
-                                            ULONG type, ULONG protect) {
-    if (is_token(base, 3)) return canary(3);
+// 4. NtAllocateVirtualMemory / 10. NtAllocateVirtualMemoryEx — fast path: executable protection
+//    not requested.
+template <typename Real>
+NTSTATUS allocate(const char* operation, HANDLE process, PVOID* base, PSIZE_T size, ULONG protect, Real real) {
     if (!tls_ready()) {
         if (execguard::executable(protect) && execguard::is_current_process(process)) return kAccessDenied;
-        return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
+        return real();
     }
     watchdog::check_from_hook();
     if (!execguard::executable(protect) || guard::shutting_down() || !execguard::is_current_process(process)) {
-        return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
+        return real();
     }
     const execguard::Requester req = execguard::find_requester();
-    if (!execguard::may_create_exec(req, "NtAllocateVirtualMemory", base && *base ? reinterpret_cast<std::uintptr_t>(*base) : 0,
+    if (!execguard::may_create_exec(req, operation, base && *base ? reinterpret_cast<std::uintptr_t>(*base) : 0,
                                     size ? *size : 0))
         return kAccessDenied;
     const int op = exec::op_begin();
-    const NTSTATUS s = real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
+    const NTSTATUS s = real();
     if (nt::ok(s) && base && *base && size) {
         execguard::record(reinterpret_cast<std::uintptr_t>(*base), *size, req, exec::Source::allocate);
     }
     exec::op_end(op);
     return s;
+}
+
+NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_PTR zero_bits, PSIZE_T size,
+                                            ULONG type, ULONG protect) {
+    if (is_token(base, 3)) return canary(3);
+    return allocate("NtAllocateVirtualMemory", process, base, size, protect, [&] {
+        return real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
+    });
+}
+
+NTSTATUS NTAPI hook_NtAllocateVirtualMemoryEx(HANDLE process, PVOID* base, PSIZE_T size, ULONG type, ULONG protect,
+                                              PVOID extended, ULONG extended_count) {
+    if (is_token(base, 9)) return canary(9);
+    return allocate("NtAllocateVirtualMemoryEx", process, base, size, protect, [&] {
+        return real_NtAllocateVirtualMemoryEx(process, base, size, type, protect, extended, extended_count);
+    });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -275,14 +352,20 @@ struct Target {
     unsigned char expected[16];
 };
 
-Target g_targets[6] = {
+Target g_targets[kHookCount] = {
     {"NtCreateSection", reinterpret_cast<void**>(&real_NtCreateSection), reinterpret_cast<void*>(&hook_NtCreateSection), nullptr, {}},
     {"NtMapViewOfSection", reinterpret_cast<void**>(&real_NtMapViewOfSection), reinterpret_cast<void*>(&hook_NtMapViewOfSection), nullptr, {}},
     {"NtUnmapViewOfSection", reinterpret_cast<void**>(&real_NtUnmapViewOfSection), reinterpret_cast<void*>(&hook_NtUnmapViewOfSection), nullptr, {}},
     {"NtAllocateVirtualMemory", reinterpret_cast<void**>(&real_NtAllocateVirtualMemory), reinterpret_cast<void*>(&hook_NtAllocateVirtualMemory), nullptr, {}},
     {"NtProtectVirtualMemory", reinterpret_cast<void**>(&real_NtProtectVirtualMemory), reinterpret_cast<void*>(&hook_NtProtectVirtualMemory), nullptr, {}},
     {"NtFreeVirtualMemory", reinterpret_cast<void**>(&real_NtFreeVirtualMemory), reinterpret_cast<void*>(&hook_NtFreeVirtualMemory), nullptr, {}},
+    // The Ex variants: hooked where ntdll has them.
+    {"NtCreateSectionEx", reinterpret_cast<void**>(&real_NtCreateSectionEx), reinterpret_cast<void*>(&hook_NtCreateSectionEx), nullptr, {}},
+    {"NtMapViewOfSectionEx", reinterpret_cast<void**>(&real_NtMapViewOfSectionEx), reinterpret_cast<void*>(&hook_NtMapViewOfSectionEx), nullptr, {}},
+    {"NtUnmapViewOfSectionEx", reinterpret_cast<void**>(&real_NtUnmapViewOfSectionEx), reinterpret_cast<void*>(&hook_NtUnmapViewOfSectionEx), nullptr, {}},
+    {"NtAllocateVirtualMemoryEx", reinterpret_cast<void**>(&real_NtAllocateVirtualMemoryEx), reinterpret_cast<void*>(&hook_NtAllocateVirtualMemoryEx), nullptr, {}},
 };
+constexpr int kRequiredHooks = 6;  // the six of the ТЗ; the Ex variants only where ntdll has them
 
 // Other threads must not run inside the bytes being patched: Detours suspends them.
 std::vector<HANDLE> other_threads() {
@@ -328,10 +411,14 @@ bool install(std::string* failed) {
     real_NtAllocateVirtualMemory = a.NtAllocateVirtualMemory;
     real_NtProtectVirtualMemory = a.NtProtectVirtualMemory;
     real_NtFreeVirtualMemory = a.NtFreeVirtualMemory;
-    g_query_section = a.NtQuerySection;
-    for (Target& tg : g_targets) {
+    real_NtCreateSectionEx = a.NtCreateSectionEx;
+    real_NtMapViewOfSectionEx = a.NtMapViewOfSectionEx;
+    real_NtUnmapViewOfSectionEx = a.NtUnmapViewOfSectionEx;
+    real_NtAllocateVirtualMemoryEx = a.NtAllocateVirtualMemoryEx;
+    for (int i = 0; i < kHookCount; ++i) {
+        Target& tg = g_targets[i];
         tg.entry = *tg.real;
-        if (!tg.entry) {
+        if (!tg.entry && i < kRequiredHooks) {
             if (failed) *failed = std::string(tg.name) + " missing";
             return false;
         }
@@ -342,7 +429,8 @@ bool install(std::string* failed) {
     if (err == NO_ERROR) err = DetourUpdateThread(GetCurrentThread());
     for (HANDLE t : threads) DetourUpdateThread(t);
     int failed_index = -1;
-    for (int i = 0; i < 6 && err == NO_ERROR; ++i) {
+    for (int i = 0; i < kHookCount && err == NO_ERROR; ++i) {
+        if (!g_targets[i].entry) continue;  // an Ex variant this Windows does not have
         err = DetourAttach(g_targets[i].real, g_targets[i].hook);
         if (err != NO_ERROR) failed_index = i;
     }
@@ -359,10 +447,17 @@ bool install(std::string* failed) {
         }
         return false;
     }
-    for (Target& tg : g_targets) std::memcpy(tg.expected, tg.entry, sizeof(tg.expected));
+    g_installed = 0;
+    for (int i = 0; i < kHookCount; ++i) {
+        if (!g_targets[i].entry) continue;
+        std::memcpy(g_targets[i].expected, g_targets[i].entry, sizeof(g_targets[i].expected));
+        g_installed |= 1u << i;
+    }
     allow_trampoline_regions();
     return true;
 }
+
+unsigned installed_mask() { return g_installed; }
 
 unsigned canary_round() {
     InterlockedExchange(&g_canary_hits, 0);
@@ -375,7 +470,16 @@ unsigned canary_round() {
     a.NtAllocateVirtualMemory(nullptr, const_cast<PVOID*>(&g_tokens[3]), 0, &zero, 0, 0);
     a.NtProtectVirtualMemory(nullptr, const_cast<PVOID*>(&g_tokens[4]), &zero, 0, nullptr);
     a.NtFreeVirtualMemory(nullptr, const_cast<PVOID*>(&g_tokens[5]), &zero, 0);
-    return static_cast<unsigned>(InterlockedCompareExchange(&g_canary_hits, 0, 0)) & kAllHooks;
+    if (g_installed & (1u << 6))
+        a.NtCreateSectionEx(reinterpret_cast<PHANDLE>(const_cast<PVOID*>(&g_tokens[6])), 0, nullptr, nullptr, 0, 0, nullptr,
+                            nullptr, 0);
+    if (g_installed & (1u << 7))
+        a.NtMapViewOfSectionEx(nullptr, nullptr, const_cast<PVOID*>(&g_tokens[7]), nullptr, &zero, 0, 0, nullptr, 0);
+    if (g_installed & (1u << 8))
+        a.NtUnmapViewOfSectionEx(nullptr, const_cast<PVOID>(static_cast<const volatile void*>(&g_tokens[8])), 0);
+    if (g_installed & (1u << 9))
+        a.NtAllocateVirtualMemoryEx(nullptr, const_cast<PVOID*>(&g_tokens[9]), &zero, 0, 0, nullptr, 0);
+    return static_cast<unsigned>(InterlockedCompareExchange(&g_canary_hits, 0, 0)) & g_installed;
 }
 
 namespace {
@@ -419,17 +523,18 @@ std::uintptr_t jump_target(const unsigned char* p) {
 
 }  // namespace
 
-void check_entries(EntryCheck out[6]) {
-    for (int i = 0; i < 6; ++i) {
+void check_entries(EntryCheck out[kHookCount]) {
+    for (int i = 0; i < kHookCount; ++i) {
         const auto* p = static_cast<const unsigned char*>(g_targets[i].entry);
         out[i].name = g_targets[i].name;
+        out[i].present = (g_installed & (1u << i)) != 0;
         out[i].bytes_same = p && std::memcmp(p, g_targets[i].expected, sizeof(g_targets[i].expected)) == 0;
         out[i].first_jump = p ? jump_target(p) : 0;
     }
 }
 
 std::string entry_bytes_hex(int index, bool expected) {
-    if (index < 0 || index >= 6 || !g_targets[index].entry) return std::string();
+    if (index < 0 || index >= kHookCount || !g_targets[index].entry) return std::string();
     return expected ? hex(g_targets[index].expected, 16) : hex(g_targets[index].entry, 16);
 }
 

@@ -165,7 +165,7 @@ VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data,
     }
     if (reason != nt::kLdrDllNotificationLoaded) return;
     if (modules::find(base)) return;  // mapped through our hook: already decided
-    // Mapped by a path the hook does not see (NtMapViewOfSectionEx): decide now. The DLL
+    // Mapped past the hooks (a direct system call, a view another process mapped): decide now. The DLL
     // entry point has not run yet; the close is requested before it can matter much.
     std::wstring path = win::mapped_file_name(data->DllBase);
     if (path.empty() && data->FullDllName && data->FullDllName->Buffer)

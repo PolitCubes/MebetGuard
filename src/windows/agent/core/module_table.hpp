@@ -38,6 +38,8 @@ std::uint64_t add_if_absent(std::uintptr_t base, std::size_t size, trust::Trust 
 // The record of the module at `base`, if any.
 bool record_at(std::uintptr_t base, Record* out);
 void remove_if(std::uintptr_t base, std::uint64_t serial);
+// The sweep has proven which file the record `serial` at `base` (made without an id) is about.
+void prove_identity(std::uintptr_t base, std::uint64_t serial, const trust::FileIdentity& id);
 // A view whose file is being judged right now (the load gate's slow path): the sweep leaves it alone
 // for a while — not for good: a judging thread that never finishes (suspended, killed, a file that
 // never opens) must not leave an image unjudged. Cleared by add() and remove().
@@ -49,7 +51,8 @@ void remove_unloading(std::uintptr_t base);
 // A trusted module was unloaded from `base` within the last `max_age_ms`.
 bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms);
 // ... and the file at `path` now is the very file its record had judged — by file id, whatever form
-// the name takes (8.3, a mapped drive, a volume without a letter); by name only when the record had no id.
+// the name takes (8.3, a mapped drive, a volume without a letter); a record without an id by the id of
+// the file under its own name.
 bool unloaded_recently_file(std::uintptr_t base, std::uint64_t max_age_ms, const std::wstring& path);
 
 // Lock-free lookups.

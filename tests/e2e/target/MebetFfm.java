@@ -43,6 +43,11 @@ public final class MebetFfm {
     private static final int MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000;
     private static final int PAGE_READWRITE = 0x04, PAGE_EXECUTE_READ = 0x20, PAGE_EXECUTE_READWRITE = 0x40;
     private static final int THREAD_TERMINATE = 0x0001, THREAD_SUSPEND_RESUME = 0x0002, THREAD_QUERY_INFORMATION = 0x0040;
+    private static final int PAGE_READONLY = 0x02, SEC_IMAGE = 0x1000000, FILE_MAP_READ = 0x4;
+    private static final int GENERIC_READ = 0x80000000, GENERIC_EXECUTE = 0x20000000, FILE_SHARE_READ = 0x1, OPEN_EXISTING = 3;
+    private static final int SECTION_QUERY = 0x1, SECTION_MAP_READ = 0x4, SECTION_MAP_EXECUTE = 0x8;
+    private static final int PROCESS_VM_OPERATION = 0x0008;
+    private static final int LOAD_LIBRARY_AS_IMAGE_RESOURCE = 0x20;
     private static final String GUARD_DLL = "MebetGuard.dll";
 
     private MebetFfm() {}
@@ -59,6 +64,11 @@ public final class MebetFfm {
             case "ffm-kill-guard": return tamperGuardThreads(true, arg);
             case "ffm-unload-guard": return unloadGuard(arg);
             case "ffm-jam-sweep": return jamSweep();
+            case "ffm-quick-alloc2": return quickAlloc2();
+            case "ffm-quick-map-image": return quickMapImage(arg);
+            case "ffm-quick-stale-unmap": return quickStaleUnmap();
+            case "ffm-quick-limited-handle": return quickLimitedHandle();
+            case "ffm-resource-read": return resourceRead(arg);
             default: return "TARGET did nothing (unknown ffm action " + p[0] + ")";
         }
     }
@@ -187,9 +197,10 @@ public final class MebetFfm {
     // ---- M-07: kill threads inside a hooked call, then executable memory only the sweep sees. --
 
     // Threads loop MapViewOfFile/UnmapViewOfFile (each map goes through the guard's hook) and are
-    // terminated mid-call: a hook that counts calls in flight is left counting forever. Then the
-    // executable memory comes from VirtualAlloc2 (NtAllocateVirtualMemoryEx), a path the hooks do
-    // not cover, so only the periodic memory sweep can find it — if it still runs.
+    // terminated mid-call: a hook that counts calls in flight is left counting forever. Then code is
+    // written into the game from outside (the scenario's probe: an administrator's program, which no
+    // DACL keeps out), past every hook in the game: only the periodic memory sweep can find it — if
+    // it still runs.
     private static String jamSweep() throws Throwable {
         MemorySegment map = (MemorySegment) Win.CreateFileMappingW.invokeExact(MemorySegment.ofAddress(-1L),
                 MemorySegment.NULL, PAGE_READWRITE, 0, 1 << 20, MemorySegment.NULL);
@@ -228,15 +239,107 @@ public final class MebetFfm {
         }
         System.out.println("TARGET killed " + killed + " threads inside MapViewOfFile");
         System.out.flush();
+        Thread.sleep(15_000);  // the probe writes its code now; three periodic sweeps
+        return "TARGET did ffm-jam-sweep (foreign code survived the sweeps)";
+    }
+
+    // ---- Doors past the hooks, walked through before the next sweep. ------------------------------
+    // What a cheat that keeps its work short does: done before the periodic sweep (every 5 s) comes
+    // round. The target exits right after the marker of a "ffm-quick-" action, so only a hook that
+    // refuses at the call itself stops these.
+
+    // VirtualAlloc2 → NtAllocateVirtualMemoryEx.
+    private static String quickAlloc2() throws Throwable {
         MemorySegment proc = (MemorySegment) Win.GetCurrentProcess.invokeExact();
         MemorySegment code = (MemorySegment) Win.VirtualAlloc2.invokeExact(proc, MemorySegment.NULL, 4096L,
                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, MemorySegment.NULL, 0);
-        if (code.address() == 0) throw new IllegalStateException("VirtualAlloc2(RWX) failed");
+        if (code.address() == 0) throw new IllegalStateException("VirtualAlloc2(RWX) was refused");
         runCode(code.reinterpret(4096));
-        System.out.println("TARGET foreign code ran outside the hooks");
-        System.out.flush();
-        Thread.sleep(15_000);  // three periodic sweeps
-        return "TARGET did ffm-jam-sweep (foreign code survived the sweeps)";
+        return "TARGET did ffm-quick-alloc2 (native code ran from VirtualAlloc2 memory)";
+    }
+
+    // CreateFileMapping2 + MapViewOfFile3 → NtCreateSectionEx + NtMapViewOfSectionEx: the image of an
+    // unsigned DLL mapped into the game without the loader.
+    private static String quickMapImage(String path) throws Throwable {
+        MemorySegment file = (MemorySegment) Win.CreateFileW.invokeExact(wstr(path), GENERIC_READ | GENERIC_EXECUTE,
+                FILE_SHARE_READ, MemorySegment.NULL, OPEN_EXISTING, 0, MemorySegment.NULL);
+        if (file.address() == 0 || file.address() == -1L) throw new IllegalStateException("cannot open " + path);
+        MemorySegment map = (MemorySegment) WinEx.CreateFileMapping2.invokeExact(file, MemorySegment.NULL,
+                SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_EXECUTE, PAGE_READONLY, SEC_IMAGE, 0L,
+                MemorySegment.NULL, MemorySegment.NULL, 0);
+        int closed = (int) Win.CloseHandle.invokeExact(file);
+        if (map.address() == 0) throw new IllegalStateException("CreateFileMapping2(SEC_IMAGE) was refused");
+        MemorySegment proc = (MemorySegment) Win.GetCurrentProcess.invokeExact();
+        MemorySegment view = (MemorySegment) WinEx.MapViewOfFile3.invokeExact(map, proc, MemorySegment.NULL, 0L, 0L,
+                0, PAGE_READONLY, MemorySegment.NULL, 0);
+        if (view.address() == 0) throw new IllegalStateException("MapViewOfFile3 was refused");
+        return "TARGET did ffm-quick-map-image (an unsigned image mapped at 0x" + Long.toHexString(view.address()) + ")";
+    }
+
+    // A trusted image mapped as a view (MapViewOfFile: through the hooks, recorded as the module) and
+    // unmapped by UnmapViewOfFile (NtUnmapViewOfSectionEx on Windows 8+): left recorded, its range
+    // lent the module's trust to whatever came to that address next — code made executable there
+    // passed as the module's own.
+    private static String quickStaleUnmap() throws Throwable {
+        Path dll = null;
+        Path bin = Path.of(System.getProperty("java.home"), "bin");
+        for (String name : new String[] {"prefs.dll", "management.dll", "jaas.dll", "rmi.dll", "sunmscapi.dll"}) {
+            if (Files.exists(bin.resolve(name))) {
+                dll = bin.resolve(name);
+                break;
+            }
+        }
+        if (dll == null) throw new IllegalStateException("no JDK library to map in " + bin);
+        for (int attempt = 0; attempt < 5; attempt++) {
+            MemorySegment file = (MemorySegment) Win.CreateFileW.invokeExact(wstr(dll.toString()),
+                    GENERIC_READ | GENERIC_EXECUTE, FILE_SHARE_READ, MemorySegment.NULL, OPEN_EXISTING, 0, MemorySegment.NULL);
+            if (file.address() == 0 || file.address() == -1L) throw new IllegalStateException("cannot open " + dll);
+            MemorySegment map = (MemorySegment) Win.CreateFileMappingW.invokeExact(file, MemorySegment.NULL,
+                    PAGE_READONLY | SEC_IMAGE, 0, 0, MemorySegment.NULL);
+            int closedFile = (int) Win.CloseHandle.invokeExact(file);
+            if (map.address() == 0) throw new IllegalStateException("CreateFileMapping(SEC_IMAGE) of " + dll + " failed");
+            MemorySegment view = (MemorySegment) Win.MapViewOfFile.invokeExact(map, FILE_MAP_READ, 0, 0, 0L);
+            int closedMap = (int) Win.CloseHandle.invokeExact(map);
+            if (view.address() == 0) throw new IllegalStateException("MapViewOfFile of " + dll + " failed");
+            int unmapped = (int) Win.UnmapViewOfFile.invokeExact(view);
+            if (unmapped == 0) throw new IllegalStateException("UnmapViewOfFile failed");
+            MemorySegment code = (MemorySegment) Win.VirtualAlloc.invokeExact(view, 4096L, MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE);
+            if (code.address() != view.address()) continue;  // the address was taken meanwhile: again
+            code = code.reinterpret(4096);
+            write(code, retCode());
+            MemorySegment old = ARENA.allocate(JAVA_INT);
+            int ok = (int) Win.VirtualProtect.invokeExact(code, 4096L, PAGE_EXECUTE_READ, old);
+            if (ok == 0) throw new IllegalStateException("VirtualProtect(RX) was refused");
+            flush(code);
+            call(code);
+            return "TARGET did ffm-quick-stale-unmap (native code ran where " + dll.getFileName() + " was mapped)";
+        }
+        throw new IllegalStateException("the address of the unmapped view was never free again");
+    }
+
+    // A handle to the game's own process with nothing but PROCESS_VM_OPERATION, all VirtualAllocEx
+    // needs: it tells no process id.
+    private static String quickLimitedHandle() throws Throwable {
+        MemorySegment proc = (MemorySegment) Win.GetCurrentProcess.invokeExact();
+        MemorySegment out = ARENA.allocate(ADDRESS);
+        int dup = (int) Win.DuplicateHandle.invokeExact(proc, proc, proc, out, PROCESS_VM_OPERATION, 0, 0);
+        if (dup == 0) throw new IllegalStateException("DuplicateHandle(PROCESS_VM_OPERATION) failed");
+        MemorySegment code = (MemorySegment) Win.VirtualAllocEx.invokeExact(out.get(ADDRESS, 0), MemorySegment.NULL,
+                4096L, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (code.address() == 0) throw new IllegalStateException("VirtualAllocEx(RWX) was refused");
+        runCode(code.reinterpret(4096));
+        return "TARGET did ffm-quick-limited-handle (native code ran from VirtualAllocEx memory)";
+    }
+
+    // ---- Legit: the resources of an unsigned file (its icon, its version), as a file dialog reads
+    // them: LoadLibraryEx AS_IMAGE_RESOURCE maps it as an image that cannot run code. --------------
+    private static String resourceRead(String path) throws Throwable {
+        MemorySegment m = (MemorySegment) Win.LoadLibraryExW.invokeExact(wstr(path), MemorySegment.NULL,
+                LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        if (m.address() == 0) throw new IllegalStateException("LoadLibraryEx(AS_IMAGE_RESOURCE) of " + path + " failed");
+        int freed = (int) Win.FreeLibrary.invokeExact(m);
+        return "TARGET did ffm-resource-read (" + path + ")";
     }
 
     // ---- helpers ------------------------------------------------------------------------------
@@ -343,6 +446,12 @@ public final class MebetFfm {
                 FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
         static final MethodHandle VirtualAlloc2 = fn(KBASE, "VirtualAlloc2",
                 FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT));
+        static final MethodHandle VirtualAllocEx = fn(K32, "VirtualAllocEx",
+                FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
+        static final MethodHandle CreateFileW = fn(K32, "CreateFileW",
+                FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS));
+        static final MethodHandle LoadLibraryExW = fn(K32, "LoadLibraryExW",
+                FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
         static final MethodHandle VirtualProtect = fn(K32, "VirtualProtect",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS));
         static final MethodHandle FlushInstructionCache = fn(K32, "FlushInstructionCache",
@@ -382,6 +491,16 @@ public final class MebetFfm {
                 ADVAPI.find("AdjustTokenPrivileges").orElseThrow(),
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
                 Linker.Option.captureCallState("GetLastError"));
+    }
+
+    // Windows 10 1803+ only, loaded apart: on an older Windows only the actions that use them fail.
+    private static final class WinEx {
+        static final MethodHandle CreateFileMapping2 = fn(Win.KBASE, "CreateFileMapping2",
+                FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS, ADDRESS,
+                        JAVA_INT));
+        static final MethodHandle MapViewOfFile3 = fn(Win.KBASE, "MapViewOfFile3",
+                FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS,
+                        JAVA_INT));
     }
 
     private static final class Posix {

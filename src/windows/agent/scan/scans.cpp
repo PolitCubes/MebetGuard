@@ -347,15 +347,65 @@ HANDLE open_mapped_file(std::uintptr_t alloc) {
 // while it was judged escaped every sweep. Only a refusal without a readable file is looked at
 // again: a library unloaded while its file was being judged leaves nothing to read, and another
 // library may already sit at its address (a game was closed for an "untrusted module" with no
-// name). That one stands unless the image was recorded by a hook, went away, or another file can
-// be read there now (the next sweep judges it).
+// name). That one stands unless the image was recorded by a hook or went away — or the file mapped
+// there can be read now and is allowed, judged right then. Never let off for being readable alone:
+// whoever mapped it decides when its file can be opened, and was let off every sweep.
 bool refusal_stands(std::uintptr_t alloc, const trust::Decision& d) {
     if (d.facts.identity_known) return true;
-    return still_there([&] {
-        if (modules::find(alloc) || image_gone(alloc)) return true;
-        trust::FileIdentity now{};
-        return mapped_file_id(alloc, now);  // readable now: the next sweep judges that file
+    bool stands = true;
+    const bool unsettled = still_there([&] {
+        if (modules::find(alloc) || image_gone(alloc)) {
+            stands = false;
+            return true;
+        }
+        const HANDLE h = open_mapped_file(alloc);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        stands = !trust::decide(h, win::mapped_file_name(reinterpret_cast<void*>(alloc))).verdict.allowed;
+        CloseHandle(h);
+        return true;
     });
+    return unsettled || stands;
+}
+
+// The record at `alloc` still describes the image mapped there: the very file it was made for, told by
+// its id — or, for a record without one (a KnownDLL, a WOW64 image, a file whose id the loader's
+// handle could not read), by the kernel's name, and then by the id of the file under the record's own
+// name (proven once, kept). Unreadable is not proof: a library on its way out is let go when it is
+// gone, but a file kept from the guard by whoever mapped it leaves the record unproven.
+bool record_holds(std::uintptr_t alloc, const modules::Record& rec) {
+    if (!rec.id_known && rec.path.empty()) return true;  // nothing to compare with (the guard's own views)
+    bool holds = true;
+    auto look = [&] {
+        if (image_gone(alloc)) return true;  // going: the unmap hook removes the record
+        trust::FileIdentity now{};
+        if (rec.id_known) {
+            if (!mapped_file_id(alloc, now)) return false;
+            holds = same_file(now, rec.id);
+            return true;
+        }
+        const std::wstring name = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+        if (name.empty()) return false;
+        if (win::name_equals(name, rec.path)) return true;
+        trust::FileIdentity was{};
+        const HANDLE h = trust::open_read(rec.path);
+        const bool known = h != INVALID_HANDLE_VALUE && trust::identity_of(h, was);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (!known || !mapped_file_id(alloc, now)) return false;
+        holds = same_file(now, was);
+        if (holds) modules::prove_identity(alloc, rec.serial, now);
+        return true;
+    };
+    if (look()) return holds;
+    if (still_there(look)) return guard::closing();  // never proven (closing: nothing more to judge)
+    return holds;
+}
+
+// The memory at `base` is no longer the region the sweep found there: released, decommitted, or now part
+// of another allocation.
+bool region_changed(std::uintptr_t base, const MEMORY_BASIC_INFORMATION& was) {
+    MEMORY_BASIC_INFORMATION m{};
+    return !VirtualQuery(reinterpret_cast<void*>(base), &m, sizeof(m)) || m.State != MEM_COMMIT ||
+           m.AllocationBase != was.AllocationBase;
 }
 
 void sweep_memory(SweepMode mode) {
@@ -381,20 +431,25 @@ void sweep_memory(SweepMode mode) {
             if (alloc == last_image_base) continue;
             last_image_base = alloc;
             modules::Record rec;
+            std::uintptr_t owner = 0;
             if (modules::record_at(alloc, &rec)) {
                 // A record holds only while the file mapped there is the one judged. A view unmapped
-                // by a call the hooks do not see (NtUnmapViewOfSectionEx) left its record behind, and
+                // past the hooks (a direct system call, another process) left its record behind, and
                 // another image mapped at that base was taken for the old trusted one for good.
-                trust::FileIdentity now{};
-                if (!rec.id_known || !mapped_file_id(alloc, now) || same_file(now, rec.id)) continue;
+                if (record_holds(alloc, rec)) continue;
                 modules::remove_if(alloc, rec.serial);  // stale: judged below like any image
-            } else if (modules::find(alloc)) {
-                continue;
+            } else if (modules::find(alloc, nullptr, &owner)) {
+                // An image starting inside the range of another record: images never overlap, so the
+                // one recorded there is gone, and its range lent its trust to whatever is mapped in it
+                // now — this image went unjudged for good. That record is stale; this image is judged.
+                modules::Record old;
+                if (owner == alloc || !modules::record_at(owner, &old)) continue;
+                modules::remove_if(owner, old.serial);
             }
             if (!config::enabled(config::Module::hidden_images)) continue;
             if (modules::pending_within(alloc, pending_max_ms())) continue;  // its file is being judged
             if (loader_knows(alloc)) {
-                // Loaded by a path the hooks do not see (NtMapViewOfSectionEx): judge the file now.
+                // Loaded past the hooks (a direct system call, another process): judge the file now.
                 const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(alloc));
                 const trust::Decision d = trust::decide_path(path);
                 if (d.verdict.allowed) {
@@ -466,7 +521,8 @@ void sweep_memory(SweepMode mode) {
             continue;
         }
         if (periodic && !still_there([&] {
-                return exec::covers(base, next) || exec::forgotten_since(base, next, forgotten_before);
+                return exec::covers(base, next) || exec::forgotten_since(base, next, forgotten_before) ||
+                       region_changed(base, mbi);
             }))
             continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");

@@ -63,10 +63,33 @@ void close_foreign_code(const Requester& r, const char* operation, std::uintptr_
 
 }  // namespace
 
+namespace {
+using NtCompareObjectsFn = NTSTATUS(NTAPI*)(HANDLE first, HANDLE second);
+// Resolved when the agent loads, so that a hook on a thread without TLS can use them (see nt_hooks).
+const NtCompareObjectsFn g_compare_objects = reinterpret_cast<NtCompareObjectsFn>(
+    reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCompareObjects")));
+// A real handle to this process (the pseudo-handle is not one the kernel compares by object).
+HANDLE self_handle() {
+    HANDLE h = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &h, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS))
+        return nullptr;
+    return h;
+}
+const HANDLE g_self = self_handle();  // never closed: hooks use it while the process exits
+}  // namespace
+
 bool is_current_process(HANDLE process) {
     if (process == nt::current_process()) return true;
     if (!process) return false;
-    return GetProcessId(process) == GetCurrentProcessId();
+    if (const DWORD pid = GetProcessId(process)) return pid == GetCurrentProcessId();
+    // A handle without PROCESS_QUERY_LIMITED_INFORMATION tells no id, and VirtualAllocEx needs no more
+    // than PROCESS_VM_OPERATION: such a handle to the game's own process was taken for another
+    // process, and executable memory passed every hook unjudged. The kernel compares the objects
+    // behind two handles whatever they allow (Windows 10 1607+); where it cannot be asked, a handle
+    // that does not say whose process it is counts as this one.
+    if (g_compare_objects && g_self) return nt::ok(g_compare_objects(process, g_self));
+    return true;
 }
 
 Requester find_requester() {

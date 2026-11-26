@@ -72,8 +72,13 @@ bool forgotten_since(std::uintptr_t begin, std::uintptr_t end, std::uint64_t gen
     ForgottenRing& r = *g_forgotten;
     bool hit = false;
     AcquireSRWLockShared(&r.lock);
-    for (const Forgotten& f : r.items)
-        if (f.generation > generation && f.begin < end && f.end > begin) hit = true;
+    // More forgets since than the history keeps: those it lost could be the one asked about, and none
+    // is taken for it (the caller looks at the memory itself) — an overflow a cheat could cause on
+    // purpose must not count as "forgotten".
+    if (r.generation - generation < kForgottenKept) {
+        for (const Forgotten& f : r.items)
+            if (f.generation > generation && f.begin < end && f.end > begin) hit = true;
+    }
     ReleaseSRWLockShared(&r.lock);
     return hit;
 }

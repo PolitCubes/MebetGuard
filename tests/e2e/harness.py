@@ -201,7 +201,42 @@ def probe_hold_process(pid, proc):
     return "PROBE process held for %d s and resumed" % HOLD_SECONDS
 
 
-PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process}
+def probe_remote_code(pid, proc):
+    """An administrator's program (SeDebugPrivilege: what no DACL keeps out) writes executable code
+    into the game, past every hook in it: only the guard's memory sweep can find it. First waits until
+    the game has killed its own threads inside a hooked call (ffm-jam-sweep), which once left the
+    sweep waiting for those calls for ever. The code is never run: being there is the attack."""
+    import ctypes
+    deadline = time.monotonic() + 60
+    while not any("TARGET killed" in line for line in list(proc.lines)):
+        if time.monotonic() > deadline or proc.wait(0.05):
+            return "PROBE remote-code: the game never got to kill its threads"
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.VirtualAllocEx.restype = ctypes.c_void_p
+    k32.VirtualAllocEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+    k32.WriteProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+                                       ctypes.POINTER(ctypes.c_size_t)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    def write():
+        h = k32.OpenProcess(0x0008 | 0x0020, 0, pid)  # PROCESS_VM_OPERATION | PROCESS_VM_WRITE
+        if not h:
+            return "PROBE remote-code: open denied (error %d)" % ctypes.get_last_error()
+        try:
+            addr = k32.VirtualAllocEx(h, None, 4096, 0x3000, 0x40)  # MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
+            if not addr:
+                return "PROBE remote-code: VirtualAllocEx failed (error %d)" % ctypes.get_last_error()
+            done = ctypes.c_size_t(0)
+            k32.WriteProcessMemory(h, addr, b"\xc3", 1, ctypes.byref(done))  # ret
+            return "PROBE remote-code written at 0x%x" % addr
+        finally:
+            k32.CloseHandle(h)
+    return winpriv.as_other("admin", write)
+
+
+PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
@@ -361,6 +396,7 @@ def _sc(**kw):
     kw.setdefault("privs", "game")
     kw.setdefault("ingame", False)         # the attack runs inside the started game (an action)
     kw.setdefault("needs_dev_mode", False)
+    kw.setdefault("needs_admin", False)    # the test itself must run as an administrator (its probe)
     return kw
 
 
@@ -416,6 +452,12 @@ SCENARIOS = [
         timeout=120, title="Библиотеки самой Java грузятся и выгружаются без остановки (45 с)",
         marker="TARGET did ffm-load-churn",
         build=lambda ctx, native, jar: dict(action="ffm-load-churn 45", iters=2)),
+    # The icon or the version of an unsigned file, read as a file dialog does: the file is mapped as an
+    # image that can run no code (LoadLibraryEx AS_IMAGE_RESOURCE) — no module to judge.
+    _sc(id="resource_read_unsigned", kind="legit", module="module_trust", os=WIN, needs_ffm=True, needs_native=True,
+        guard="allow", title="Ресурсы неподписанного файла (иконка, версия): LoadLibraryEx AS_IMAGE_RESOURCE",
+        marker="TARGET did ffm-resource-read",
+        build=lambda ctx, native, jar: dict(action="ffm-resource-read " + str(native))),
 
     # ---- attacks: the start of the JVM -----------------------------------------------------------
     # The proof is the variable gone from the game: the Linux/macOS guard starts the JVM through
@@ -473,6 +515,26 @@ SCENARIOS = [
         guard="close:foreign_code", title="FFM: VirtualProtect(RX) + шелл-код из Java",
         marker="TARGET did ffm-exec-protect",
         build=lambda ctx, native, jar: dict(action="ffm-exec-protect")),
+    # Doors past the six hooks of the ТЗ — their Ex variants, an unmap they did not see, a handle that
+    # does not say whose process it is — each walked through before the next periodic sweep (every
+    # 5 s): the game exits right after the marker ("ffm-quick-" actions), so only a hook that refuses
+    # at the call itself stops them.
+    _sc(id="ex_exec_alloc", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
+        guard="close:foreign_code", marker="TARGET did ffm-quick-alloc2",
+        title="FFM: VirtualAlloc2(RWX) (NtAllocateVirtualMemoryEx) + шелл-код, выход до обхода",
+        build=lambda ctx, native, jar: dict(action="ffm-quick-alloc2")),
+    _sc(id="ex_image_map", kind="attack", module="module_trust", os=WIN, needs_ffm=True, needs_native=True,
+        ingame=True, guard="close:untrusted_module", marker="TARGET did ffm-quick-map-image",
+        title="FFM: образ неподписанной DLL через CreateFileMapping2 + MapViewOfFile3 (Ex), выход до обхода",
+        build=lambda ctx, native, jar: dict(action="ffm-quick-map-image " + str(native))),
+    _sc(id="stale_unmap_exec", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
+        guard="close:foreign_code", marker="TARGET did ffm-quick-stale-unmap",
+        title="FFM: образ доверенной DLL снят UnmapViewOfFile, на его адресе шелл-код, выход до обхода",
+        build=lambda ctx, native, jar: dict(action="ffm-quick-stale-unmap")),
+    _sc(id="limited_handle_exec", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
+        guard="close:foreign_code", marker="TARGET did ffm-quick-limited-handle",
+        title="FFM: VirtualAllocEx(RWX) через хэндл своего процесса без права запроса, выход до обхода",
+        build=lambda ctx, native, jar: dict(action="ffm-quick-limited-handle")),
     _sc(id="process_dacl_open", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],
@@ -493,10 +555,12 @@ SCENARIOS = [
         title="FreeLibrary на страже, затем загрузить чужой натив", marker="TARGET did ffm-unload-guard",
         proof=[r"TARGET called FreeLibrary on the guard [1-9]\d* times"],
         build=lambda ctx, native, jar: dict(action="ffm-unload-guard " + str(native), iters=2)),
+    # Then the code comes from outside (probe remote_code): past every hook, so only the sweep can see it.
     _sc(id="tamper_jam_sweep", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
-        guard="close:foreign_code", timeout=90,
-        title="Убить потоки посреди хука, затем RWX мимо хуков (только обход)",
-        marker="TARGET did ffm-jam-sweep", proof=[r"TARGET killed [1-9]\d* threads inside MapViewOfFile"],
+        needs_admin=True, guard="close:foreign_code", timeout=90, probe="remote_code",
+        title="Убить потоки посреди хука, затем чужая программа пишет код в игру (только обход)",
+        marker="TARGET did ffm-jam-sweep", proof=[r"TARGET killed [1-9]\d* threads inside MapViewOfFile",
+                                                  r"PROBE remote-code written at 0x[0-9a-f]+"],
         build=lambda ctx, native, jar: dict(action="ffm-jam-sweep", iters=2)),
 ]
 
@@ -538,6 +602,8 @@ def applies(sc, ctx, variant=(None, None)):
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:
         return "нужна Java 22+ с FFM (здесь Java %d)" % ctx.java_feature
+    if sc["needs_admin"] and not ctx.admin:
+        return "сценарию нужен тест от администратора (на раннерах CI так и есть)"
     if any(v and v.startswith("admin") for v in variant) and not ctx.admin:
         return "вариант «админ» требует, чтобы тест работал от администратора (на раннерах CI так и есть)"
     return None

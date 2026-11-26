@@ -88,7 +88,15 @@ public class MebetTarget {
             } else if (action.startsWith("ffm-")) {
                 // Java 22+ only: the class is built only when the JDK has the FFM API.
                 Class<?> ffm = Class.forName("MebetFfm");
-                System.out.println((String) ffm.getMethod("run", String.class).invoke(null, action));
+                String did = (String) ffm.getMethod("run", String.class).invoke(null, action);
+                System.out.println(did);
+                if (action.startsWith("ffm-quick-") && did.startsWith("TARGET did")) {
+                    // Done before the next periodic sweep could see it: the game ends right here, so
+                    // only a hook that refused at the call could have stopped it.
+                    System.out.println("TARGET exit");
+                    System.out.flush();
+                    Runtime.getRuntime().halt(0);
+                }
             } else {
                 System.out.println("TARGET did nothing (unknown action " + action + ")");
             }

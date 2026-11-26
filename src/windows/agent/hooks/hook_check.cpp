@@ -15,9 +15,10 @@ namespace mebet::hooks {
 void self_check() {
     if (!config::enabled(config::Module::hook_self_check)) return;
     const unsigned hits = canary_round();
-    EntryCheck checks[6];
+    EntryCheck checks[kHookCount];
     check_entries(checks);
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < kHookCount; ++i) {
+        if (!checks[i].present) continue;  // an Ex variant this Windows does not have
         const bool reached = (hits & (1u << i)) != 0;
         if (reached && checks[i].bytes_same) continue;
         report::Event ev;

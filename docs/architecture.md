@@ -11,7 +11,7 @@
 | 2 | `exe/main.cpp`, `shared/pe_hash.cpp` | агент проверяется по вшитому хэшу (не меняется от подписи) и грузится по полному пути через тот же открытый дескриптор |
 | 3 | `agent/entry.cpp` → `window/splash.cpp` | заставка в своём потоке |
 | 4 | `trust/signatures.cpp`, `trust/engine.cpp` | прогрев wintrust/crypt32 до хуков, движок доверия |
-| 5 | `hooks/nt_hooks.cpp` | шесть хуков ntdll одной транзакцией Detours |
+| 5 | `hooks/nt_hooks.cpp` | хуки ntdll одной транзакцией Detours: шесть из ТЗ и их Ex-варианты (`NtCreateSectionEx`, `NtMapViewOfSectionEx`, `NtUnmapViewOfSectionEx`, `NtAllocateVirtualMemoryEx`), где система их экспортирует, — та же логика за каждой дверью |
 | 6 | `system/environment.cpp` | дев-режим (всегда), ВМ |
 | 7 | `scan/scans.cpp` (`startup_check`) | всё, что загрузилось раньше агента: модули, исполняемая память, потоки |
 | 8 | `launch/launch.cpp` | `jli.dll` через шлюз, `JLI_InitArgProcessing(false, true)`, `JLI_CmdToArgs`, проверка файлов и аргументов |

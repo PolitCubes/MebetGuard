@@ -166,8 +166,19 @@ void remove_unloading(std::uintptr_t base) {
     AcquireSRWLockExclusive(&n.lock);
     auto it = n.records.find(base);
     if (it != n.records.end()) {
-        n.unloaded[n.unloaded_next++ % kUnloadedKept] = Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown,
-                                                                 it->second.path, it->second.id, it->second.id_known};
+        // One entry per base (a library loaded and unloaded over and over keeps one), else the oldest:
+        // round-robin, a burst of unloads elsewhere pushed out the one a sweep was about to ask for,
+        // and a library caught between its unload notification and its unmap was closed as hidden.
+        std::size_t slot = 0;
+        for (std::size_t i = 0; i < kUnloadedKept; ++i) {
+            if (n.unloaded[i].base == base) {
+                slot = i;
+                break;
+            }
+            if (n.unloaded[i].at_ms < n.unloaded[slot].at_ms) slot = i;
+        }
+        n.unloaded[slot] = Unloaded{base, GetTickCount64(), it->second.trust != trust::Trust::unknown, it->second.path,
+                                    it->second.id, it->second.id_known};
         remove_locked(n, it);
     }
     ReleaseSRWLockExclusive(&n.lock);
@@ -199,13 +210,33 @@ bool unloaded_recently(std::uintptr_t base, std::uint64_t max_age_ms) {
 bool unloaded_recently_file(std::uintptr_t base, std::uint64_t max_age_ms, const std::wstring& path) {
     Unloaded u;
     if (path.empty() || !newest_unload(base, max_age_ms, &u) || !u.trusted) return false;
-    if (!u.id_known) return !u.path.empty() && win::name_equals(u.path, path);
-    const HANDLE h = trust::open_read(path);  // outside the lock: an open can take a while
-    if (h == INVALID_HANDLE_VALUE) return false;
+    // Outside the lock: an open can take a while.
+    auto id_of = [](const std::wstring& p, trust::FileIdentity& out) {
+        const HANDLE h = p.empty() ? INVALID_HANDLE_VALUE : trust::open_read(p);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        const bool ok = trust::identity_of(h, out);
+        CloseHandle(h);
+        return ok;
+    };
     trust::FileIdentity now{};
-    const bool ok = trust::identity_of(h, now);
-    CloseHandle(h);
-    return ok && now.volume == u.id.volume && std::memcmp(now.file_id, u.id.file_id, sizeof(now.file_id)) == 0;
+    if (!id_of(path, now)) return false;
+    trust::FileIdentity was = u.id;
+    // A record without an id (Windows 7, a volume without file ids): the file under its own name, by
+    // id too. Its name and the kernel's never compare: the record has the long normalized form, the
+    // kernel's keeps 8.3 components ("JOHNDO~1"), and the same file did not match itself.
+    if (!u.id_known && !id_of(u.path, was)) return false;
+    return now.volume == was.volume && std::memcmp(now.file_id, was.file_id, sizeof(now.file_id)) == 0;
+}
+
+void prove_identity(std::uintptr_t base, std::uint64_t serial, const trust::FileIdentity& id) {
+    Names& n = names();
+    AcquireSRWLockExclusive(&n.lock);
+    auto it = n.records.find(base);
+    if (it != n.records.end() && it->second.serial == serial && !it->second.id_known) {
+        it->second.id = id;
+        it->second.id_known = true;
+    }
+    ReleaseSRWLockExclusive(&n.lock);
 }
 
 bool record_at(std::uintptr_t base, Record* out) {

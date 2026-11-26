@@ -177,7 +177,12 @@ pytest tests/e2e -v -rP --paths cyrillic --guard <MebetGuard> --java <JAVA_HOME>
 | `hidden_images` | ручной маппинг образа | закрыть | 214 | ⬜ (Windows, натив) |
 | `foreign_exec_memory` | FFM из Java: `VirtualAlloc(RWX)` + шелл-код | закрыть | 215 | ✅ (Windows x64/arm64) |
 | `foreign_exec_memory` | FFM из Java: `VirtualAlloc(RW)` → `VirtualProtect(RX)` + шелл-код | закрыть | 215 | ✅ (Windows x64/arm64) |
-| `foreign_exec_memory` | убить потоки посреди хука (M-07), затем RWX через `VirtualAlloc2` мимо хуков | обход памяти → закрыть | 215 | ✅ (Windows x64/arm64) |
+| `foreign_exec_memory` | убить потоки посреди хука (M-07), затем чужая программа (админ с SeDebugPrivilege) пишет исполняемый код в игру мимо всех хуков | обход памяти → закрыть | 215 | ✅ (Windows x64/arm64) |
+| `foreign_exec_memory` | FFM: `VirtualAlloc2(RWX)` (`NtAllocateVirtualMemoryEx`) + шелл-код, игра выходит до обхода памяти | хук → закрыть | 215 | ✅ (Windows x64/arm64) |
+| `module_trust` | FFM: образ неподписанной DLL через `CreateFileMapping2` + `MapViewOfFile3` (`NtCreateSectionEx` / `NtMapViewOfSectionEx`), выход до обхода | хук → закрыть | 210 | ✅ (Windows x64/arm64) |
+| `foreign_exec_memory` | FFM: образ доверенной DLL снят `UnmapViewOfFile` (`NtUnmapViewOfSectionEx`), на его адресе шелл-код, выход до обхода | хук → закрыть | 215 | ✅ (Windows x64/arm64) |
+| `foreign_exec_memory` | FFM: `VirtualAllocEx(RWX)` через хэндл своего процесса с одним `PROCESS_VM_OPERATION` (id процесса по нему не узнать), выход до обхода | хук → закрыть | 215 | ✅ (Windows x64/arm64) |
+| `module_trust` | легит: ресурсы неподписанного файла (иконка, версия) — `LoadLibraryEx(AS_IMAGE_RESOURCE)` | не мешать | — | ✅ (Windows x64/arm64) |
 | `hook_self_check` | снос хуков стража в ntdll | закрыть | 219 | ⬜ (Windows, натив) |
 | `guard_watchdog` | заморозить потоки стража (`SuspendThread`, админ + SeDebugPrivilege), затем чужой натив | закрыть | 225 | ✅ (Windows x64/arm64) |
 | `guard_watchdog` | убить потоки стража (`TerminateThread`), затем чужой натив | закрыть | 225 | ✅ (Windows x64/arm64) |
