@@ -273,6 +273,7 @@ class UserProc:
             raise OSError("CreateProcessAsUser failed: Windows error %d" % err)
         _CloseHandle(pi.hThread)
         self._h, self._r, self.pid = pi.hProcess, r, pi.dwProcessId
+        self.handle = self._h  # the parent's own process handle
         self._t = threading.Thread(target=self._read, daemon=True)
         self._t.start()
 

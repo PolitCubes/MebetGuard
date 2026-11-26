@@ -108,6 +108,7 @@ class Proc:
         self._p = subprocess.Popen([str(c) for c in cmd], env=env, cwd=cwd, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT)
         self.pid = self._p.pid
+        self.handle = int(getattr(self._p, "_handle", 0))  # Windows: the parent's own process handle
         self._t = threading.Thread(target=self._read, daemon=True)
         self._t.start()
 
@@ -133,7 +134,7 @@ class Proc:
 
 # --- external probes (another program acting on the target) ------------------------------------
 
-def probe_open_process(pid):
+def probe_open_process(pid, proc=None):
     """Another program asks for the rights an injector needs. Only opens and closes a handle —
     nothing is written into the target. Its privilege level comes from winpriv.as_other()."""
     import ctypes
@@ -149,7 +150,26 @@ def probe_open_process(pid):
     return "PROBE open-process denied (error %d)" % ctypes.get_last_error()
 
 
-PROBES = {"open_process": probe_open_process}
+HOLD_SECONDS = 35  # longer than every "guard thread is silent" limit of the watchdog
+
+
+def probe_hold_process(pid, proc):
+    """The whole game is paused and let go again: Suspend / Resume in Process Explorer or Resource
+    Monitor, a launcher that pauses the game, a dump tool. Done with the handle the parent got
+    when it started the game. Nothing in the game is touched: every thread stops and continues."""
+    import ctypes
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtSuspendProcess.argtypes = [ctypes.c_void_p]
+    ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+    status = ntdll.NtSuspendProcess(proc.handle)
+    if status != 0:
+        return "PROBE hold failed (NtSuspendProcess 0x%08X)" % (status & 0xFFFFFFFF)
+    time.sleep(HOLD_SECONDS)
+    ntdll.NtResumeProcess(proc.handle)
+    return "PROBE process held for %d s and resumed" % HOLD_SECONDS
+
+
+PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
@@ -243,7 +263,7 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
                 if proc.wait(0.05):
                     break
         if pid:
-            fn = lambda: PROBES[probe](pid)  # noqa: E731
+            fn = lambda: PROBES[probe](pid, proc)  # noqa: E731
             proc.lines.append((winpriv.as_other(other, fn) if other else fn()) + "\n")
     timed_out = not proc.wait(max(0.0, limit - (time.monotonic() - start)))
     if timed_out:
@@ -329,6 +349,17 @@ SCENARIOS = [
     _sc(id="ffm_benign", kind="legit", module="foreign_exec_memory", needs_ffm=True, guard="allow",
         title="Обычный нативный вызов через FFM", marker="TARGET did ffm-benign",
         build=lambda ctx, native, jar: dict(action="ffm-benign")),
+    # The whole process paused for longer than the watchdog's limits and resumed: nobody stopped
+    # the guard's threads on their own, so the game must go on.
+    _sc(id="process_hold", kind="legit", module="guard_watchdog", os=WIN, guard="allow", timeout=90,
+        title="Пауза всего процесса на %d с и продолжение" % HOLD_SECONDS, marker="PROBE process held",
+        probe="hold_process", build=lambda ctx, native, jar: dict(action="none", iters=40)),
+    # Libraries of the game's own Java loaded and unloaded all the time while the memory sweep
+    # runs: an image the load hook is still registering is not a hidden one.
+    _sc(id="native_load_churn", kind="legit", module="hidden_images", os=WIN, needs_ffm=True, guard="allow",
+        timeout=120, title="Библиотеки самой Java грузятся и выгружаются без остановки (45 с)",
+        marker="TARGET did ffm-load-churn",
+        build=lambda ctx, native, jar: dict(action="ffm-load-churn 45", iters=2)),
 
     # ---- attacks: the start of the JVM -----------------------------------------------------------
     _sc(id="env_hardening_jto", kind="attack", module="env_hardening", guard="neutralize",

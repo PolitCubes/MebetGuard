@@ -20,9 +20,13 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
@@ -48,6 +52,7 @@ public final class MebetFfm {
         String arg = p.length > 1 ? p[1].trim() : "";
         switch (p[0]) {
             case "ffm-benign": return benign();
+            case "ffm-load-churn": return loadChurn(arg);
             case "ffm-exec-alloc": return execAlloc();
             case "ffm-exec-protect": return execProtect();
             case "ffm-freeze-guard": return tamperGuardThreads(false, arg);
@@ -63,6 +68,42 @@ public final class MebetFfm {
     private static String benign() throws Throwable {
         long v = WINDOWS ? (long) Win.GetTickCount64.invokeExact() : (int) Posix.getpid.invokeExact();
         return "TARGET did ffm-benign (a native call returned " + v + ")";
+    }
+
+    // Libraries of the game's own Java, loaded and unloaded in a loop on a few threads for the
+    // given number of seconds (a library lookup in a confined arena unloads when the arena
+    // closes). Every load maps an image through the guard's hooks while its memory sweep runs.
+    private static String loadChurn(String arg) throws Throwable {
+        final long end = System.nanoTime() + Long.parseLong(arg) * 1_000_000_000L;
+        final Path bin = Path.of(System.getProperty("java.home"), "bin");
+        final List<Path> libs = new ArrayList<>();
+        for (String name : new String[] {"prefs.dll", "management.dll", "jaas.dll", "rmi.dll", "sunmscapi.dll",
+                                         "j2pkcs11.dll", "w2k_lsa_auth.dll", "sspi_bridge.dll"}) {
+            if (Files.exists(bin.resolve(name))) libs.add(bin.resolve(name));
+        }
+        if (libs.isEmpty()) throw new IllegalStateException("no JDK library to load in " + bin);
+        final AtomicLong loads = new AtomicLong();
+        final AtomicReference<Throwable> failed = new AtomicReference<>();
+        final Thread[] ts = new Thread[Math.min(4, libs.size())];
+        for (int i = 0; i < ts.length; i++) {
+            final int k = i;
+            ts[i] = new Thread(() -> {
+                try {
+                    for (int n = k; System.nanoTime() < end && failed.get() == null; n += ts.length) {
+                        try (Arena arena = Arena.ofConfined()) {
+                            SymbolLookup.libraryLookup(libs.get(n % libs.size()), arena);
+                        }
+                        loads.incrementAndGet();
+                    }
+                } catch (Throwable e) {
+                    failed.compareAndSet(null, e);
+                }
+            }, "mebet-load-" + i);
+            ts[i].start();
+        }
+        for (Thread t : ts) t.join();
+        if (failed.get() != null) throw failed.get();
+        return "TARGET did ffm-load-churn (" + loads.get() + " loads of " + libs.size() + " libraries)";
     }
 
     // ---- foreign_exec_memory: shellcode without a DLL. ---------------------------------------

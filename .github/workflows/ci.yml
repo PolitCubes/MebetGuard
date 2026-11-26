@@ -94,6 +94,8 @@ jobs:
         with:
           name: bin-linux-${{ matrix.arch }}-${{ matrix.variant }}
           path: dist/${{ matrix.kind }}/
+      - name: starts on glibc 2.28 (Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck)
+        run: bash tools/ci/check-glibc.sh dist/${{ matrix.kind }}/${{ matrix.dir }}/*
 
   build-macos-binaries:
     name: macos ${{ matrix.arch }} ${{ matrix.variant }}
@@ -143,6 +145,8 @@ jobs:
           - jit_hot
           - trusted_native_load
           - ffm_benign
+          - process_hold
+          - native_load_churn
           # attacks on the JVM start
           - env_hardening_jto
           - env_hardening_jdk
@@ -169,6 +173,7 @@ jobs:
         # attacks cannot exist there.
         exclude:
           - { arch: x86, feature: ffm_benign }
+          - { arch: x86, feature: native_load_churn }
           - { arch: x86, feature: foreign_exec_alloc }
           - { arch: x86, feature: foreign_exec_protect }
           - { arch: x86, feature: tamper_freeze_guard }
