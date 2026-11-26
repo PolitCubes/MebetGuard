@@ -45,7 +45,9 @@ constexpr std::uint64_t kWatchdogStep = 1000 * kMs;  // the watchdog looks every
 constexpr std::uint64_t kWorkerStep = 2000 * kMs;    // the worker at least once a second when idle
 constexpr std::uint64_t kHookStep = 1000 * kMs;
 constexpr DWORD kTickMs = 250;
-constexpr DWORD kHookSecondLookMs = 100;
+// The hook's second look at guard threads it found stopped: every step, for at most the whole of it.
+constexpr DWORD kHookSecondLookStepMs = 25;
+constexpr DWORD kHookSecondLookMaxMs = 2000;
 constexpr DWORD kLastWordsReportMs = 2000;  // the line and the report
 constexpr DWORD kLastWordsLineMs = 250;     // the line only
 constexpr int kThreadSuspendCount = 35;  // THREADINFOCLASS, Windows 8.1+
@@ -99,6 +101,20 @@ int suspended(HANDLE t) {
 
 bool ended(HANDLE t) { return t && WaitForSingleObject(t, 0) == WAIT_OBJECT_0; }
 bool stopped(HANDLE t) { return ended(t) || suspended(t) == 1; }
+
+// The hook's second look, patient: right after the whole process was let go again its threads are
+// resumed one after another, and on a busy machine the guard's came up more than 100 ms after the
+// thread in the hook (a Windows ARM64 runner: still suspended at the one look 100 ms later, and an
+// honest game closed with guard_stalled). Over as soon as they run or beat again; threads somebody
+// stopped are still stopped after the whole wait.
+template <typename Still>
+bool still_stopped(Still still) {
+    for (DWORD waited = 0; waited < kHookSecondLookMaxMs; waited += kHookSecondLookStepMs) {
+        Sleep(kHookSecondLookStepMs);
+        if (!still()) return false;
+    }
+    return true;
+}
 
 // How long another thread has been stopped, counted only while the observer itself was running.
 // The whole process held for a minute (Suspend in a task manager, a dump tool, a machine that
@@ -574,8 +590,7 @@ void check_from_hook() {
         // here as soon as both beats were 8 s old, and the window of a close caused by the
         // watchdog thread itself vanished after 8 seconds), its slow-work limit before that.
         if (stopped(worker)) {
-            Sleep(kHookSecondLookMs);
-            if (stopped(worker)) end_pending_close("guard threads stopped during the close");
+            if (still_stopped([&] { return stopped(worker); })) end_pending_close("guard threads stopped during the close");
             return;
         }
         // Before the close starts, the same limit the watchdog thread would apply: the long one
@@ -589,8 +604,7 @@ void check_from_hook() {
     }
     if (!config::closes(config::Module::guard_watchdog)) return;
     if (stopped(worker) && (!watchdog || stopped(watchdog))) {
-        Sleep(kHookSecondLookMs);
-        if (stopped(worker) && (!watchdog || stopped(watchdog)) && beats() == seen)
+        if (still_stopped([&] { return stopped(worker) && (!watchdog || stopped(watchdog)) && beats() == seen; }))
             on_stall("both guard threads silent", false);
         return;
     }
