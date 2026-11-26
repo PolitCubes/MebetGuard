@@ -64,6 +64,9 @@ def _java_beyond(ctx):
     java = paths.copy_java(ctx.layout.java_src, ctx.layout.root / (name + " java"))
     c = copy.copy(ctx)
     c.java_home, c.java = java, java / "bin" / "java.exe"
+    # JAVA_HOME is this folder now — not the layout's own Java folder in the other case (paths.py),
+    # which the guard would happily run from.
+    c.java_env = None
     return c
 
 
