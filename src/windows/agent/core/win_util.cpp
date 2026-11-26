@@ -148,17 +148,29 @@ std::wstring strip_long_prefix(const std::wstring& p) {
 }
 }  // namespace
 
+bool name_equals(std::wstring_view a, std::wstring_view b) {
+    if (a.size() != b.size()) return false;
+    if (a.empty()) return true;
+    // The system's own upper-case table, the one file systems use (Vista+).
+    return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) ==
+           CSTR_EQUAL;
+}
+
+bool name_starts_with(std::wstring_view s, std::wstring_view prefix) {
+    return s.size() >= prefix.size() && name_equals(s.substr(0, prefix.size()), prefix);
+}
+
 bool path_under(const std::wstring& path, const std::wstring& dir) {
     const std::wstring p = strip_long_prefix(path);
     std::wstring d = strip_long_prefix(dir);
     while (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
     if (d.empty() || p.size() <= d.size()) return false;
-    if (!istarts_with(p, d)) return false;
+    if (!name_starts_with(p, d)) return false;
     return p[d.size()] == L'\\' || p[d.size()] == L'/';
 }
 
 bool same_path(const std::wstring& a, const std::wstring& b) {
-    return iequals_ascii(strip_long_prefix(full_path(a)), strip_long_prefix(full_path(b)));
+    return name_equals(strip_long_prefix(full_path(a)), strip_long_prefix(full_path(b)));
 }
 
 bool file_exists(const std::wstring& path) {

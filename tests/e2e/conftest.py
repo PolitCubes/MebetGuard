@@ -22,6 +22,29 @@ def pytest_addoption(parser):
                 help="run from awkward folders — copies of the guard and the JDK, the work dir (paths.py)")
 
 
+def _not_here(item, config):
+    """A test that cannot apply to this configuration at all — another OS, the dev_mode check
+    without --expect-dev-mode, a code-page test where the variant's folders fit the code page.
+    Deselected rather than skipped: with --no-skip a skip fails the run, and these are not tests
+    that could not run here by accident, but tests that are not about here."""
+    host = harness.host_os()
+    params = getattr(item, "callspec", None)
+    sc = params.params.get("sc") if params else None
+    if sc is not None:
+        return host not in sc["os"] or (sc["needs_dev_mode"] and not config.getoption("--expect-dev-mode"))
+    if item.path.name == "test_paths.py":
+        variant = config.getoption("--paths")
+        return host != "windows" or not variant or paths.beyond_name(variant) is None
+    return False
+
+
+def pytest_collection_modifyitems(config, items):
+    drop = [i for i in items if _not_here(i, config)]
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+        items[:] = [i for i in items if i not in drop]
+
+
 @pytest.fixture(scope="session")
 def ctx(request):
     guard = request.config.getoption("--guard")
@@ -40,6 +63,7 @@ def ctx(request):
         guard, java, work, native = layout.guard, layout.java, layout.work, layout.native
     c = harness.Ctx(guard, java, work, native)
     c.layout = layout
+    c.java_env = layout.java_env if layout else None
     if not c.guard.exists():
         pytest.fail("нет стража: %s" % c.guard)
     if not c.java.exists():

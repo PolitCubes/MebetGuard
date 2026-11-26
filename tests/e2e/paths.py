@@ -14,6 +14,14 @@ Variants (every OS):
               Windows: the guard's folder also so long that MebetGuard.dll is at 254 characters.
   beyond    — characters outside the Windows ANSI code page: an emoji, CJK, Cyrillic, "Ł" (which
               Windows quietly turns into "L").
+  ukrainian — "Ґанок Їжак Єнот іграшка": the letters Russian does not have (Ґ Є І Ї). In the
+              code page of Ukrainian and Russian Windows (1251), not in the CI runners' (1252).
+  latin     — German and Spanish: "Größe Straße Äpfel Übung ñandú Canción ¿Qué tal ¡Sí". In the
+              runners' code page: there they must work everywhere — guard, Java and client folder.
+
+On Windows the guard also gets JAVA_HOME with the letters of the variant's folders in the other case
+("äPFEL" for "Äpfel"): the same folder to Windows, and the guard compares paths as Windows does,
+not only ASCII letters.
 
 Who gets which characters. The guard's folder gets all of them: plain java never sees it, so the
 guard must work from it whatever its name (macOS: no "=" — the JVM cuts -agentpath:<path>=<options>
@@ -36,8 +44,10 @@ import os
 import shutil
 from pathlib import Path
 
-VARIANTS = ("cyrillic", "specials", "beyond")
+VARIANTS = ("cyrillic", "specials", "beyond", "ukrainian", "latin")
 CYRILLIC = "Игра Тест"
+UKRAINIAN = "Ґанок Їжак Єнот іграшка"
+LATIN = "Größe Straße Äpfel Übung ñandú Canción ¿Qué tal ¡Sí"
 BEYOND = "Игра 🎮 中文"              # an emoji is beyond every legacy code page
 LETTERS = ["Größe", "Türkçe", "Čeština", "Ελληνικά", "日本語", "中文", "Игра"]
 AGENT_LIB = {"windows": "MebetGuard.dll", "linux": "libMebetGuard.so", "macos": "libMebetGuard.dylib"}
@@ -93,6 +103,10 @@ def names(variant, host_os):
                     client="Client " + common + ("" if win else " ; $*?"))
     if variant == "beyond":
         return dict(guard=BEYOND + " Łódź страж", java=_or_own("Игра 中文", " java"), client=_or_own("Игра 中文", ""))
+    if variant == "ukrainian":
+        return dict(guard=UKRAINIAN + " охорона", java=_or_own(UKRAINIAN, " java"), client=_or_own(UKRAINIAN, ""))
+    if variant == "latin":
+        return dict(guard=LATIN + " Wächter", java=_or_own(LATIN, " java"), client=_or_own(LATIN, ""))
     raise ValueError("unknown --paths variant %r (%s)" % (variant, ", ".join(VARIANTS)))
 
 
@@ -100,7 +114,7 @@ def beyond_name(variant):
     """Windows: a folder name of the variant the ANSI code page cannot express, or None."""
     if ansi_code_page() is None:
         return None
-    name = {"cyrillic": CYRILLIC, "beyond": BEYOND}.get(variant)
+    name = {"cyrillic": CYRILLIC, "beyond": BEYOND, "ukrainian": UKRAINIAN, "latin": LATIN}.get(variant)
     return name if name and not fits(name) else None
 
 
@@ -123,14 +137,27 @@ def copy_java(src, dst):
     return dst
 
 
+def other_case(text):
+    """Every letter in the other case where that is one letter both ways ("Äpfel" → "äPFEL"); "ß", the
+    Turkish dotless "ı" and the like stay, so the name stays the same name to the file system."""
+    out = []
+    for c in text:
+        o = c.swapcase()
+        out.append(o if len(o) == 1 and o.swapcase() == c else c)
+    return "".join(out)
+
+
 class Layout:
-    def __init__(self, variant, guard, java, work, native, root, java_src):
+    def __init__(self, variant, guard, java, work, native, root, java_src, java_env=None):
         self.variant, self.guard, self.java, self.work, self.native = variant, guard, java, work, native
         self.root, self.java_src = root, java_src
+        self.java_env = java_env  # JAVA_HOME as handed to the game, when it differs from `java`
 
     def describe(self):
-        return "\n".join("  %-6s %s" % (k, v) for k, v in (("guard", self.guard), ("java", self.java),
-                                                          ("work", self.work), ("native", self.native)))
+        rows = [("guard", self.guard), ("java", self.java), ("work", self.work), ("native", self.native)]
+        if self.java_env:
+            rows.append(("JAVA_HOME", self.java_env))
+        return "\n".join("  %-9s %s" % (k, v) for k, v in rows)
 
 
 def relocate(variant, host_os, guard, java, root, native=None):
@@ -165,4 +192,7 @@ def relocate(variant, host_os, guard, java, root, native=None):
         (work / "native").mkdir(exist_ok=True)
         native_copy = work / "native" / native.name
         shutil.copy2(native, native_copy)
-    return Layout(variant, gdir / guard.name, java_copy, work, native_copy, root, java)
+    # Windows: JAVA_HOME in the other case — the same folder to Windows (and to plain java, which
+    # does not read it), and the guard must find it the same.
+    java_env = str(root / other_case(n["java"])) if host_os == "windows" else None
+    return Layout(variant, gdir / guard.name, java_copy, work, native_copy, root, java, java_env)

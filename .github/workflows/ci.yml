@@ -132,7 +132,7 @@ jobs:
     needs: build-windows-binaries
     name: windows ${{ matrix.arch }} ${{ matrix.feature }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: ${{ matrix.timeout || 25 }}
     strategy:
       fail-fast: false
       matrix:
@@ -170,15 +170,31 @@ jobs:
           - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
           # the prod build must close on a dev-mode runner (203)
           - { feature: dev_mode, variant: prod, extra: "--expect-dev-mode" }
-          # Awkward paths (tests/e2e/paths.py): the layers again, with the guard, a copy of the JDK
-          # and the client folder in folders players have — one job per variant. test_paths.py adds
-          # the folders plain java itself cannot use on this runner's ANSI code page (1252).
-          - { arch: x64, feature: paths-cyrillic, extra: "--paths cyrillic", runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie,
-              select: "clean_launch or trusted_native_load or module_trust_load or jvm_agent_module or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath or beyond_code_page" }
-          - { arch: x64, feature: paths-specials, extra: "--paths specials", runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie,
-              select: "clean_launch or trusted_native_load or module_trust_load or jvm_agent_module or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
-          - { arch: x64, feature: paths-beyond, extra: "--paths beyond", runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie,
-              select: "clean_launch or trusted_native_load or module_trust_load or jvm_agent_module or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath or beyond_code_page" }
+          # Awkward paths (tests/e2e/paths.py): every scenario again, with the guard, a copy of the JDK
+          # and the client folder in folders players have — Cyrillic, Ukrainian, German and Spanish
+          # letters, shell specials, and characters beyond the ANSI code page. Two jobs per variant
+          # (the long scenarios apart), each with the usual --no-skip. test_paths.py adds the folders
+          # plain java itself cannot use on the runner's code page (1252).
+          - { arch: x64, feature: paths-cyrillic-quick, extra: "--paths cyrillic", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-cyrillic-long, extra: "--paths cyrillic", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-ukrainian-quick, extra: "--paths ukrainian", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-ukrainian-long, extra: "--paths ukrainian", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-latin-quick, extra: "--paths latin", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-latin-long, extra: "--paths latin", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-specials-quick, extra: "--paths specials", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-specials-long, extra: "--paths specials", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-beyond-quick, extra: "--paths beyond", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-beyond-long, extra: "--paths beyond", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
         # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
         # attacks cannot exist there.
         exclude:
@@ -266,7 +282,7 @@ jobs:
     needs: build-linux-binaries
     name: linux ${{ matrix.arch }} ${{ matrix.feature }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.timeout || 15 }}
     strategy:
       fail-fast: false
       matrix:
@@ -276,13 +292,12 @@ jobs:
         include:
           - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
           - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
-          # Awkward paths (tests/e2e/paths.py), one job per variant
-          - { arch: x64, feature: paths-cyrillic, extra: "--paths cyrillic", runner: ubuntu-24.04, dir: x86-64-linux,
-              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
-          - { arch: x64, feature: paths-specials, extra: "--paths specials", runner: ubuntu-24.04, dir: x86-64-linux,
-              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
-          - { arch: x64, feature: paths-beyond, extra: "--paths beyond", runner: ubuntu-24.04, dir: x86-64-linux,
-              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          # Awkward paths (tests/e2e/paths.py): every scenario of the OS again, one job per variant
+          - { arch: x64, feature: paths-cyrillic, extra: "--paths cyrillic", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-ukrainian, extra: "--paths ukrainian", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-latin, extra: "--paths latin", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-specials, extra: "--paths specials", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-beyond, extra: "--paths beyond", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -306,7 +321,7 @@ jobs:
     needs: build-macos-binaries
     name: macos ${{ matrix.arch }} ${{ matrix.feature }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.timeout || 15 }}
     strategy:
       fail-fast: false
       matrix:
@@ -316,13 +331,12 @@ jobs:
         include:
           - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
           - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
-          # Awkward paths (tests/e2e/paths.py), one job per variant
-          - { arch: arm64, feature: paths-cyrillic, extra: "--paths cyrillic", runner: macos-15, dir: arm64-macosx,
-              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
-          - { arch: arm64, feature: paths-specials, extra: "--paths specials", runner: macos-15, dir: arm64-macosx,
-              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
-          - { arch: arm64, feature: paths-beyond, extra: "--paths beyond", runner: macos-15, dir: arm64-macosx,
-              select: "clean_launch or env_hardening_jto or env_hardening_jdk or jvm_agents_javaagent or jvm_agents_agentpath" }
+          # Awkward paths (tests/e2e/paths.py): every scenario of the OS again, one job per variant
+          - { arch: arm64, feature: paths-cyrillic, extra: "--paths cyrillic", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-ukrainian, extra: "--paths ukrainian", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-latin, extra: "--paths latin", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-specials, extra: "--paths specials", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-beyond, extra: "--paths beyond", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

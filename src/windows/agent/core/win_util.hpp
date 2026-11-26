@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "nt.hpp"
@@ -36,6 +37,11 @@ std::wstring env(const wchar_t* name);
 std::wstring dir_of(const std::wstring& path);
 std::wstring file_name_of(const std::wstring& path);
 std::wstring full_path(const std::wstring& path);  // GetFullPathNameW, no trailing separator
+// Equal as Windows compares file names: case-insensitively for every letter, not only ASCII.
+// "C:\Ігри" and "C:\ігри", "Äpfel" and "äpfel" are one folder; an ASCII-only compare made a
+// JAVA_HOME typed in another case than its folder a path outside the client Java.
+bool name_equals(std::wstring_view a, std::wstring_view b);
+bool name_starts_with(std::wstring_view s, std::wstring_view prefix);
 bool path_under(const std::wstring& path, const std::wstring& dir);  // case-insensitive
 bool same_path(const std::wstring& a, const std::wstring& b);
 bool file_exists(const std::wstring& path);

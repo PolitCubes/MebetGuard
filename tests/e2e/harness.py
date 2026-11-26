@@ -112,6 +112,7 @@ class Ctx:
         self.admin = bool(winpriv and winpriv.is_admin())
         self.no_skip = False
         self.expect_dev_mode = False  # --expect-dev-mode: a release build on a dev-mode machine
+        self.java_env = None          # JAVA_HOME as handed to the game, when not java_home itself (paths.py)
 
     def tool(self, name):
         return self.java_home / "bin" / (name + EXE)
@@ -279,7 +280,7 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
     """mode 'baseline' uses plain java; 'guarded' uses the guard wrapper. game / other are the
     privilege levels ("user" / "admin", Windows) of the game and of the probing program."""
     env = os.environ.copy()
-    env["JAVA_HOME"] = str(ctx.java_home)
+    env["JAVA_HOME"] = str(ctx.java_env or ctx.java_home)
     env["MEBET_TEST_NO_UI"] = "1"
     if extra_env:
         env.update(extra_env)

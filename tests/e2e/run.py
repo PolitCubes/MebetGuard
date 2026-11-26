@@ -44,6 +44,7 @@ def main():
         guard, java, work, native = layout.guard, layout.java, layout.work, layout.native
     ctx = harness.Ctx(guard, java, work, native)
     ctx.expect_dev_mode = a.expect_dev_mode
+    ctx.java_env = layout.java_env if a.paths else None
     if not ctx.guard.exists():
         sys.exit("guard not found: " + str(ctx.guard))
     if not ctx.java.exists():

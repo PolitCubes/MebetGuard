@@ -240,7 +240,7 @@ std::string anonymize(const std::wstring& path) {
     if (!p.ready) build_prefixes(p);
     std::wstring out = path;
     for (const auto& kv : p.list) {
-        if (out.size() >= kv.first.size() && istarts_with(out, kv.first) &&
+        if (out.size() >= kv.first.size() && win::name_starts_with(out, kv.first) &&
             (out.size() == kv.first.size() || out[kv.first.size()] == L'\\' || out[kv.first.size()] == L'/')) {
             out = kv.second + out.substr(kv.first.size());
             break;
