@@ -2,6 +2,7 @@
 // Copyright (c) 2026 PolitCubes
 #include "trust/file_identity.hpp"
 
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 
 namespace mebet::trust {
@@ -83,6 +84,7 @@ std::wstring final_path(HANDLE file) {
 }
 
 HANDLE open_read(const std::wstring& path) {
+    watchdog::SlowWork slow;  // an open can wait on a slow or unreachable disk
     return CreateFileW(win::exact_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 }

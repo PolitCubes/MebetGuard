@@ -35,4 +35,10 @@ bool find(std::uintptr_t addr, Owner* out = nullptr);
 bool covers(std::uintptr_t begin, std::uintptr_t end);
 bool overlaps(std::uintptr_t begin, std::uintptr_t end);
 
+// A hooked call is between its real call and its record. The sweep gives memory it finds
+// unrecorded a little longer while any is (scans.cpp, still_there); it never waits on it for good.
+void op_begin();
+void op_end();
+bool ops_in_flight();
+
 }  // namespace mebet::exec

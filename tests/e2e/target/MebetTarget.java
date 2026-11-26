@@ -9,6 +9,9 @@
 //
 // Observability the oracle in run.py relies on (every line flushed):
 //   "TARGET up pid=<n>"      — the JVM reached main()
+//   "TARGET env <NAME> set|unset" — whether JAVA_TOOL_OPTIONS / JDK_JAVA_OPTIONS reached the game.
+//                              The proof of env_hardening: through the guard they must be gone,
+//                              whether or not this launch path would have read them.
 //   "TARGET alive <i>"       — heartbeat i (the app is still running)
 //   "TARGET action: <a>"     — the in-process action is about to run: the game got that far.
 //                              A close before this line was not about the action at all.
@@ -32,6 +35,9 @@ public class MebetTarget {
     public static void main(String[] args) throws Exception {
         long pid = ProcessHandle.current().pid();
         System.out.println("TARGET up pid=" + pid);
+        for (String name : new String[] {"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS"}) {
+            System.out.println("TARGET env " + name + (System.getenv(name) != null ? " set" : " unset"));
+        }
         System.out.flush();
 
         String cmdFile = System.getProperty("mebet.cmd", "");

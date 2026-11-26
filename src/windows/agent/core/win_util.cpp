@@ -5,6 +5,7 @@
 #include <cwchar>
 #include <utility>
 
+#include "core/watchdog.hpp"
 #include "strings.hpp"
 
 namespace mebet::win {
@@ -205,7 +206,7 @@ std::wstring final_name(HANDLE h, DWORD flags) {
 // A file or folder opened only to ask for its name: no data access, so share modes do not stand
 // in the way of a file the loader has mapped.
 HANDLE open_for_name(const std::wstring& path) {
-    return CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+    return CreateFileW(exact_path(path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
 }
 
@@ -213,6 +214,7 @@ HANDLE open_for_name(const std::wstring& path) {
 // "C:\Mount\Data" for a volume mounted only into a folder; empty when it has none. Asked through
 // the volume's root folder, so WOW64 never redirects it.
 std::wstring ask_dos_root_of_volume(const std::wstring& device) {
+    watchdog::SlowWork slow;  // the open can wait on the device
     const HANDLE h = open_for_name(L"\\\\?\\GLOBALROOT" + device + L"\\");
     if (h == INVALID_HANDLE_VALUE) return std::wstring();
     std::wstring root = strip_long_prefix(final_name(h, FILE_NAME_OPENED | VOLUME_NAME_DOS));
@@ -332,6 +334,18 @@ std::wstring exact_path(const std::wstring& path) {
     if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') return L"\\\\?\\" + path;
     if (path.compare(0, 2, L"\\\\") == 0) return L"\\\\?\\UNC\\" + path.substr(2);
     return path;
+}
+
+std::size_t image_extent(std::uintptr_t base) {
+    std::uintptr_t pos = base;
+    for (int guard_count = 0; guard_count < 65536; ++guard_count) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(reinterpret_cast<void*>(pos), &m, sizeof(m)) || m.Type != MEM_IMAGE ||
+            reinterpret_cast<std::uintptr_t>(m.AllocationBase) != base)
+            break;
+        pos = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+    }
+    return pos - base;
 }
 
 std::wstring canonical_path(const std::wstring& path) {

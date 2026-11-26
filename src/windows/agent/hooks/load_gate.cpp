@@ -168,7 +168,8 @@ VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data,
     timing::Scope scope(config::Module::module_trust);
     const trust::Decision d = trust::decide_path(path);
     if (d.verdict.allowed) {
-        modules::add(base, data->SizeOfImage, d.verdict.trust, d.facts.path);
+        // The size the kernel has mapped, not the one in the loader's data.
+        if (const std::size_t extent = win::image_extent(base)) modules::add(base, extent, d.verdict.trust, d.facts.path);
         report_inventory(d);
     } else {
         deny_module(d, d.verdict.reason, "loader_notification");
@@ -252,8 +253,12 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         return true;
     }
     // Any other image section (created before the hooks, by NtCreateSectionEx, or handed
-    // over from another process): judge the file that is actually mapped.
+    // over from another process): judge the file that is actually mapped. That can take seconds
+    // on a cold disk, and the sweep must not take the view for an image mapped around the loader
+    // meanwhile: until the verdict it is in the table — as untrusted, so nothing in it counts as
+    // allowed code.
     const std::wstring path = win::mapped_file_name(base);
+    modules::add(b, size, trust::Trust::unknown, path);
     trust::Decision d;
     {
         timing::Scope scope(config::Module::module_trust);
@@ -269,6 +274,7 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         modules::add(b, size, trust::Trust::unknown, d.facts.path);
         return true;
     }
+    modules::remove(b);  // the caller unmaps the view
     return false;
 }
 

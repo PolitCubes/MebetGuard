@@ -21,7 +21,7 @@ import pytest
 import harness
 
 SIDES = {"baseline": "без гварда", "guarded": "через гвард"}
-LEVEL = {"user": "пользователь", "admin": "админ"}
+LEVEL = {"user": "пользователь", "admin": "админ", "admin_nodebug": "админ без SeDebugPrivilege"}
 CASES = [(sc, v, side) for sc in harness.SCENARIOS for v in harness.variants(sc) for side in SIDES]
 IDS = ["-".join(x for x in (sc["id"], side, harness.variant_id(v)) if x) for sc, v, side in CASES]
 EVIDENCE = re.compile(r"TARGET (did|froze|killed|called|foreign|action-failed)|\[Mebet\] closed|PROBE ")

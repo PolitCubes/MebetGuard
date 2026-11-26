@@ -13,6 +13,7 @@
 #include "config.hpp"
 #include "core/exec_table.hpp"
 #include "core/module_table.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "hooks/load_gate.hpp"
 #include "json_writer.hpp"
@@ -95,6 +96,8 @@ struct VersionStrings {
 VersionStrings version_strings(const std::wstring& path) {
     gate::OwnReadScope own;  // GetFileVersionInfo maps the file; it may be the refused one
     VersionStrings v;
+    // GetFileVersionInfo trims a dot or a space at the end of a name and would read another file.
+    if (win::exact_path(path) != path) return v;
     DWORD dummy = 0;
     const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);
     if (!size || size > (4u << 20)) return v;
@@ -169,7 +172,7 @@ PeFacts pe_facts(const std::wstring& path) {
 }
 
 bool dir_writable(const std::wstring& dir) {
-    HANDLE h = CreateFileW(dir.c_str(), FILE_ADD_FILE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    HANDLE h = CreateFileW(win::exact_path(dir).c_str(), FILE_ADD_FILE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     CloseHandle(h);
@@ -299,6 +302,7 @@ std::string file_label(const trust::Decision& d) {
 }
 
 std::string file_card_json(const trust::Decision& d) {
+    watchdog::SlowWork slow;  // the folder, the headers and the version strings: each an open of its own
     const trust::FileFacts& f = d.facts;
     JsonWriter w;
     w.begin_object();

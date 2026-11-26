@@ -424,6 +424,7 @@ void report_drivers() {
     unsigned listed = 0;
     for (const auto& kernel_path : kernel_modules()) {
         if (listed >= config::kLimit_list_items) break;
+        if (guard::closing()) return;  // a close is pending: it must not wait for this report
         watchdog::worker_beat();  // a signature and a hash per driver: minutes on a slow disk
         const std::wstring path = kernel_path_to_dos(kernel_path);
         const trust::Decision d = trust::decide_path(path);

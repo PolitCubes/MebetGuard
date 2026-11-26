@@ -114,6 +114,7 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
         req = execguard::find_requester();
         if (!execguard::may_create_exec(req, "NtMapViewOfSection", 0, view_size ? *view_size : 0)) return kAccessDenied;
     }
+    exec::op_begin();
     const NTSTATUS s =
         real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit, allocation, protect);
     if (nt::ok(s) && base && *base && view_size) {
@@ -121,12 +122,14 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
             if (!gate::on_image_view(section, *base, *view_size)) {
                 real_NtUnmapViewOfSection(process, *base);
                 *base = nullptr;
+                exec::op_end();
                 return kAccessDenied;
             }
         } else if (execguard::executable(protect)) {
             execguard::record(reinterpret_cast<std::uintptr_t>(*base), *view_size, req, exec::Source::map);
         }
     }
+    exec::op_end();
     return s;
 }
 
@@ -170,10 +173,12 @@ NTSTATUS NTAPI hook_NtAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_P
     if (!execguard::may_create_exec(req, "NtAllocateVirtualMemory", base && *base ? reinterpret_cast<std::uintptr_t>(*base) : 0,
                                     size ? *size : 0))
         return kAccessDenied;
+    exec::op_begin();
     const NTSTATUS s = real_NtAllocateVirtualMemory(process, base, zero_bits, size, type, protect);
     if (nt::ok(s) && base && *base && size) {
         execguard::record(reinterpret_cast<std::uintptr_t>(*base), *size, req, exec::Source::allocate);
     }
+    exec::op_end();
     return s;
 }
 
@@ -200,8 +205,10 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
     }
     const execguard::Requester req = execguard::find_requester();
     if (!execguard::may_create_exec(req, "NtProtectVirtualMemory", addr, *size)) return kAccessDenied;
+    exec::op_begin();
     const NTSTATUS s = real_NtProtectVirtualMemory(process, base, size, protect, old);
     if (nt::ok(s)) execguard::record(reinterpret_cast<std::uintptr_t>(*base), *size, req, exec::Source::protect);
+    exec::op_end();
     return s;
 }
 

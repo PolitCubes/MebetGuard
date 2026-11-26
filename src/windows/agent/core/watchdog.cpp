@@ -63,12 +63,17 @@ std::atomic<HANDLE> g_watchdog{nullptr};
 std::atomic<HANDLE> g_watchdog_own{nullptr};
 std::atomic<bool> g_watchdog_created{false};
 std::atomic<std::uint64_t> g_created_at{0};  // when start() ran: the clock of threads that have not beaten yet
-// Set by the worker on its own thread. Not its thread id: Windows hands the id of a thread that
-// has ended to the next new thread, and that thread would then beat for a dead worker.
-thread_local bool t_worker = false;
+// The worker's thread id, set by the worker itself. No TLS: SlowWork and worker_beat run on any
+// thread, also in a loader callback on a thread that has no TLS block yet or any more. Windows
+// may hand the id of a thread that has ended to a new one, which would then beat for a dead
+// worker: wherever that matters, an ended worker is told by its handle first.
+std::atomic<DWORD> g_worker_tid{0};
 std::atomic<int> g_worker_slow{0};  // SlowWork scopes open on the worker
 std::atomic<bool> g_ending{false};
-std::atomic<bool> g_told{false};  // report level: one report, the game keeps running
+// Report level: one report from each side (the watchdog about the worker, the worker about the
+// watchdog); the game keeps running.
+std::atomic<bool> g_told_by_watchdog{false};
+std::atomic<bool> g_told_by_worker{false};
 // Time the watchdog thread has witnessed the process running (see witnessed_100ns); 0 = not started.
 std::atomic<std::uint64_t> g_witnessed{0};
 // What the hooks themselves have witnessed (see hook_witnessed).
@@ -135,9 +140,19 @@ bool silent(const std::atomic<std::uint64_t>& beat, std::uint64_t now, std::uint
     return created && now > created && now - created > kStartMax;
 }
 
-// "[Mebet] closed: <id> (code <n>) <what>\n" without the CRT: the thread that froze the guard
-// may hold the stdio or heap lock.
+// A whole close may take this long once it has started: the reason window (it closes itself
+// after close_window_max_ms, guard.cpp), the report, and a margin. Past that the worker is stuck
+// somewhere in the close, and the watchdog ends the process with the code of the close.
+std::uint64_t close_budget() {
+    return (static_cast<std::uint64_t>(config::opt::close_window_max_ms) + config::opt::close_report_wait_ms + 10000) * kMs;
+}
+
+// The close line, "[Mebet] closed: <id> (code <n>) <what>\n", without the CRT: the thread that
+// froze the guard may hold the stdio or heap lock. Written once, by whoever claims it first.
+std::atomic<bool> g_line_claimed{false};
+
 void write_close_line(const char* id, int code, const char* what) {
+    if (g_line_claimed.exchange(true)) return;
     char line[256];
     std::size_t n = 0;
     auto put = [&](const char* s) {
@@ -169,43 +184,68 @@ void write_close_line(const char* id, int code, const char* what) {
     for (;;) Sleep(INFINITE);
 }
 
-report::Event stalled_event(const char* what) {
+report::Event stalled_event(const char* what, bool closes) {
     report::Event ev;
-    ev.type = "close.guard_stalled";
-    ev.level = report::Level::error;
-    ev.title = std::string("Closed: guard thread stopped (") + what + ")";
-    ev.fingerprint = {"close.guard_stalled", what};
+    ev.type = closes ? "close.guard_stalled" : "report.guard_stalled";
+    ev.level = closes ? report::Level::error : report::Level::warning;
+    ev.title = std::string(closes ? "Closed: " : "Signal: ") + "guard thread stopped (" + what + ")";
+    ev.fingerprint = {ev.type, what};
     ev.tags.emplace_back("reason", "guard_stalled");
+    if (!closes) ev.tags.emplace_back("module", config::module(config::Module::guard_watchdog).id);
     return ev;
 }
 
-// The last words of a guard that ends the process itself: the line for the launcher log and,
-// when asked, the report. Each of them can block for good — stderr is a console somebody is
-// selecting text in, building the report takes the heap lock and sending it the lock of the
-// reporter, and the thread that was frozen may hold either. The watchdog used to do all of that
-// itself before the kill: blocked there, it never killed, and every other thread that noticed
-// the stall then waited for it forever. So the words are said by a thread of their own, started
-// together with the watchdog and parked until needed; whoever ends the process only wakes it,
-// waits a limited time and kills. Nothing on that path allocates or takes a lock.
+// The last words of a guard that ends the process itself: the line for the launcher log and the
+// report. Each of them can block for good — stderr is a console somebody is selecting text in,
+// building the report takes the heap lock and sending it the lock of the reporter, and the thread
+// that was frozen may hold either. The watchdog used to do all of that itself before the kill:
+// blocked there, it never killed, and every other thread that noticed the stall then waited for
+// it forever. So the words are said by a thread of their own, started together with the watchdog
+// and parked until needed; whoever ends the process only wakes it, waits a limited time and
+// kills. Nothing on that path allocates or takes a lock. The same thread sends the one report of
+// the report level: given to the worker, it would wait for the very thread that stalled.
+enum class Report : unsigned char {
+    none,     // the line only
+    stalled,  // guard_stalled
+    pending,  // the report of the pending close, unless the close has sent it already
+};
 struct LastWords {
     const char* id = "";
     const char* what = "";
     int code = 0;
-    bool report = false;
+    Report report = Report::none;
 };
 LastWords g_words;        // written once by the thread that won g_ending, before g_say is set
-HANDLE g_say = nullptr;   // wakes the last-words thread
+HANDLE g_say = nullptr;   // wakes the last-words thread for the end
 HANDLE g_said = nullptr;  // it has finished
+HANDLE g_tell = nullptr;  // wakes it for the report of the report level
+std::atomic<const char*> g_tell_what{nullptr};
 
 DWORD WINAPI last_words_main(void*) {
-    WaitForSingleObject(g_say, INFINITE);
-    write_close_line(g_words.id, g_words.code, g_words.what);
-    if (g_words.report) report::Reporter::instance().send_now(stalled_event(g_words.what), 1500);
-    SetEvent(g_said);
-    for (;;) Sleep(INFINITE);  // the caller ends the process
+    const HANDLE wake[2] = {g_say, g_tell};  // the end first when both are set
+    for (;;) {
+        const DWORD r = WaitForMultipleObjects(2, wake, FALSE, INFINITE);
+        if (r == WAIT_OBJECT_0) {
+            const LastWords words = g_words;
+            write_close_line(words.id, words.code, words.what);
+            if (words.report == Report::stalled) {
+                report::Reporter::instance().send_now(stalled_event(words.what, true), 1500);
+            } else if (words.report == Report::pending) {
+                guard::send_pending_close_report(1500);
+            }
+            SetEvent(g_said);
+            for (;;) Sleep(INFINITE);  // the caller ends the process
+        }
+        if (r == WAIT_OBJECT_0 + 1) {
+            if (const char* what = g_tell_what.exchange(nullptr))
+                report::Reporter::instance().send_now(stalled_event(what, false), 1500);
+            continue;
+        }
+        Sleep(1000);  // the wait failed: do not spin
+    }
 }
 
-[[noreturn]] void end_process(const char* id, const char* what, int code, bool try_report) {
+[[noreturn]] void end_process(const char* id, const char* what, int code, Report report) {
     bool expected = false;
     if (!g_ending.compare_exchange_strong(expected, true)) {
         // Another thread is ending the process — unless it was stopped half-way: give it the
@@ -216,10 +256,19 @@ DWORD WINAPI last_words_main(void*) {
     g_words.id = id;
     g_words.what = what;
     g_words.code = code;
-    g_words.report = try_report;
+    g_words.report = report;
+    bool said = false;
     if (g_say && g_said) {
         SetEvent(g_say);
-        WaitForSingleObject(g_said, try_report ? kLastWordsReportMs : kLastWordsLineMs);
+        said = WaitForSingleObject(g_said, report == Report::none ? kLastWordsLineMs : kLastWordsReportMs) == WAIT_OBJECT_0;
+    }
+    if (!said) {
+        // The last-words thread did not answer. It starts in the guard module, so whoever froze or
+        // killed the guard's threads got it too — exactly when the launcher log needs the line.
+        // Written from here when stderr is a pipe or a file; a console can be held by a selection
+        // and would hold the kill with it.
+        const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+        if (err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_CHAR) write_close_line(id, code, what);
     }
     kill_process(code);
 }
@@ -227,23 +276,23 @@ DWORD WINAPI last_words_main(void*) {
 void on_stall(const char* what, bool try_report) {
     if (config::closes(config::Module::guard_watchdog)) {
         end_process(config::reason(config::Reason::guard_stalled).id, what,
-                    config::reason(config::Reason::guard_stalled).exit_code, try_report);
+                    config::reason(config::Reason::guard_stalled).exit_code, try_report ? Report::stalled : Report::none);
     }
-    if (try_report && !g_told.exchange(true)) guard::defer_event(stalled_event(what));  // report level
+    // Report level: one report, sent by the last-words thread.
+    if (try_report && g_tell && !g_told_by_watchdog.exchange(true)) {
+        g_tell_what.store(what);
+        SetEvent(g_tell);
+    }
 }
 
 // A close is pending and nobody is left to carry it out, or it was not finished in time: the
-// process ends with the code of that close. Never with 0 — a launcher reads 0 as a normal exit.
+// process ends with the code of that close, and with its report if the close has not sent it.
+// Never with 0 — a launcher reads 0 as a normal exit.
 [[noreturn]] void end_pending_close(const char* what) {
     const int pending = guard::pending_exit_code();
-    end_process("pending_close", what, pending ? pending : config::reason(config::Reason::guard_stalled).exit_code, false);
+    end_process("pending_close", what, pending ? pending : config::reason(config::Reason::guard_stalled).exit_code,
+                Report::pending);
 }
-
-// The whole close — the reason window included — may take this long. The worker shows the window
-// and waits for the player; the game is hidden but its threads still run behind it, and nothing
-// else of the guard works meanwhile. A window nobody dismisses (covered, hidden by code in the
-// process, a player who walked away) used to keep that state for good.
-std::uint64_t close_max() { return static_cast<std::uint64_t>(config::opt::close_window_max_ms) * kMs; }
 
 HANDLE query_copy(HANDLE t) {
     HANDLE out = nullptr;
@@ -257,7 +306,7 @@ DWORD WINAPI watchdog_main(void*) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     Witness worker;
     std::uint64_t previous = now_100ns();
-    std::uint64_t closing_for = 0;
+    std::uint64_t running_for = 0;  // witnessed time since the close itself started
     g_witnessed.store(1, std::memory_order_relaxed);
     for (;;) {
         const std::uint64_t now = now_100ns();
@@ -272,19 +321,29 @@ DWORD WINAPI watchdog_main(void*) {
 
         const HANDLE w = g_worker.load(std::memory_order_acquire);
         worker.look(now, g_beat_worker.load(std::memory_order_relaxed), suspended(w) == 1, kWatchdogStep);
-        if (!guard::closing()) {
-            const bool slow = g_worker_slow.load(std::memory_order_relaxed) > 0;
-            if (ended(w)) on_stall("worker thread ended", true);
-            if (worker.frozen >= kFrozenMin) on_stall("worker thread suspended", true);
-            if (worker.silent > (slow ? kWorkerSlowMax : kWorkerSilentMax)) on_stall("worker thread silent", true);
-            if (worker.unstarted > kStartMax) on_stall("worker thread did not start", true);
+        const bool closing = guard::closing();
+        const bool dead = ended(w), frozen = worker.frozen >= kFrozenMin;
+        // A close is pending and the worker carries it out. Frozen or killed before or in the
+        // middle of it, it would leave the game running behind that close: end it with the code
+        // of the close.
+        if (closing && (dead || frozen)) end_pending_close("worker thread stopped during the close");
+        if (dead) on_stall("worker thread ended", true);
+        if (frozen) on_stall("worker thread suspended", true);
+        if (guard::close_running()) {
+            // The close itself has started. The worker does not beat while the reason window is
+            // open, so its silence says nothing now; the close has a time limit instead. It used
+            // to start counting when the close was requested — a worker in the middle of a long
+            // task reached the close a minute later and was ended before it had sent the report
+            // or shown the window.
+            running_for += dt;
+            if (running_for > close_budget()) end_pending_close("the close was not finished in time");
         } else {
-            // A close is pending and the worker carries it out. Frozen or killed in the middle,
-            // it would leave the game running behind that close: end it with the code of the
-            // close. The same when the close is not finished in time.
-            closing_for += dt;
-            if (ended(w) || worker.frozen >= kFrozenMin) end_pending_close("worker thread stopped during the close");
-            if (closing_for > close_max()) end_pending_close("the close was not finished in time");
+            // Before the close starts the worker beats as always — while it finishes its task.
+            const bool slow = g_worker_slow.load(std::memory_order_relaxed) > 0;
+            const bool too_silent = worker.silent > (slow ? kWorkerSlowMax : kWorkerSilentMax);
+            if (too_silent && closing) end_pending_close("worker thread silent before the close");
+            if (too_silent) on_stall("worker thread silent", true);
+            if (worker.unstarted > kStartMax) on_stall("worker thread did not start", true);
         }
         Sleep(kTickMs);
     }
@@ -365,7 +424,8 @@ void start(HANDLE worker) {
     // The last-words thread first: a stall found a moment later already has it.
     g_say = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_said = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (g_say && g_said) {
+    g_tell = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_say && g_said && g_tell) {
         if (HANDLE t = CreateThread(nullptr, 0, &last_words_main, nullptr, 0, nullptr)) CloseHandle(t);
     }
     // The watchdog thread makes itself known (handle, first beat) once it runs. It used to be
@@ -390,13 +450,12 @@ void start(HANDLE worker) {
 }
 
 void worker_started() {
-    t_worker = true;
+    g_worker_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
     g_beat_worker.store(now_100ns(), std::memory_order_relaxed);
 }
 
 void worker_tick() {
     static Witness watchdog;  // the worker thread only
-    t_worker = true;
     const std::uint64_t now = now_100ns();
     g_beat_worker.store(now, std::memory_order_relaxed);
     if (!g_watchdog_created.load(std::memory_order_acquire)) return;
@@ -411,16 +470,16 @@ void worker_tick() {
     else if (watchdog.unstarted > kStartMax) what = "watchdog thread did not start";
     if (!what) return;
     // Report level: one report, not one on every loop (each of them wakes this loop again).
-    if (!config::closes(config::Module::guard_watchdog) && g_told.exchange(true)) return;
-    guard::signal(config::Module::guard_watchdog, config::Reason::guard_stalled, win::wide(what), stalled_event(what));
+    if (!config::closes(config::Module::guard_watchdog) && g_told_by_worker.exchange(true)) return;
+    guard::signal(config::Module::guard_watchdog, config::Reason::guard_stalled, win::wide(what), stalled_event(what, true));
 }
 
 void worker_beat() {
-    if (!t_worker) return;
+    if (GetCurrentThreadId() != g_worker_tid.load(std::memory_order_relaxed)) return;
     g_beat_worker.store(now_100ns(), std::memory_order_relaxed);
 }
 
-SlowWork::SlowWork() : on_worker_(t_worker) {
+SlowWork::SlowWork() : on_worker_(GetCurrentThreadId() == g_worker_tid.load(std::memory_order_relaxed)) {
     if (!on_worker_) return;
     g_beat_worker.store(now_100ns(), std::memory_order_relaxed);
     g_worker_slow.fetch_add(1, std::memory_order_relaxed);
@@ -442,35 +501,39 @@ void check_from_hook() {
     const std::uint64_t now = now_100ns();
     if (config::kTestBuild) trace_hook(now, g_worker.load(std::memory_order_acquire), watchdog, guard::closing());
     if (!silent(g_beat_watchdog, now, kWatchdogSilentMax)) return;  // the fast path
-    if (!silent(g_beat_worker, now, kWatchdogSilentMax)) return;      // the worker deals with it
+    const HANDLE worker = g_worker.load(std::memory_order_acquire);
+    // The worker deals with it — if it is the worker that beats: an ended worker's id may beat
+    // for it from a new thread.
+    if (!silent(g_beat_worker, now, kWatchdogSilentMax) && !ended(worker)) return;
     if (guard::shutting_down() || (g_dll_shutdown && g_dll_shutdown())) return;
     // Both beats are old. They are just as old right after the whole process was held (Suspend
     // in a task manager), when this thread happens to run before the guard threads do — and
     // those beat again within a moment. Threads somebody stopped stay stopped: look twice.
-    const HANDLE worker = g_worker.load(std::memory_order_acquire);
     auto beats = [] {
         return g_beat_worker.load(std::memory_order_relaxed) + g_beat_watchdog.load(std::memory_order_relaxed);
     };
     const std::uint64_t seen = beats();
     if (guard::closing()) {
         // A close is pending and the watchdog thread, which would end a close that hangs, is
-        // silent. The worker carries the close out and does not beat while the reason window is
-        // open, so its silence says nothing: only a worker that is stopped leaves nobody. (The
-        // process used to end here as soon as both beats were 8 s old — the reason window of a
-        // close caused by the watchdog thread itself vanished after 8 seconds.) A worker that
-        // is alive keeps its time limit, counted by the hooks.
+        // silent. A worker that is stopped leaves nobody to carry the close out. A worker that is
+        // alive gets the limit the watchdog would give it: the close's own once it has started
+        // (the worker does not beat while the reason window is open — the process used to end
+        // here as soon as both beats were 8 s old, and the window of a close caused by the
+        // watchdog thread itself vanished after 8 seconds), its slow-work limit before that.
         if (stopped(worker)) {
             Sleep(kHookSecondLookMs);
             if (stopped(worker)) end_pending_close("guard threads stopped during the close");
             return;
         }
-        if (hook_witnessed(~seen, now) > close_max()) end_pending_close("the close was not finished in time");
+        const std::uint64_t limit = guard::close_running() ? close_budget() : kWorkerSlowMax;
+        if (hook_witnessed(~seen, now) > limit) end_pending_close("the close was not finished in time");
         return;
     }
     if (!config::closes(config::Module::guard_watchdog)) return;
-    if (stopped(worker) && stopped(watchdog)) {
+    if (stopped(worker) && (!watchdog || stopped(watchdog))) {
         Sleep(kHookSecondLookMs);
-        if (stopped(worker) && stopped(watchdog) && beats() == seen) on_stall("both guard threads silent", false);
+        if (stopped(worker) && (!watchdog || stopped(watchdog)) && beats() == seen)
+            on_stall("both guard threads silent", false);
         return;
     }
     // Neither ended nor visibly suspended (before Windows 8.1 the suspend count cannot be asked

@@ -67,8 +67,9 @@ python tests/e2e/run.py --guard <MebetGuard> --java <JAVA_HOME> [--only id,id]
 2. e2e      (каждая — после сборки своей ОС; джоб на архитектуру × фичу)
             Matrix: e2e-windows   x64 · x86 · arm64  ×  каждый сценарий из harness.SCENARIOS для Windows
                                   (на x86 — без сценариев FFM)
-            Matrix: e2e-linux     x64 · arm64  ×  env_hardening_jto · env_hardening_jdk ·
-                                  jvm_agents_javaagent · jvm_agents_agentpath
+            Matrix: e2e-linux     x64 · arm64  ×  clean_launch · thread_churn · jit_hot · ffm_benign ·
+                                  env_hardening_jto · env_hardening_jdk · jvm_agents_javaagent ·
+                                  jvm_agents_agentpath
             Matrix: e2e-macos     x64 · arm64  ×  то же, что linux
 3. ci-ok    зависит только от трёх e2e; красный, если любая упала, отменена или пропущена
             (пропущена = упала её сборка) — его требует правило ветки master
@@ -116,7 +117,7 @@ Liberica (BellSoft): гвард доверяет издателю Java игры,
 
 | Слой (модуль) | Атака | Гвард должен | Код | Статус |
 |---|---|---|---|---|
-| `env_hardening` | чужой агент через `JAVA_TOOL_OPTIONS` | нейтрализовать (очистить env) | — | ✅ |
+| `env_hardening` | чужой агент через `JAVA_TOOL_OPTIONS` | нейтрализовать (очистить env: игра видит переменную незаданной) | — | ✅ |
 | `jvm_agents` | чужой `-javaagent` в строке | закрыть | 208 | ✅ |
 | `module_trust` | `System.load` неподписанного натива | закрыть | 210 | ✅ |
 | `jvm_agents` | `-agentpath` чужой нативный агент | закрыть | 208 | ✅ |
@@ -180,8 +181,9 @@ Java нет FFM-линкера, а Java 22+ под x86 не выпускаетс
 
 `module_trust` и `jvm_agents` (`-agentpath`) используют одну неподписанную натив-заглушку
 (`attacks/native/mebet_fake_cheat.c`, только маркер: экспортирует `JNI_OnLoad`, `Agent_OnLoad`,
-`Agent_OnAttach`) — в контейнере её собирает `gcc`, в Windows-CI — MSVC в тестовый артефакт
-(`dist/fixtures/mebet_fake_cheat.dll`); на стенде её выкачивают и передают через `--untrusted-native`.
+`Agent_OnAttach`) — на Linux/macOS её собирает раннер сам (`cc`/`clang`/`gcc`), в Windows-CI —
+MSVC в каждом e2e-джобе (`fixtures\mebet_fake_cheat.dll`, в артефакты не выкладывается); на стенде
+её собирают так же или передают готовую через `--untrusted-native`.
 
 Внешняя инъекция из другого процесса (`CreateRemoteThread` и т.п.) закрывается DACL процесса
 (`process_dacl`): его e2e проверяет, что процесс стража нельзя открыть с правами на запись
@@ -194,4 +196,6 @@ Java нет FFM-линкера, а Java 22+ под x86 не выпускаетс
   детект инъекции в память на Linux/macOS в страже пока не подключён, поэтому соответствующие
   слои там помечены как Windows-only, пока это не появится.
 
-Контейнеры: Linux-слои гоняются в Docker (на **test**-сборке), Windows-слои — на раннере.
+Все слои гоняются прямо на раннерах GitHub своей ОС и архитектуры, на **dev**-сборке (`devtest`);
+только `dev_mode` — на **prod**. Linux-бинарники при этом собираются в контейнере
+`manylinux_2_28`, чтобы запускаться на glibc 2.28.

@@ -318,7 +318,6 @@ def _sc(**kw):
     kw.setdefault("proof", [])
     kw.setdefault("privs", "game")
     kw.setdefault("ingame", False)         # the attack runs inside the started game (an action)
-    kw.setdefault("strict_exit", False)    # the process must end by itself with the code
     kw.setdefault("needs_dev_mode", False)
     return kw
 
@@ -329,7 +328,10 @@ def _tamper_threads(verb):
     # that follows is caught as usual.
     def expect(game, other):
         if game == "admin":
-            return dict(guard="close:guard_stalled", proof=[r"TARGET %s [1-9]\d* guard threads" % verb])
+            # The close line too: the thread that would print it starts in the guard module and is
+            # frozen or killed with the rest, and the launcher log must still say why.
+            return dict(guard="close:guard_stalled", proof=[r"TARGET %s [1-9]\d* guard threads" % verb,
+                                                            r"\[Mebet\] closed: guard_stalled \(code 225\)"])
         return dict(guard="close:untrusted_module", proof=[r"TARGET %s 0 guard threads" % verb])
     return expect
 
@@ -339,9 +341,8 @@ def _dacl_expect(game, other):
         # Windows lets an admin with SeDebugPrivilege open any process: not the DACL's job, the
         # guard's detections (watchdog, hooks, sweeps) cover what such a program does next.
         return dict(guard="known_limit", proof=[])
-    if game == "admin":
-        # A standard program cannot open an elevated one at all (integrity level), guard or not.
-        return dict(baseline="denied")
+    # The other program as the same user (or as an elevated admin without SeDebugPrivilege):
+    # without the guard Windows lets it in, with the guard only the DACL can keep it out.
     return {}
 
 
@@ -375,10 +376,14 @@ SCENARIOS = [
         build=lambda ctx, native, jar: dict(action="ffm-load-churn 45", iters=2)),
 
     # ---- attacks: the start of the JVM -----------------------------------------------------------
+    # The proof is the variable gone from the game: the Linux/macOS guard starts the JVM through
+    # JLI_Launch, which never reads JDK_JAVA_OPTIONS, so "no agent ran" alone proves nothing there.
     _sc(id="env_hardening_jto", kind="attack", module="env_hardening", guard="neutralize",
+        proof=[r"TARGET env JAVA_TOOL_OPTIONS unset"],
         title="Чужой агент через JAVA_TOOL_OPTIONS", marker="ATTACK agent premain ran",
         build=lambda ctx, native, jar: dict(extra_env={"JAVA_TOOL_OPTIONS": _agent_env(jar)})),
     _sc(id="env_hardening_jdk", kind="attack", module="env_hardening", guard="neutralize",
+        proof=[r"TARGET env JDK_JAVA_OPTIONS unset"],
         title="Чужой агент через JDK_JAVA_OPTIONS", marker="ATTACK agent premain ran",
         build=lambda ctx, native, jar: dict(extra_env={"JDK_JAVA_OPTIONS": _agent_env(jar)})),
     _sc(id="jvm_agents_javaagent", kind="attack", module="jvm_agents", guard="close:foreign_agent_arg",
@@ -393,8 +398,11 @@ SCENARIOS = [
     # Windows runners); the e2e-windows job runs it against the prod (release) build. With any
     # other build or machine it cannot pass, so it runs only when asked for (--expect-dev-mode):
     # a full local run would otherwise never be green.
+    # The prod build ignores MEBET_TEST_NO_UI and shows its reason window: nobody on the runner
+    # dismisses it, so this also proves that a close before the worker exists ends the process by
+    # itself (close_window_max_ms) instead of waiting for ever.
     _sc(id="dev_mode", kind="attack", module="dev_mode", os=WIN, guard="close:dev_mode", needs_dev_mode=True,
-        title="Запуск prod-сборки в dev-режиме → закрытие", marker="TARGET up pid=",
+        timeout=100, title="Запуск prod-сборки в dev-режиме → закрытие", marker="TARGET up pid=",
         build=lambda ctx, native, jar: dict()),
 
     # ---- attacks: inside the running game --------------------------------------------------------
@@ -406,9 +414,9 @@ SCENARIOS = [
     # the game keeps running behind the window for 75 s, and the guard must end the process
     # itself, with the code of the reason, when the time for a close is up.
     _sc(id="close_window_timeout", kind="attack", module="guard_watchdog", os=WIN, needs_native=True, ingame=True,
-        guard="close:untrusted_module", strict_exit=True, timeout=120,
+        guard="close:untrusted_module", timeout=120,
         title="Окно причины никто не закрыл: процесс завершается сам, с кодом причины",
-        marker="TARGET did load-native", proof=[r"\[Mebet\] closed: pending_close .*not finished in time"],
+        marker="TARGET did load-native", proof=[r"\[Mebet\] the reason window was not closed in \d+ s"],
         build=lambda ctx, native, jar: dict(action="load-native " + str(native), iters=300,
                                             extra_env={"MEBET_TEST_NO_UI": ""})),
     _sc(id="jvm_agent_module", kind="attack", module="jvm_agents", os=WIN, guard="close:jvm_agent_module", ingame=True,
@@ -455,7 +463,11 @@ def variants(sc):
     if host_os() != "windows":
         return [(None, None)]
     if sc["privs"] == "game_other":
-        return [(g, o) for g in ("user", "admin") for o in ("user", "admin")]
+        # Not (admin game, standard-user program): a medium-integrity program never gets these
+        # rights on an elevated process, guard or not, so that variant proved nothing about the
+        # guard. An elevated admin without SeDebugPrivilege does get them — but for the guard's DACL.
+        return [("user", "user"), ("user", "admin_nodebug"), ("user", "admin"),
+                ("admin", "admin_nodebug"), ("admin", "admin")]
     return [("user", None), ("admin", None)]
 
 
@@ -483,7 +495,7 @@ def applies(sc, ctx, variant=(None, None)):
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:
         return "нужна Java 22+ с FFM (здесь Java %d)" % ctx.java_feature
-    if "admin" in variant and not ctx.admin:
+    if any(v and v.startswith("admin") for v in variant) and not ctx.admin:
         return "вариант «админ» требует, чтобы тест работал от администратора (на раннерах CI так и есть)"
     return None
 
@@ -499,6 +511,9 @@ def baseline_ok(sc, base, exp=None):
     if exp["baseline"] == "denied":
         if has(base, sc["marker"]):
             return False, "ждали, что Windows сама не пустит, а атака прошла: %r" % sc["marker"]
+        for rx in exp.get("proof") or sc["proof"]:
+            if not re.search(rx, base["out"]):
+                return False, "атака не была проведена (нет %r) — проверка ничего не доказала" % rx
         return True, "Windows сама не пускает (уровень целостности), приложение живо"
     what = "атака не воспроизвелась" if sc["kind"] == "attack" else "действие не выполнилось"
     if not has(base, sc["marker"]):
@@ -552,16 +567,15 @@ def guard_ok(ctx, sc, guarded, exp=None):
     if g.startswith("close:"):
         reasons = g.split(":", 1)[1].split("|")
         wants = {ctx.codes[r]: r for r in reasons}
-        if guarded["exit"] in wants:
+        # By the exit code of a process that ended by itself — never by the close line alone: a
+        # guard that printed it and then hung (a reason window nobody dismissed, say) is broken,
+        # and the harness's own kill must not count as a close.
+        if guarded["exit"] in wants and not guarded["timed_out"]:
             return True, "закрыт, код %d (%s)" % (guarded["exit"], wants[guarded["exit"]])
-        # The prod build shows the reason window (it ignores MEBET_TEST_NO_UI) and can block on a
-        # headless runner until the harness kills it: then the "[Mebet] closed" line is the
-        # proof — but only if the app really stopped (it never reached its end).
         closed = _closed_line(guarded)
-        if closed and closed[1] in wants and not has(guarded, "TARGET exit") and not sc["strict_exit"]:
-            return True, "закрыт, код %d (%s)" % (closed[1], closed[0])
-        return False, "ждали закрытие с кодом %s, получили exit %s%s" % (
+        return False, "ждали закрытие с кодом %s, получили exit %s%s%s" % (
             "/".join("%d (%s)" % (c, r) for c, r in wants.items()), guarded["exit"],
+            " (не завершился сам, остановлен по таймауту)" if guarded["timed_out"] else "",
             "" if not closed else ", строка закрытия %s (code %d)" % closed)
     # neutralize
     if guarded["exit"] != 0 or not has(guarded, "TARGET exit"):

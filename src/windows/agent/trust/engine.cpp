@@ -116,6 +116,10 @@ bool in_display_driver_dir(const std::wstring& path) {
 
 std::string product_version(const std::wstring& path) {
     gate::OwnReadScope own;
+    // GetFileVersionInfo trims a dot or a space at the end of a name: for "name.dll." it reads the
+    // "name.dll" next to it, while the signature was verified on the dotted file through its
+    // handle. No version then — and a publisher rule with a version floor does not match.
+    if (win::exact_path(path) != path) return std::string();
     DWORD dummy = 0;
     const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);
     if (!size) return std::string();

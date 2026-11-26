@@ -42,6 +42,7 @@ struct Core {
     std::atomic<bool> closing{false};
     std::atomic<bool> armed{false};
     std::atomic<bool> flow_started{false};
+    std::atomic<bool> report_claimed{false};  // the report of the close: sent by run_close or by the watchdog
     std::atomic<int> exit_code{0};
     std::atomic<CloseRequest*> close{nullptr};
     HANDLE wake = nullptr;
@@ -75,9 +76,23 @@ void drain_deferred() {
     items.swap(c.deferred);
     ReleaseSRWLockExclusive(&c.deferred_lock);
     for (auto& fn : items) {
+        // A close is pending: the rest (inventory cards, reports) can wait for ever — the close
+        // and its report must not wait for them.
+        if (c.closing.load(std::memory_order_acquire)) break;
         if (fn) fn();
         watchdog::worker_beat();
     }
+}
+
+// The event of a close as it is sent: the detection's own, marked with the reason and the code.
+report::Event close_event(const CloseRequest& r, report::Event ev) {
+    const auto& def = config::reason(r.reason);
+    if (ev.type.empty()) ev.type = std::string("close.") + def.id;
+    if (ev.title.empty()) ev.title = std::string("Closed: ") + def.id;
+    ev.level = report::Level::error;
+    ev.tags.emplace_back("reason", def.id);
+    ev.tags.emplace_back("exit_code", std::to_string(def.exit_code));
+    return ev;
 }
 
 [[noreturn]] void run_close(CloseRequest& r) {
@@ -91,19 +106,20 @@ void drain_deferred() {
     splash::hide_now();
     EnumWindows(&hide_window, 0);
 
-    // 2. The report goes out while the window is on screen (ТЗ §12: send or 3 s).
+    // 2. The report goes out while the window is on screen (ТЗ §12: send or 3 s) — unless the
+    //    watchdog, which ends a close that came too late, has sent it already.
     const std::uint64_t started = win::now_ms();
     std::atomic<bool> sent{false};
-    report::Event ev = std::move(r.event);
-    if (ev.type.empty()) ev.type = std::string("close.") + def.id;
-    if (ev.title.empty()) ev.title = std::string("Closed: ") + def.id;
-    ev.level = report::Level::error;
-    ev.tags.emplace_back("reason", def.id);
-    ev.tags.emplace_back("exit_code", std::to_string(def.exit_code));
-    std::thread sender([&sent, ev]() mutable {
-        report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+    std::thread sender;
+    if (!c.report_claimed.exchange(true)) {
+        report::Event ev = close_event(r, std::move(r.event));
+        sender = std::thread([&sent, ev]() mutable {
+            report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+            sent.store(true);
+        });
+    } else {
         sent.store(true);
-    });
+    }
 
     // 3. Reason and code in the launcher log too (no log file, ТЗ §3).
     std::fprintf(stderr, "[Mebet] closed: %s (code %d) %s\n", def.id, def.exit_code, to_utf8(r.detail).c_str());
@@ -111,10 +127,30 @@ void drain_deferred() {
 
     // 4. The reason window (draft layout until the mockups are chosen). Test builds on CI
     //    skip it when MEBET_TEST_NO_UI is set, so a smoke test cannot hang on a dialog.
+    //    It waits for the player, but not for ever: the game is hidden but its threads still run
+    //    behind it, and nothing else of the guard works meanwhile. A window nobody dismisses
+    //    (covered, hidden by code in the process, a player who walked away) used to keep that
+    //    state for good — on every path, before the worker and the watchdog exist too. So the
+    //    window has a thread of its own, and the close goes on after close_window_max_ms.
     std::wstring title;
     const std::wstring text = reason_text(r.reason, r.detail, &title);
     const bool no_ui = config::kTestBuild && !win::env(L"MEBET_TEST_NO_UI").empty();
-    if (!no_ui) reason_window::show(title, text);
+    if (!no_ui) {
+        const HANDLE dismissed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (dismissed) {
+            std::thread([title, text, dismissed] {
+                reason_window::show(title, text);
+                SetEvent(dismissed);
+            }).detach();
+            if (WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
+                std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
+                             config::opt::close_window_max_ms / 1000);
+                std::fflush(stderr);
+            }
+        } else {
+            reason_window::show(title, text);
+        }
+    }
 
     // 5. Wait for the report at most until 3 s after the close started.
     while (!sent.load() && win::now_ms() - started < config::opt::close_report_wait_ms) Sleep(20);
@@ -174,6 +210,14 @@ void init(const BootInfo* boot) {
 const BootInfo& boot() { return *core().boot; }
 
 bool closing() { return core().closing.load(std::memory_order_acquire); }
+bool close_running() { return core().flow_started.load(std::memory_order_acquire); }
+
+void send_pending_close_report(unsigned timeout_ms) {
+    Core& c = core();
+    CloseRequest* r = c.close.load();
+    if (!r || c.report_claimed.exchange(true)) return;  // no close, or its report is on its way
+    report::Reporter::instance().send_now(close_event(*r, r->event), timeout_ms);
+}
 bool shutting_down() { return g_shutdown.load(std::memory_order_relaxed); }
 void set_shutting_down() { g_shutdown.store(true); }
 bool armed() { return core().armed.load(std::memory_order_acquire); }

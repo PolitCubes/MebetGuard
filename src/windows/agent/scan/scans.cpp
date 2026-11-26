@@ -26,6 +26,7 @@
 #include "process/dacl.hpp"
 #include "report/cards.hpp"
 #include "strings.hpp"
+#include "trust/file_identity.hpp"
 
 namespace mebet::scan {
 
@@ -75,8 +76,8 @@ void close_foreign_thread(std::uintptr_t start, DWORD tid, const char* when) {
     guard::signal(config::Module::foreign_threads, config::Reason::foreign_thread, std::wstring(), std::move(ev));
 }
 
-void close_hidden_image(std::uintptr_t base) {
-    const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(base));
+// `path`: the file mapped there, read when the image was found (it may be gone by now).
+void close_hidden_image(std::uintptr_t base, const std::wstring& path) {
     report::Event ev;
     ev.type = "close.hidden_image";
     ev.level = report::Level::error;
@@ -151,6 +152,10 @@ bool wow64_layer_image(std::uintptr_t base) {
     USHORT machine = 0;
     DWORD size = 0;
     if (!image_header(base, &machine, &size) || machine != native || size == 0) return false;
+    // The header is only a hint: the range recorded is what the kernel has mapped, and a header
+    // that disagrees with it was rewritten.
+    const std::size_t extent = win::image_extent(base);
+    if (!extent || ((static_cast<std::size_t>(size) + 0xFFF) & ~static_cast<std::size_t>(0xFFF)) != extent) return false;
     const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(base));
     const std::wstring name = win::file_name_of(path);
     static const wchar_t* const kLayer[] = {L"ntdll.dll",    L"wow64.dll",    L"wow64base.dll", L"wow64con.dll",
@@ -160,7 +165,7 @@ bool wow64_layer_image(std::uintptr_t base) {
     if (!layer || !win::same_path(path, win::windows_dir() + L"\\System32\\" + name)) return false;
     const trust::Decision d = trust::decide_path(win::windows_dir() + L"\\Sysnative\\" + name);
     if (!d.verdict.allowed || d.verdict.trust != trust::Trust::os) return false;
-    modules::add(base, size, trust::Trust::os, path);
+    modules::add(base, extent, trust::Trust::os, path);
     return true;
 }
 
@@ -253,17 +258,22 @@ enum class SweepMode { startup, periodic };
 // A hooked call records the memory it has just made a moment after making it; the loader maps an
 // image a moment before it lists it and drops it from its list (the guard forgets it then) a
 // moment before it unmaps it. The periodic walk can catch any of them in between, and what it
-// sees then looks exactly like foreign code or a hidden image: games were closed for only
-// loading or unloading a library. So before the walk judges such a find it looks again a few
-// times over a quarter of a second. What was only in between has settled by then — recorded,
-// listed or gone; what is still there the same way is judged, in this very sweep.
+// sees then looks like foreign code or a hidden image: games were closed for only loading or
+// unloading a library. So before it judges such a find the walk looks again a few times over a
+// quarter of a second — and while a hooked call is still between its real call and its record (a
+// thread preempted right there), up to two seconds longer. What has not settled by then is judged
+// in this very sweep; nothing is carried over to the next one.
 //
-// M-07, for the record: the sweep used to skip everything while a hooked call was in flight, and
-// a thread killed inside a hook left that counter up for good — the periodic sweep never ran
-// again. Then it kept suspects from one sweep to the next by their address: something that moved
-// between two sweeps, or stayed for less than one interval, was never judged. Neither is needed:
-// a quarter of a second is far more than a live call or the loader takes.
+// What counts as settled is narrow on purpose. Executable memory: only a record made meanwhile.
+// Memory that turns non-executable or goes away was still seen executable and unrecorded —
+// counted as settled, it let shellcode that flips RX/RW slip through every sweep. An image: a
+// record, the loader listing it, or the image gone with a file the trust engine allows.
+//
+// M-07, for the record: the sweep once skipped everything while a call was in flight, and a
+// thread killed inside a hook left that count up for good. Now a stuck count costs two seconds.
 constexpr DWORD kSettleMs[] = {2, 18, 60, 170};
+constexpr DWORD kInFlightMaxMs = 2000;
+constexpr DWORD kInFlightStepMs = 50;
 
 template <typename Settled>
 bool still_there(Settled settled) {
@@ -272,25 +282,19 @@ bool still_there(Settled settled) {
         Sleep(wait);
         watchdog::worker_beat();
     }
+    for (DWORD waited = 0; waited < kInFlightMaxMs && exec::ops_in_flight(); waited += kInFlightStepMs) {
+        if (settled()) return false;
+        Sleep(kInFlightStepMs);
+        watchdog::worker_beat();
+    }
     return !settled();
 }
 
-// The image at `alloc` is in the module table, or no image has its base there any more.
-bool image_recorded(std::uintptr_t alloc) {
-    if (modules::find(alloc)) return true;
+// No image has its base at `alloc` any more.
+bool image_gone(std::uintptr_t alloc) {
     MEMORY_BASIC_INFORMATION m{};
     return !VirtualQuery(reinterpret_cast<void*>(alloc), &m, sizeof(m)) || m.Type != MEM_IMAGE ||
            reinterpret_cast<std::uintptr_t>(m.AllocationBase) != alloc;
-}
-
-// The executable region at `base` is in the table of allowed memory, or is no longer there.
-bool region_recorded(std::uintptr_t base) {
-    MEMORY_BASIC_INFORMATION m{};
-    if (!VirtualQuery(reinterpret_cast<void*>(base), &m, sizeof(m)) || m.State != MEM_COMMIT || !(m.Protect & 0xF0) ||
-        (m.Protect & PAGE_GUARD) || m.Type == MEM_IMAGE)
-        return true;
-    const auto b = reinterpret_cast<std::uintptr_t>(m.BaseAddress);
-    return exec::covers(b, b + m.RegionSize);
 }
 
 // The same file is still mapped as an image at `alloc`.
@@ -298,16 +302,35 @@ bool same_file_mapped(std::uintptr_t alloc, const std::wstring& path) {
     return !path.empty() && iequals_ascii(win::mapped_file_name(reinterpret_cast<void*>(alloc)), path);
 }
 
+// Volume and file id of the file mapped at `alloc` (not size and time: those its owner can change
+// while the image is mapped). False when it cannot be read.
+bool mapped_file_id(std::uintptr_t alloc, trust::FileIdentity& id) {
+    const std::wstring path = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+    if (path.empty()) return false;
+    const HANDLE h = trust::open_read(path);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const bool ok = trust::identity_of(h, id);
+    CloseHandle(h);
+    return ok;
+}
+
+bool same_file(const trust::FileIdentity& a, const trust::FileIdentity& b) {
+    return a.volume == b.volume && std::memcmp(a.file_id, b.file_id, sizeof(a.file_id)) == 0;
+}
+
 // The file of an image the loader lists was refused by the periodic walk. Is the refusal about
 // what is mapped there? A library unloaded while its file was being judged leaves nothing to
-// read — an empty name, an "unreadable" file — and another library may already sit at the same
-// address: a game was closed for an "untrusted module" with no name. The refusal stands when,
-// look after look, the image is still there, unrecorded, and no other file has taken its place.
-bool refusal_stands(std::uintptr_t alloc, const std::wstring& judged_path) {
+// read, and another library may already sit at its address: a game was closed for an "untrusted
+// module" with no name. The refusal stands unless, look after look, the image was recorded by a
+// hook, went away, or another file sits there now — told by its file id, never by its name: the
+// name of a mapped file follows a rename, and a module that kept renaming its file escaped.
+bool refusal_stands(std::uintptr_t alloc, const trust::Decision& d) {
     return still_there([&] {
-        if (image_recorded(alloc)) return true;
-        const std::wstring now = win::mapped_file_name(reinterpret_cast<void*>(alloc));
-        return !now.empty() && !iequals_ascii(now, judged_path);  // another file: the next sweep judges that one
+        if (modules::find(alloc) || image_gone(alloc)) return true;
+        trust::FileIdentity now{};
+        if (!mapped_file_id(alloc, now)) return false;  // cannot tell: the refusal stands
+        // Judged without a readable file (the image was going away): judge again next sweep.
+        return !d.facts.identity_known || !same_file(now, d.facts.identity);
     });
 }
 
@@ -343,22 +366,33 @@ void sweep_memory(SweepMode mode) {
                     // library may have been unloaded since, and another loaded at its address:
                     // recorded only if that file is still what is mapped, never over a record a
                     // hook has made meanwhile, and taken back if the image went away in between.
-                    MODULEINFO mi{};
-                    if (GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(alloc), &mi, sizeof(mi)) &&
-                        same_file_mapped(alloc, path)) {
-                        const std::uint64_t serial = modules::add_if_absent(alloc, mi.SizeOfImage, d.verdict.trust, d.facts.path);
+                    const std::size_t extent = win::image_extent(alloc);
+                    if (extent && same_file_mapped(alloc, path)) {
+                        const std::uint64_t serial = modules::add_if_absent(alloc, extent, d.verdict.trust, d.facts.path);
                         if (serial && !same_file_mapped(alloc, path)) modules::remove_if(alloc, serial);
                     }
-                } else if (!periodic || refusal_stands(alloc, path)) {
+                } else if (!periodic || refusal_stands(alloc, d)) {
                     gate::deny_module(d, d.verdict.reason, mode == SweepMode::startup ? "startup" : "sweep");
                 }
                 continue;
             }
             if (wow64_layer_image(alloc)) continue;  // the system's own WOW64 images (M-01)
-            // Neither recorded nor listed: a hidden image stays so, a library in the middle of
-            // loading or unloading does not.
-            if (periodic && !still_there([&] { return image_recorded(alloc) || loader_knows(alloc); })) continue;
-            close_hidden_image(alloc);
+            const std::wstring found = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+            if (periodic) {
+                // Neither recorded nor listed. A hidden image stays so. A library in the middle of
+                // loading or unloading does not: a moment later it is recorded or listed, or gone —
+                // and then its file is one the trust engine allows. An image of any other file was
+                // mapped around the loader, however briefly.
+                bool gone = false;
+                const bool stays = still_there([&] {
+                    if (modules::find(alloc) || loader_knows(alloc)) return true;
+                    gone = image_gone(alloc);
+                    return gone;
+                });
+                if (!stays && !gone) continue;
+                if (!stays && !found.empty() && trust::decide_path(found).verdict.allowed) continue;
+            }
+            close_hidden_image(alloc, found);
             continue;
         }
         // MEM_PRIVATE / MEM_MAPPED executable.
@@ -368,7 +402,7 @@ void sweep_memory(SweepMode mode) {
             exec::allow(base, next, exec::Owner{trust::Trust::os, 0, exec::Source::preexisting});
             continue;
         }
-        if (periodic && !still_there([&] { return region_recorded(base); })) continue;
+        if (periodic && !still_there([&] { return exec::covers(base, next); })) continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");
     }
 }
@@ -434,23 +468,23 @@ std::vector<std::wstring> known_dll_names() {
 void check_loaded_module(HMODULE m, const std::vector<std::wstring>& known) {
     const auto base = reinterpret_cast<std::uintptr_t>(m);
     if (modules::find(base)) return;  // mapped through the hook already
-    MODULEINFO mi{};
-    if (!GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof(mi))) return;
+    const std::size_t extent = win::image_extent(base);  // the kernel's, not the loader's entry
+    if (!extent) return;
     const std::wstring path = win::mapped_file_name(m);  // from the kernel, not the PEB
     const std::wstring name = lower_ascii(win::file_name_of(path));
     if (win::same_path(win::dir_of(path), win::image_system_dir())) {
         for (const auto& k : known) {
             if (name == k) {
-                modules::add(base, mi.SizeOfImage, trust::Trust::known_dll, path);
+                modules::add(base, extent, trust::Trust::known_dll, path);
                 return;
             }
         }
     }
-    const trust::Decision d = gate::decide_loaded_module(base, mi.SizeOfImage, win::module_path(m));
+    const trust::Decision d = gate::decide_loaded_module(base, extent, win::module_path(m));
     if (d.verdict.allowed) {
-        modules::add(base, mi.SizeOfImage, d.verdict.trust, d.facts.path);
+        modules::add(base, extent, d.verdict.trust, d.facts.path);
     } else if (config::enabled(config::Module::startup_self_check)) {
-        modules::add(base, mi.SizeOfImage, trust::Trust::unknown, d.facts.path);
+        modules::add(base, extent, trust::Trust::unknown, d.facts.path);
         gate::deny_module(d, config::Reason::early_module, "startup");
     }
 }

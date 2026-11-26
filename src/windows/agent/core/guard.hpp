@@ -3,9 +3,12 @@
 // Guard core: the controlled close (ТЗ §3 «Как закрываем»), the worker thread and the
 // routing of every signal by the level of its module.
 //
-// Hooks never end the process (ТЗ §5): they deny the operation and call request_close();
-// the worker hides the game, shows the reason window, sends the report and terminates
-// with the reason's exit code.
+// Detections never end the process themselves (ТЗ §5): a hook denies the operation and calls
+// request_close(); the worker hides the game, shows the reason window, sends the report and
+// terminates with the reason's exit code. The one exception is the watchdog (core/watchdog.hpp):
+// when the guard's own threads are stopped, or a close is not carried out in time, there is no
+// worker left to rely on, and the watchdog — from its thread or from any hook — ends the
+// process itself.
 #pragma once
 
 #include <functional>
@@ -22,6 +25,11 @@ void init(const BootInfo* boot);
 const BootInfo& boot();
 
 bool closing();
+// The close itself has started (run_close): the reason window may be on screen.
+bool close_running();
+// The report of the pending close, for the watchdog when it ends a close that did not run in time.
+// Sent at most once, by this or by the close itself.
+void send_pending_close_report(unsigned timeout_ms);
 bool shutting_down();  // DLL_PROCESS_DETACH: hooks pass everything through
 void set_shutting_down();
 

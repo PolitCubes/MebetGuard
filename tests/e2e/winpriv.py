@@ -232,19 +232,23 @@ def set_debug_privilege(enable):
 
 def as_other(level, fn):
     """Run fn() as another program at the given level: "user" impersonates the standard-user
-    token on this thread; "admin" turns SeDebugPrivilege on for the call."""
+    token on this thread; "admin" turns SeDebugPrivilege on for the call, "admin_nodebug" off
+    (an elevated program that did not ask for it: Windows still checks the DACL for it)."""
     if level == "user":
         _check(_ImpersonateLoggedOnUser(user_token()), "ImpersonateLoggedOnUser")
         try:
             return fn()
         finally:
             _RevertToSelf()
-    was = set_debug_privilege(True)
+    want = level == "admin"
+    was = set_debug_privilege(want)
+    if was is None and not want:
+        raise OSError("SeDebugPrivilege cannot be switched off here")
     try:
         return fn()
     finally:
-        if was is False:
-            set_debug_privilege(False)
+        if was is not None and was != want:
+            set_debug_privilege(was)
 
 
 class UserProc:

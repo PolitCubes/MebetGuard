@@ -132,7 +132,7 @@ jobs:
     needs: build-windows-binaries
     name: windows ${{ matrix.arch }} ${{ matrix.feature }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

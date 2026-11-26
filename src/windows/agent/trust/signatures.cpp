@@ -281,12 +281,20 @@ void fill_signer(CRYPT_PROVIDER_DATA* prov, Signer& s, bool system_chain_valid) 
         if (tsa && tsa->pCert) s.tsa_cn = name_attr(tsa->pCert, szOID_COMMON_NAME, false);
     }
 
+    // The Microsoft root policy looks only at the key of the chain's end. Without a validated chain
+    // that is enough only when the root is the one thing wrong with it: Windows names its worst
+    // problem and says nothing of the rest, so an issuer that is no CA, or a bad signature inside,
+    // could hide behind an untrusted root.
+    const DWORD tolerated = CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_NOT_TIME_VALID | CERT_TRUST_IS_NOT_TIME_NESTED |
+                            CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION;
+    const bool chain_sound = system_chain_valid ||
+                             (sgnr->pChainContext && (sgnr->pChainContext->TrustStatus.dwErrorStatus & ~tolerated) == 0);
     PCCERT_CONTEXT root = chain_root(sgnr->pChainContext);
     if (root && CertCompareCertificateName(X509_ASN_ENCODING, &root->pCertInfo->Subject, &root->pCertInfo->Issuer)) {
         s.root_cn = simple_name(root);
         s.root_sha256 = Sha256::of(root->pbCertEncoded, root->cbCertEncoded);
-        s.ms_os = microsoft_root(sgnr->pChainContext, 0);
-        s.ms_app = !s.ms_os && microsoft_root(sgnr->pChainContext, kMicrosoftRootCheckApplicationRoot);
+        s.ms_os = chain_sound && microsoft_root(sgnr->pChainContext, 0);
+        s.ms_app = chain_sound && !s.ms_os && microsoft_root(sgnr->pChainContext, kMicrosoftRootCheckApplicationRoot);
         if (system_chain_valid) s.pinned_root = pinned_index(root);
     }
     if (system_chain_valid) {
