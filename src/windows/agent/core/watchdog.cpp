@@ -107,6 +107,36 @@ bool stopped(HANDLE t) { return ended(t) || suspended(t) == 1; }
 // thread in the hook (a Windows ARM64 runner: still suspended at the one look 100 ms later, and an
 // honest game closed with guard_stalled). Over as soon as they run or beat again; threads somebody
 // stopped are still stopped after the whole wait.
+// The whole process is held (Suspend in a task manager, a dump tool), not just the guard: most of its
+// other threads are suspended too. A thread being created while the hold was put on escapes it and runs
+// alone meanwhile — its hooks found both guard threads suspended and closed an honest game, the
+// moment it next called one (process_hold on a Windows ARM64 runner, half a minute into the hold). A
+// cheat that stops the guard's threads leaves the game's running: a game held whole cannot be played,
+// and when it is let go, the guard runs again. Never for a close already pending (see check_from_hook).
+bool process_held(HANDLE worker, HANDLE watchdog) {
+    const auto& a = nt::api();
+    if (!a.NtGetNextThread) return false;
+    const DWORD self = GetCurrentThreadId();
+    const DWORD guard_ids[2] = {worker ? GetThreadId(worker) : 0, watchdog ? GetThreadId(watchdog) : 0};
+    int others = 0, held = 0;
+    HANDLE prev = nullptr;
+    for (int n = 0; n < 4096; ++n) {
+        HANDLE next = nullptr;
+        if (!nt::ok(a.NtGetNextThread(nt::current_process(), prev, THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                                      0, 0, &next)) ||
+            !next)
+            break;
+        if (prev) CloseHandle(prev);
+        prev = next;
+        const DWORD id = GetThreadId(next);
+        if (id == self || (id && (id == guard_ids[0] || id == guard_ids[1]))) continue;
+        ++others;
+        if (suspended(next) == 1) ++held;
+    }
+    if (prev) CloseHandle(prev);
+    return others > 0 && held * 4 >= others * 3;
+}
+
 template <typename Still>
 bool still_stopped(Still still) {
     for (DWORD waited = 0; waited < kHookSecondLookMaxMs; waited += kHookSecondLookStepMs) {
@@ -604,7 +634,9 @@ void check_from_hook() {
     }
     if (!config::closes(config::Module::guard_watchdog)) return;
     if (stopped(worker) && (!watchdog || stopped(watchdog))) {
-        if (still_stopped([&] { return stopped(worker) && (!watchdog || stopped(watchdog)) && beats() == seen; }))
+        if (process_held(worker, watchdog)) return;  // the whole game stands, this thread slipped the hold
+        if (still_stopped([&] { return stopped(worker) && (!watchdog || stopped(watchdog)) && beats() == seen; }) &&
+            !process_held(worker, watchdog))
             on_stall("both guard threads silent", false);
         return;
     }
