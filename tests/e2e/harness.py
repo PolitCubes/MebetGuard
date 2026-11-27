@@ -571,7 +571,7 @@ SCENARIOS = [
         build=lambda ctx, native, jar: dict(action="ffm-load-churn 45", iters=2)),
     # A thread that slipped past the hold keeps calling hooks while every other thread, the guard's too,
     # stands: the whole game is held, nobody stopped the guard on its own.
-    _sc(id="process_hold_escaped", kind="legit", module="guard_watchdog", os=WIN, needs_ffm=True, needs_admin=True,
+    _sc(id="whole_game_held", kind="legit", module="guard_watchdog", os=WIN, needs_ffm=True, needs_admin=True,
         guard="allow", timeout=120, probe="hold_all_but_spinner", marker="PROBE held",
         title="Пауза всей игры, кроме одного потока, зовущего хуки (%d с), и продолжение" % HOLD_SECONDS,
         build=lambda ctx, native, jar: dict(action="ffm-hook-spinner 50", iters=2)),

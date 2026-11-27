@@ -162,6 +162,7 @@ jobs:
           - process_hold
           - native_load_churn
           - resource_read_unsigned
+          - module_file_unreadable
           # attacks on the JVM start
           - env_hardening_jto
           - env_hardening_jdk
@@ -177,6 +178,9 @@ jobs:
           - ex_image_map
           - stale_unmap_exec
           - limited_handle_exec
+          - image_page_protect
+          - overwrite_cached_dll
+          - foreign_exec_moving
           - process_dacl_open
           - close_window_timeout
           # attacks on the guard itself
@@ -184,6 +188,7 @@ jobs:
           - tamper_kill_guard
           - tamper_unload_guard
           - tamper_jam_sweep
+          - whole_game_held
         include:
           - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     vc: x64,     dir: x86-64-mustdie }
           - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     vc: x64_x86, dir: x86-mustdie }
@@ -195,23 +200,23 @@ jobs:
           # letters, shell specials, and characters beyond the ANSI code page. Two jobs per variant
           # (the long scenarios apart), each with the usual --no-skip. test_paths.py adds the folders
           # plain java itself cannot use on the runner's code page (1252).
-          - { arch: x64, feature: paths-cyrillic-quick, extra: "--paths cyrillic", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+          - { arch: x64, feature: paths-cyrillic-quick, extra: "--paths cyrillic", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
           - { arch: x64, feature: paths-cyrillic-long, extra: "--paths cyrillic", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-ukrainian-quick, extra: "--paths ukrainian", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+          - { arch: x64, feature: paths-ukrainian-quick, extra: "--paths ukrainian", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
           - { arch: x64, feature: paths-ukrainian-long, extra: "--paths ukrainian", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-latin-quick, extra: "--paths latin", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+          - { arch: x64, feature: paths-latin-quick, extra: "--paths latin", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
           - { arch: x64, feature: paths-latin-long, extra: "--paths latin", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-specials-quick, extra: "--paths specials", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+          - { arch: x64, feature: paths-specials-quick, extra: "--paths specials", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
           - { arch: x64, feature: paths-specials-long, extra: "--paths specials", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-beyond-quick, extra: "--paths beyond", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper", timeout: 45,
+          - { arch: x64, feature: paths-beyond-quick, extra: "--paths beyond", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
           - { arch: x64, feature: paths-beyond-long, extra: "--paths beyond", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
               runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
@@ -227,6 +232,9 @@ jobs:
           - { arch: x86, feature: ex_image_map }
           - { arch: x86, feature: stale_unmap_exec }
           - { arch: x86, feature: limited_handle_exec }
+          - { arch: x86, feature: image_page_protect }
+          - { arch: x86, feature: overwrite_cached_dll }
+          - { arch: x86, feature: whole_game_held }
           - { arch: x86, feature: tamper_freeze_guard }
           - { arch: x86, feature: tamper_kill_guard }
           - { arch: x86, feature: tamper_unload_guard }
