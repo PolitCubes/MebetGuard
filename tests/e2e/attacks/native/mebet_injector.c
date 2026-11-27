@@ -7,6 +7,7 @@
  *
  *   mebet_injector remote-thread <pid> <dll>
  *   mebet_injector apc <pid> <dll>
+ *   mebet_injector manual-map <pid> <dll>
  *
  * Prints one "INJECTOR ..." line and exits 0 when the technique was carried out. */
 
@@ -14,6 +15,7 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 static int fail(const char *what) {
@@ -80,6 +82,39 @@ static int apc(DWORD pid, const wchar_t *dll) {
     CloseHandle(proc);
     if (!queued) return fail("no thread took the APC");
     printf("INJECTOR apc done (queued to %d threads)\n", queued);
+    return 0;
+}
+
+typedef LONG(NTAPI *NtCreateSectionFn)(HANDLE *, ACCESS_MASK, void *, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef LONG(NTAPI *NtMapViewOfSectionFn)(HANDLE, HANDLE, void **, ULONG_PTR, SIZE_T, PLARGE_INTEGER, SIZE_T *, ULONG,
+                                          ULONG, ULONG);
+#define SEC_IMAGE_FLAG 0x1000000u
+#define VIEW_UNMAP 2u
+
+/* An export's RVA, read from the headers already placed at `base` in the target. */
+static DWORD export_rva(HANDLE proc, BYTE *base, const char *want) {
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS nt;
+    if (!ReadProcessMemory(proc, base, &dos, sizeof(dos), NULL)) return 0;
+    if (!ReadProcessMemory(proc, base + dos.e_lfanew, &nt, sizeof(nt), NULL)) return 0;
+    IMAGE_DATA_DIRECTORY d = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!d.Size) return 0;
+    IMAGE_EXPORT_DIRECTORY ex;
+    if (!ReadProcessMemory(proc, base + d.VirtualAddress, &ex, sizeof(ex), NULL)) return 0;
+    for (DWORD i = 0; i < ex.NumberOfNames; ++i) {
+        DWORD name_rva = 0;
+        WORD ordinal = 0;
+        DWORD fn_rva = 0;
+        char name[64] = {0};
+        if (!ReadProcessMemory(proc, base + ex.AddressOfNames + i * sizeof(DWORD), &name_rva, sizeof(name_rva), NULL) ||
+            !ReadProcessMemory(proc, base + name_rva, name, sizeof(name) - 1, NULL))
+            continue;
+        if (strcmp(name, want) != 0) continue;
+        if (!ReadProcessMemory(proc, base + ex.AddressOfNameOrdinals + i * sizeof(WORD), &ordinal, sizeof(ordinal), NULL) ||
+            !ReadProcessMemory(proc, base + ex.AddressOfFunctions + ordinal * sizeof(DWORD), &fn_rva, sizeof(fn_rva), NULL))
+            return 0;
+        return fn_rva;
+    }
     return 0;
 }
 

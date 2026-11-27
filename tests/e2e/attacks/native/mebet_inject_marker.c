@@ -25,3 +25,12 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) say("library loaded");
     return TRUE;
 }
+
+/* A plain thread entry (one argument, so it is called correctly however the image was placed).
+ * The scenario that maps this image without the loader starts a thread here: DllMain does not run
+ * for a hand-placed image, and calling it as a thread entry would pass the wrong "reason". */
+__declspec(dllexport) DWORD WINAPI MebetMarkerThread(LPVOID arg) {
+    (void)arg;
+    say("manually-mapped image");
+    return 0;
+}
