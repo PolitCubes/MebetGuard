@@ -9,6 +9,7 @@
 #include "core/guard.hpp"
 #include "core/module_table.hpp"
 #include "core/timing.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "json_writer.hpp"
 #include "mebet_trust_data.hpp"
@@ -158,6 +159,10 @@ bool decide_and_apply(const trust::Decision& d, const char* phase) {
 
 VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data, PVOID) {
     if (!data || guard::shutting_down()) return;
+    // A loader event is another thread touching the guard: if a cheat has frozen or killed the guard's
+    // threads, let this one notice the stall and finish the close, rather than only publish one that a
+    // frozen worker never carries out. The loader always calls this on a thread with its TLS in place.
+    watchdog::check_from_hook();
     const auto base = reinterpret_cast<std::uintptr_t>(data->DllBase);
     if (reason == nt::kLdrDllNotificationUnloaded) {
         modules::remove_unloading(base);

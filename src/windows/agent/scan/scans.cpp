@@ -288,7 +288,10 @@ bool still_there(Settled settled) {
         Sleep(wait);
         watchdog::worker_beat();
     }
-    for (DWORD waited = 0; waited < kInFlightMaxMs && exec::live_op_within(kInFlightMaxMs); waited += kInFlightStepMs) {
+    // By the clock, not by summed sleeps: one settled() can block on a file open (a share that stalls),
+    // and the loop must not then keep a whole sweep inside one find while every other check waits.
+    const std::uint64_t deadline = GetTickCount64() + kInFlightMaxMs;
+    while (GetTickCount64() < deadline && exec::live_op_within(kInFlightMaxMs)) {
         if (guard::closing() || settled()) return false;
         Sleep(kInFlightStepMs);
         watchdog::worker_beat();
@@ -374,38 +377,40 @@ bool refusal_stands(std::uintptr_t alloc, const trust::Decision& d) {
 // gone, but a file kept from the guard by whoever mapped it leaves the record unproven.
 bool record_holds(std::uintptr_t alloc, const modules::Record& rec) {
     if (!rec.id_known && rec.path.empty()) return true;  // nothing to compare with (the guard's own views)
-    bool holds = true;
+    bool stale = false;  // set only when a DIFFERENT file is positively seen mapped there
     auto look = [&] {
-        if (image_gone(alloc)) return true;  // going: the unmap hook removes the record
+        if (image_gone(alloc)) return true;  // going: the unmap hook removes the record; hold for now
         trust::FileIdentity now{};
         if (rec.id_known) {
-            if (!mapped_file_id(alloc, now)) return false;
-            holds = same_file(now, rec.id);
+            if (!mapped_file_id(alloc, now)) return false;  // its file cannot be read now: not proof of a swap
+            stale = !same_file(now, rec.id);
             return true;
         }
         const std::wstring name = win::mapped_file_name(reinterpret_cast<void*>(alloc));
         if (name.empty()) return false;
-        if (win::name_equals(name, rec.path)) return true;
+        if (win::name_equals(name, rec.path)) {  // the same name: hold, and pin the id if it can be read
+            trust::FileIdentity was{};
+            const HANDLE h = trust::open_read(rec.path);
+            const bool known = h != INVALID_HANDLE_VALUE && trust::identity_of(h, was);
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            if (known && mapped_file_id(alloc, now) && same_file(now, was))
+                modules::prove_identity(alloc, rec.serial, now);
+            return true;
+        }
+        // A different name is mapped here. Only a readable, differing id makes the record stale.
         trust::FileIdentity was{};
         const HANDLE h = trust::open_read(rec.path);
         const bool known = h != INVALID_HANDLE_VALUE && trust::identity_of(h, was);
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-        if (!known || !mapped_file_id(alloc, now)) return false;
-        holds = same_file(now, was);
-        if (holds) modules::prove_identity(alloc, rec.serial, now);
+        if (!known || !mapped_file_id(alloc, now)) return false;  // cannot compare: not proof
+        stale = !same_file(now, was);
         return true;
     };
-    if (look()) return holds;
-    if (still_there(look)) return guard::closing();  // never proven (closing: nothing more to judge)
-    return holds;
-}
-
-// The memory at `base` is no longer the region the sweep found there: released, decommitted, or now part
-// of another allocation.
-bool region_changed(std::uintptr_t base, const MEMORY_BASIC_INFORMATION& was) {
-    MEMORY_BASIC_INFORMATION m{};
-    return !VirtualQuery(reinterpret_cast<void*>(base), &m, sizeof(m)) || m.State != MEM_COMMIT ||
-           m.AllocationBase != was.AllocationBase;
+    // Never closed for a file that could not be read — whoever mapped it decides when it opens, and
+    // an honest module whose file was locked or whose share dropped was closed for it. Stale only on
+    // positive evidence; a brief settle window lets a transient read succeed.
+    if (!look()) still_there(look);
+    return !stale;
 }
 
 void sweep_memory(SweepMode mode) {
@@ -521,8 +526,7 @@ void sweep_memory(SweepMode mode) {
             continue;
         }
         if (periodic && !still_there([&] {
-                return exec::covers(base, next) || exec::forgotten_since(base, next, forgotten_before) ||
-                       region_changed(base, mbi);
+                return exec::covers(base, next) || exec::forgotten_since(base, next, forgotten_before);
             }))
             continue;
         close_foreign_region(mbi, mode == SweepMode::startup ? "startup" : "sweep");

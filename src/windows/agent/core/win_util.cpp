@@ -348,9 +348,14 @@ std::wstring exact_path(const std::wstring& path) {
         trimmed = !part.empty() && part != L"." && part != L".." && (part.back() == L'.' || part.back() == L' ');
         begin = end + 1;
     }
-    if (!trimmed) return path;
-    if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') return L"\\\\?\\" + path;
-    if (path.compare(0, 2, L"\\\\") == 0) return L"\\\\?\\UNC\\" + path.substr(2);
+    // Also an absolute path at or past MAX_PATH: the process is not long-path aware, so CreateFileW on
+    // such a name fails — the kernel's name for a module on a SUBST drive or deep junction can be far
+    // longer than MAX_PATH, and its honest file then could not be opened and the game was closed.
+    const bool is_abs_drive = path.size() >= 3 && path[1] == L':' && path[2] == L'\\';
+    const bool is_unc = path.compare(0, 2, L"\\\\") == 0;
+    if (!trimmed && !((is_abs_drive || is_unc) && path.size() >= MAX_PATH)) return path;
+    if (is_abs_drive) return L"\\\\?\\" + path;
+    if (is_unc) return L"\\\\?\\UNC\\" + path.substr(2);
     return path;
 }
 

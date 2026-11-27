@@ -236,7 +236,124 @@ def probe_remote_code(pid, proc):
     return winpriv.as_other("admin", write)
 
 
-PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code}
+def _k32():
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.OpenThread.restype = ctypes.c_void_p
+    k32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.SuspendThread.restype = ctypes.c_uint32
+    k32.SuspendThread.argtypes = [ctypes.c_void_p]
+    k32.ResumeThread.restype = ctypes.c_uint32
+    k32.ResumeThread.argtypes = [ctypes.c_void_p]
+    k32.VirtualAllocEx.restype = ctypes.c_void_p
+    k32.VirtualAllocEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+    k32.VirtualFreeEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+    k32.WriteProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+                                       ctypes.POINTER(ctypes.c_size_t)]
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    k32.Thread32First.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k32
+
+
+def _thread_ids(k32, pid):
+    import ctypes
+
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32), ("th32ThreadID", ctypes.c_uint32),
+                    ("th32OwnerProcessID", ctypes.c_uint32), ("tpBasePri", ctypes.c_int32),
+                    ("tpDeltaPri", ctypes.c_int32), ("dwFlags", ctypes.c_uint32)]
+    snap = k32.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+    out = []
+    te = THREADENTRY32()
+    te.dwSize = ctypes.sizeof(te)
+    ok = k32.Thread32First(snap, ctypes.byref(te))
+    while ok:
+        if te.th32OwnerProcessID == pid:
+            out.append(te.th32ThreadID)
+        te.dwSize = ctypes.sizeof(te)
+        ok = k32.Thread32Next(snap, ctypes.byref(te))
+    k32.CloseHandle(snap)
+    return out
+
+
+def _wait_line(proc, rx, seconds=60):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for line in list(proc.lines):
+            m = re.search(rx, line)
+            if m:
+                return m
+        if proc.wait(0.05):
+            return None
+    return None
+
+
+def probe_hold_all_but_spinner(pid, proc):
+    """Every thread of the game but one is held — the guard's too (an administrator's program, past the
+    guard's thread DACL): what NtSuspendProcess leaves when a thread being created slips past it. The
+    one left running keeps calling hooked functions (ffm-hook-spinner); let go, the game must go on."""
+    m = _wait_line(proc, r"TARGET spinner tid=(\d+)")
+    if not m:
+        return "PROBE hold-all-but-one: the spinner never started"
+    spinner = int(m.group(1))
+    k32 = _k32()
+
+    def hold():
+        held = []
+        for tid in _thread_ids(k32, pid):
+            if tid == spinner:
+                continue
+            h = k32.OpenThread(0x0002, 0, tid)  # THREAD_SUSPEND_RESUME
+            if h and k32.SuspendThread(h) != 0xFFFFFFFF:
+                held.append(h)
+            elif h:
+                k32.CloseHandle(h)
+        time.sleep(HOLD_SECONDS)
+        for h in held:
+            k32.ResumeThread(h)
+            k32.CloseHandle(h)
+        return "PROBE held %d threads but the spinner for %d s and let them go" % (len(held), HOLD_SECONDS)
+    return winpriv.as_other("admin", hold)
+
+
+def probe_remote_code_moving(pid, proc):
+    """An administrator's program writes a region of executable memory into the game past every hook, and
+    keeps it moving: a new region every 40 ms, the previous one freed — each gone before the sweep can
+    look at it a second time. Being found once must be enough to close."""
+    k32 = _k32()
+
+    def move():
+        import ctypes
+        h = k32.OpenProcess(0x0008 | 0x0020, 0, pid)  # PROCESS_VM_OPERATION | PROCESS_VM_WRITE
+        if not h:
+            return "PROBE remote-code-moving: open denied (error %d)" % ctypes.get_last_error()
+        moves, prev = 0, None
+        try:
+            end = time.monotonic() + 20
+            while time.monotonic() < end:
+                addr = k32.VirtualAllocEx(h, None, 4096, 0x3000, 0x40)  # MEM_COMMIT|RESERVE, PAGE_EXECUTE_READWRITE
+                if addr:
+                    done = ctypes.c_size_t(0)
+                    k32.WriteProcessMemory(h, addr, b"\xc3", 1, ctypes.byref(done))
+                    if prev:
+                        k32.VirtualFreeEx(h, prev, 0, 0x8000)  # MEM_RELEASE
+                    prev = addr
+                    moves += 1
+                if proc.wait(0.04):
+                    break
+        finally:
+            k32.CloseHandle(h)
+        return "PROBE remote-code moved %d times" % moves
+    return winpriv.as_other("admin", move)
+
+
+PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code,
+          "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
@@ -452,6 +569,17 @@ SCENARIOS = [
         timeout=120, title="Библиотеки самой Java грузятся и выгружаются без остановки (45 с)",
         marker="TARGET did ffm-load-churn",
         build=lambda ctx, native, jar: dict(action="ffm-load-churn 45", iters=2)),
+    # A thread that slipped past the hold keeps calling hooks while every other thread, the guard's too,
+    # stands: the whole game is held, nobody stopped the guard on its own.
+    _sc(id="process_hold_escaped", kind="legit", module="guard_watchdog", os=WIN, needs_ffm=True, needs_admin=True,
+        guard="allow", timeout=120, probe="hold_all_but_spinner", marker="PROBE held",
+        title="Пауза всей игры, кроме одного потока, зовущего хуки (%d с), и продолжение" % HOLD_SECONDS,
+        build=lambda ctx, native, jar: dict(action="ffm-hook-spinner 50", iters=2)),
+    # A library loaded fine whose file can no longer be opened (permissions changed, a share dropped):
+    # it was judged when it loaded.
+    _sc(id="module_file_unreadable", kind="legit", module="module_trust", os=WIN, guard="allow", timeout=60,
+        title="Файл загруженной библиотеки стал нечитаемым (права сменились)", marker="TARGET did unreadable-module",
+        build=lambda ctx, native, jar: dict(action="unreadable-module " + str(ctx.java_home / "bin" / "sunmscapi.dll"))),
     # The icon or the version of an unsigned file, read as a file dialog does: the file is mapped as an
     # image that can run no code (LoadLibraryEx AS_IMAGE_RESOURCE) — no module to judge.
     _sc(id="resource_read_unsigned", kind="legit", module="module_trust", os=WIN, needs_ffm=True, needs_native=True,
@@ -535,6 +663,21 @@ SCENARIOS = [
         guard="close:foreign_code", marker="TARGET did ffm-quick-limited-handle",
         title="FFM: VirtualAllocEx(RWX) через хэндл своего процесса без права запроса, выход до обхода",
         build=lambda ctx, native, jar: dict(action="ffm-quick-limited-handle")),
+    _sc(id="image_page_protect", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
+        guard="close:foreign_code", marker="TARGET did ffm-quick-image-cave",
+        title="FFM: страница кода jvm.dll сделана RWX, свой код в её хвосте, выход до обхода",
+        build=lambda ctx, native, jar: dict(action="ffm-quick-image-cave")),
+    _sc(id="overwrite_cached_dll", kind="attack", module="module_trust", os=WIN, needs_ffm=True, needs_native=True,
+        ingame=True, guard="close:untrusted_module", marker="TARGET did ffm-quick-overwrite",
+        proof=[r"TARGET first load allowed"],
+        title="FFM: DLL Microsoft выгружена и перезаписана на месте неподписанной того же размера",
+        build=lambda ctx, native, jar: dict(action="ffm-quick-overwrite " + str(native))),
+    # Code written from outside and kept moving (probe remote_code_moving): found once, closed.
+    _sc(id="foreign_exec_moving", kind="attack", module="foreign_exec_memory", os=WIN, ingame=True, needs_admin=True,
+        guard="close:foreign_code", timeout=60, probe="remote_code_moving", marker="TARGET exit",
+        proof=[r"PROBE remote-code moved [1-9]\d* times"],
+        title="Чужая программа пишет исполняемую память в игру и двигает её — поймать за один обход",
+        build=lambda ctx, native, jar: dict(action="none", iters=160)),
     _sc(id="process_dacl_open", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],

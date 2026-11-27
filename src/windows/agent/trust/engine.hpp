@@ -21,6 +21,9 @@ struct FileFacts {
     FileIdentity identity{};
     bool identity_known = false;
     bool hashed = false;
+    std::uint64_t content_edge = 0;  // a cheap fingerprint of the file's ends (0 = unread): a verdict
+                                     // cached by identity is kept only while this still matches, so a
+                                     // file overwritten in place (same id and size) is judged afresh.
     Sha256Digest sha256{};
     Signatures sigs;
 };

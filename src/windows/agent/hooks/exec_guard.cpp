@@ -79,17 +79,31 @@ HANDLE self_handle() {
 const HANDLE g_self = self_handle();  // never closed: hooks use it while the process exits
 }  // namespace
 
+// Three states: ours, another, or a handle too stripped to tell. A handle without
+// PROCESS_QUERY_LIMITED_INFORMATION tells no id, yet VirtualAllocEx needs no more than
+// PROCESS_VM_OPERATION; the kernel compares the objects behind two handles whatever they allow
+// (Windows 10 1607+, NtCompareObjects). Where even that cannot be asked, the owner stays unknown.
+enum class Owner { ours, other, unknown };
+Owner process_owner(HANDLE process) {
+    if (process == nt::current_process()) return Owner::ours;
+    if (!process) return Owner::other;
+    if (const DWORD pid = GetProcessId(process)) return pid == GetCurrentProcessId() ? Owner::ours : Owner::other;
+    if (g_compare_objects && g_self) return nt::ok(g_compare_objects(process, g_self)) ? Owner::ours : Owner::other;
+    return Owner::unknown;
+}
+
 bool is_current_process(HANDLE process) {
-    if (process == nt::current_process()) return true;
-    if (!process) return false;
-    if (const DWORD pid = GetProcessId(process)) return pid == GetCurrentProcessId();
-    // A handle without PROCESS_QUERY_LIMITED_INFORMATION tells no id, and VirtualAllocEx needs no more
-    // than PROCESS_VM_OPERATION: such a handle to the game's own process was taken for another
-    // process, and executable memory passed every hook unjudged. The kernel compares the objects
-    // behind two handles whatever they allow (Windows 10 1607+); where it cannot be asked, a handle
-    // that does not say whose process it is counts as this one.
-    if (g_compare_objects && g_self) return nt::ok(g_compare_objects(process, g_self));
-    return true;
+    // Unknown counts as ours here, so a stripped handle to the game is judged (and refused), not waved
+    // through. On a genuinely foreign handle mistaken for unknown, a view lands in another address
+    // space, so VirtualQuery finds nothing of it here and nothing is recorded (see nt_hooks).
+    return process_owner(process) != Owner::other;
+}
+
+bool confirmed_current_process(HANDLE process) {
+    // For recording trust or forgetting it: only a handle proven to be the game's own. An unknown
+    // handle is not enough — trust it and a KnownDlls view mapped into another process would be
+    // recorded in the game as a trusted module.
+    return process_owner(process) == Owner::ours;
 }
 
 Requester find_requester() {

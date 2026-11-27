@@ -22,7 +22,9 @@ import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,6 +35,7 @@ import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
+import static java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED;
 
 public final class MebetFfm {
     private static final Linker LINKER = Linker.nativeLinker();
@@ -48,6 +51,8 @@ public final class MebetFfm {
     private static final int SECTION_QUERY = 0x1, SECTION_MAP_READ = 0x4, SECTION_MAP_EXECUTE = 0x8;
     private static final int PROCESS_VM_OPERATION = 0x0008;
     private static final int LOAD_LIBRARY_AS_IMAGE_RESOURCE = 0x20;
+    private static final int MEM_RELEASE = 0x8000;
+    private static final int CREATE_SUSPENDED = 0x4, STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000;
     private static final String GUARD_DLL = "MebetGuard.dll";
 
     private MebetFfm() {}
@@ -61,6 +66,10 @@ public final class MebetFfm {
             case "ffm-exec-alloc": return execAlloc();
             case "ffm-exec-protect": return execProtect();
             case "ffm-freeze-guard": return tamperGuardThreads(false, arg);
+            case "ffm-freeze-guard-decoys": return freezeGuardWithDecoys(arg);
+            case "ffm-hook-spinner": return hookSpinner(arg);
+            case "ffm-quick-image-cave": return quickImageCave();
+            case "ffm-quick-overwrite": return quickOverwrite(arg);
             case "ffm-kill-guard": return tamperGuardThreads(true, arg);
             case "ffm-unload-guard": return unloadGuard(arg);
             case "ffm-jam-sweep": return jamSweep();
@@ -174,6 +183,21 @@ public final class MebetFfm {
         System.load(nativePath);  // a forbidden action while the guard is down
         return "TARGET did " + (kill ? "ffm-kill-guard" : "ffm-freeze-guard") + " (native loaded with the guard "
                 + (kill ? "killed" : "frozen") + ")";
+    }
+
+    // The same, with many threads made suspended first and never let run: a hold of the whole game is
+    // told by most of its threads being suspended, and these decoys must not pass for one.
+    private static String freezeGuardWithDecoys(String nativePath) throws Throwable {
+        MemorySegment sleep = Win.K32.find("Sleep").orElseThrow();
+        int made = 0;
+        for (int i = 0; i < 400; i++) {
+            MemorySegment t = (MemorySegment) Win.CreateThread.invokeExact(MemorySegment.NULL, 65536L, sleep,
+                    MemorySegment.NULL, CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, MemorySegment.NULL);
+            if (t.address() != 0) made++;
+        }
+        System.out.println("TARGET made " + made + " suspended decoy threads");
+        System.out.flush();
+        return tamperGuardThreads(false, nativePath).replace("ffm-freeze-guard", "ffm-freeze-guard-decoys");
     }
 
     // ---- unload the guard: FreeLibrary until the module is gone, then a forbidden thing. -------
@@ -332,6 +356,90 @@ public final class MebetFfm {
         return "TARGET did ffm-quick-limited-handle (native code ran from VirtualAllocEx memory)";
     }
 
+    // A page of the JVM's own image made writable and executable, a byte written into the padding at the
+    // end of its code section and run: the protect hook let every change on image pages pass unjudged.
+    private static String quickImageCave() throws Throwable {
+        for (String name : new String[] {"jvm.dll", "java.dll", "verify.dll", "jimage.dll"}) {
+            MemorySegment m = (MemorySegment) Win.GetModuleHandleW.invokeExact(wstr(name));
+            if (m.address() == 0) continue;
+            MemorySegment hdr = m.reinterpret(4096);
+            int lfanew = hdr.get(JAVA_INT_UNALIGNED, 0x3C);
+            int sections = hdr.get(JAVA_SHORT_UNALIGNED, lfanew + 6) & 0xFFFF;
+            int table = lfanew + 24 + (hdr.get(JAVA_SHORT_UNALIGNED, lfanew + 20) & 0xFFFF);
+            for (int i = 0; i < sections && table + i * 40 + 40 <= 4096; i++) {
+                int s = table + i * 40;
+                if ((hdr.get(JAVA_INT_UNALIGNED, s + 36) & 0x20000000) == 0) continue;  // IMAGE_SCN_MEM_EXECUTE
+                long end = m.address() + (hdr.get(JAVA_INT_UNALIGNED, s + 12) & 0xFFFFFFFFL)
+                        + (hdr.get(JAVA_INT_UNALIGNED, s + 8) & 0xFFFFFFFFL);
+                long cave = (end + 15) & ~15L, pageEnd = (end + 4095) & ~4095L;
+                if (pageEnd - cave < 16) continue;
+                MemorySegment page = MemorySegment.ofAddress(pageEnd - 4096).reinterpret(4096);
+                MemorySegment old = ARENA.allocate(JAVA_INT);
+                int ok = (int) Win.VirtualProtect.invokeExact(page, 4096L, PAGE_EXECUTE_READWRITE, old);
+                if (ok == 0) throw new IllegalStateException("VirtualProtect(RWX) on " + name + " was refused");
+                MemorySegment code = MemorySegment.ofAddress(cave).reinterpret(16);
+                write(code, retCode());
+                flush(code);
+                call(code);
+                return "TARGET did ffm-quick-image-cave (code ran in the padding of " + name + ")";
+            }
+        }
+        throw new IllegalStateException("no code cave in the JVM's images");
+    }
+
+    // A Microsoft library copied next to the game, loaded (allowed) and unloaded, then its file
+    // replaced in place by an unsigned one of the same size and loaded again: a verdict kept by the
+    // file's id and size — both unchanged by a write in place — let it in with no new check.
+    private static String quickOverwrite(String nativePath) throws Throwable {
+        Path sys = Path.of(System.getenv("SystemRoot"), "System32", "dbghelp.dll");
+        byte[] cheat = Files.readAllBytes(Path.of(nativePath));
+        long size = Files.size(sys);
+        if (cheat.length > size) throw new IllegalStateException(nativePath + " is bigger than " + sys);
+        Path p = Path.of("overwrite-" + ProcessHandle.current().pid() + ".dll").toAbsolutePath();
+        Files.copy(sys, p, StandardCopyOption.REPLACE_EXISTING);
+        try (Arena a = Arena.ofConfined()) {
+            SymbolLookup.libraryLookup(p, a);
+        }
+        System.out.println("TARGET first load allowed (" + p.getFileName() + ")");
+        System.out.flush();
+        Files.write(p, Arrays.copyOf(cheat, (int) size));  // same file, same id and size
+        try (Arena a = Arena.ofConfined()) {
+            SymbolLookup.libraryLookup(p, a);
+        }
+        return "TARGET did ffm-quick-overwrite (an unsigned library loaded in place of a Microsoft one)";
+    }
+
+    // Legit: one thread keeps calling hooked functions (VirtualAlloc / VirtualFree) while every other
+    // thread of the game, the guard's too, is held from outside (the scenario's probe) — what a thread
+    // that slipped past NtSuspendProcess does while the whole game stands.
+    private static String hookSpinner(String arg) throws Throwable {
+        final long end = System.nanoTime() + Long.parseLong(arg) * 1_000_000_000L;
+        final AtomicLong calls = new AtomicLong();
+        final AtomicReference<Throwable> failed = new AtomicReference<>();
+        Thread t = new Thread(() -> {
+            try {
+                int tid = (int) Win.GetCurrentThreadId.invokeExact();
+                System.out.println("TARGET spinner tid=" + tid);
+                System.out.flush();
+                while (System.nanoTime() < end) {
+                    MemorySegment m = (MemorySegment) Win.VirtualAlloc.invokeExact(MemorySegment.NULL, 65536L,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                    if (m.address() != 0) {
+                        int freed = (int) Win.VirtualFree.invokeExact(m, 0L, MEM_RELEASE);
+                    }
+                    calls.incrementAndGet();
+                    Thread.sleep(2);
+                }
+            } catch (Throwable e) {
+                failed.set(e);
+            }
+        }, "mebet-spinner");
+        t.start();
+        t.join();
+        if (failed.get() != null) throw failed.get();
+        return "TARGET did ffm-hook-spinner (" + calls.get() + " hooked calls)";
+    }
+
     // ---- Legit: the resources of an unsigned file (its icon, its version), as a file dialog reads
     // them: LoadLibraryEx AS_IMAGE_RESOURCE maps it as an image that cannot run code. --------------
     private static String resourceRead(String path) throws Throwable {
@@ -446,6 +554,10 @@ public final class MebetFfm {
                 FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
         static final MethodHandle VirtualAlloc2 = fn(KBASE, "VirtualAlloc2",
                 FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT));
+        static final MethodHandle VirtualFree = fn(K32, "VirtualFree",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT));
+        static final MethodHandle CreateThread = fn(K32, "CreateThread",
+                FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
         static final MethodHandle VirtualAllocEx = fn(K32, "VirtualAllocEx",
                 FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
         static final MethodHandle CreateFileW = fn(K32, "CreateFileW",

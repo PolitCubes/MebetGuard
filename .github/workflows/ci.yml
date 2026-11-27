@@ -95,7 +95,11 @@ jobs:
       # glibc 2.28, its own Java 17) — the oldest system promised. The release build too: on Linux it
       # differs only in the WSL check, which a GitHub runner does not trip.
       - name: starts a JVM on glibc 2.28 (the guard of this build, Java 17)
+        # bash, for pipefail: the default sh in this container has none, so a guard that crashed (a
+        # non-zero exit) after the JVM had printed the marker still left the step green through the pipe.
+        shell: bash
         run: |
+          set -o pipefail
           export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
           mkdir -p tests/out
           "$JAVA_HOME/bin/javac" -d tests/out tests/java/MebetSmoke.java

@@ -352,6 +352,38 @@ bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
     return ok;
 }
 
+// A cheap 64-bit fingerprint of the file's ends (its first and last page) and its size: enough that an
+// in-place overwrite, which keeps the id and size, changes it. Not a security hash — it only keeps a
+// cached allow from outliving the content it was about; a full signature check still runs on a miss.
+// 0 when nothing could be read (then the fingerprint is simply not used).
+std::uint64_t content_edge(HANDLE file, std::uint64_t size) {
+    std::uint64_t h = 1469598103934665603ULL;  // FNV-1a
+    auto fold = [&](const unsigned char* p, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+    };
+    unsigned char sz[8];
+    for (int i = 0; i < 8; ++i) sz[i] = static_cast<unsigned char>((size >> (i * 8)) & 0xFF);
+    fold(sz, 8);
+    unsigned char buf[4096];
+    bool any = false;
+    auto read_at = [&](std::uint64_t off) {
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(off & 0xFFFFFFFFu);
+        ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+        DWORD got = 0;
+        if (ReadFile(file, buf, sizeof(buf), &got, &ov) && got) {
+            fold(buf, got);
+            any = true;
+        }
+    };
+    read_at(0);
+    if (size > sizeof(buf)) read_at(size - sizeof(buf));
+    return any ? h : 0;
+}
+
 Decision decide(HANDLE file, const std::wstring& path_hint) {
     watchdog::SlowWork slow;  // a signature or catalog check shows nothing while it runs
     State& st = state();
@@ -360,11 +392,15 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
     f.path = final_path(file);
     if (f.path.empty()) f.path = path_hint;
     f.identity_known = identity_of(file, f.identity);
+    f.content_edge = content_edge(file, f.identity_known ? f.identity.size : 0);
 
     if (f.identity_known) {
         AcquireSRWLockShared(&st.lock);
         auto it = st.cache.find(f.identity);
-        if (it != st.cache.end()) {
+        // A cached verdict is reused only when the file's ends still hash the same: an unload and an
+        // in-place overwrite with cheat code of the same size (its mtime restorable with SetFileTime)
+        // keeps the id, but not this fingerprint, so it is verified again rather than let in.
+        if (it != st.cache.end() && it->second.facts.content_edge == f.content_edge) {
             Decision cached = it->second;
             ReleaseSRWLockShared(&st.lock);
             return cached;

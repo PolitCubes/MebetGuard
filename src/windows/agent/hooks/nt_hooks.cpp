@@ -64,16 +64,19 @@ constexpr NTSTATUS kAccessDenied = nt::kStatusAccessDenied;
 // at that address later was taken for it. Everything they touch works without TLS (the tables
 // and the shutdown flag are plain globals).
 
-// What a view just mapped at `base` is, as the view itself tells: an image that can run code (SEC_IMAGE:
-// its allocation protection is PAGE_EXECUTE_WRITECOPY), or something else — data, or an image mapped
-// with SEC_IMAGE_NO_EXECUTE (LoadLibraryEx AS_IMAGE_RESOURCE: icons, version info), PAGE_READONLY.
-// NtQuerySection cannot tell the last: such a section reads back as a plain image, and every icon
-// read from an unsigned file was judged as code and closed the game. TLS-free.
-enum class View { unknown, code_image, other };
+// What a view just mapped at `base` is, as the view itself tells — not the section handle, which may
+// allow nothing. An image that can run code (SEC_IMAGE: allocation protection PAGE_EXECUTE_WRITECOPY);
+// an image mapped only for its resources (SEC_IMAGE_NO_EXECUTE, LoadLibraryEx AS_IMAGE_RESOURCE: icons,
+// version info, PAGE_READONLY) — NtQuerySection cannot tell this one from a code image, so every icon
+// read from an unsigned file was judged as code and closed the game; plain data; or unknown, when
+// nothing of the view is mapped here (a view the kernel put in another address space). TLS-free.
+enum class View { unknown, code_image, resource_image, data };
 View view_kind(void* base) {
     MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(base, &mbi, sizeof(mbi)) || mbi.AllocationBase != base) return View::unknown;
-    return mbi.Type == MEM_IMAGE && execguard::executable(mbi.AllocationProtect) ? View::code_image : View::other;
+    if (!VirtualQuery(base, &mbi, sizeof(mbi)) || mbi.AllocationBase != base || mbi.State != MEM_COMMIT)
+        return View::unknown;
+    if (mbi.Type == MEM_IMAGE) return execguard::executable(mbi.AllocationProtect) ? View::code_image : View::resource_image;
+    return View::data;
 }
 
 inline bool tls_ready() {
@@ -139,56 +142,84 @@ bool section_is_image(HANDLE section) {
     return image_attributes(info.AllocationAttributes);
 }
 
+// The real call writes the mapped base and size into the hook's own locals, never the caller's
+// out-variables, which another thread could zero between the syscall and the judge — a lost race then
+// left an image mapped, unjudged. The caller's variables are set only at the very end, once judged.
 template <typename Real>
-NTSTATUS map_view(const char* operation, HANDLE section, HANDLE process, PVOID* base, PSIZE_T view_size, ULONG protect,
-                  Real real) {
+NTSTATUS map_view(const char* operation, HANDLE section, HANDLE process, PVOID* out_base, PSIZE_T out_size,
+                  ULONG protect, Real real) {
+    PVOID lbase = out_base ? *out_base : nullptr;
+    SIZE_T lsize = out_size ? *out_size : 0;
+    auto give_back = [&](PVOID* ob, PSIZE_T os) {
+        if (ob) *ob = lbase;
+        if (os) *os = lsize;
+    };
     if (!tls_ready()) {
-        if (!execguard::is_current_process(process)) return real();
+        if (!execguard::is_current_process(process)) return real(out_base, out_size);
         if (execguard::executable(protect)) return kAccessDenied;  // cannot be judged here (see tls_ready)
-        // Whether it is an image that can run code, only the view tells (view_kind): such a view is
-        // taken back, as it cannot be judged here either.
-        const NTSTATUS s = real();
-        if (nt::ok(s) && base && *base && view_kind(*base) != View::other) {
-            real_NtUnmapViewOfSection(process, *base);
-            *base = nullptr;
+        const NTSTATUS s = real(&lbase, &lsize);
+        // Only the view tells whether it is an image that can run code; such a view is taken back, as
+        // it cannot be judged here either. Data (icons, a resource image) passes.
+        if (nt::ok(s) && lbase && view_kind(lbase) == View::code_image) {
+            real_NtUnmapViewOfSection(process, lbase);
             return kAccessDenied;
         }
+        give_back(out_base, out_size);
         return s;
     }
     watchdog::check_from_hook();
-    if (guard::shutting_down() || !execguard::is_current_process(process)) return real();
+    if (guard::shutting_down() || !execguard::is_current_process(process)) return real(out_base, out_size);
+    const bool confirmed = execguard::confirmed_current_process(process);
     bool image = section_is_image(section);
     execguard::Requester req;
     if (!image && execguard::executable(protect)) {
         req = execguard::find_requester();
-        if (!execguard::may_create_exec(req, operation, 0, view_size ? *view_size : 0)) return kAccessDenied;
+        if (!execguard::may_create_exec(req, operation, 0, out_size ? *out_size : 0)) return kAccessDenied;
     }
     const int op = exec::op_begin();
-    const NTSTATUS s = real();
-    bool no_code_image = false;
-    if (nt::ok(s) && base && *base && view_size) {
-        // The view itself tells what was mapped, whatever the handle allows: a section that could not
-        // be asked (no SECTION_QUERY) was taken for data and its image mapped unjudged; and an image
-        // mapped for its resources only can run no code, and is no module to judge (view_kind).
-        const View k = view_kind(*base);
-        if (k != View::unknown) {
-            no_code_image = image && k == View::other;
-            image = k == View::code_image;
-        }
+    const NTSTATUS s = real(&lbase, &lsize);
+    if (!nt::ok(s) || !lbase || !lsize) {
+        exec::op_end(op);
+        give_back(out_base, out_size);
+        return s;
     }
-    if (nt::ok(s) && base && *base && view_size && !no_code_image) {
-        if (image) {
-            if (!gate::on_image_view(section, *base, *view_size)) {
-                real_NtUnmapViewOfSection(process, *base);
-                *base = nullptr;
-                exec::op_end(op);
-                return kAccessDenied;
-            }
-        } else if (execguard::executable(protect)) {
-            execguard::record(reinterpret_cast<std::uintptr_t>(*base), *view_size, req, exec::Source::map);
-        }
+    const View k = view_kind(lbase);
+    // Nothing of the view is mapped in this address space (unknown): it is in another process, whatever
+    // the handle claimed — record nothing, judge nothing.
+    if (k == View::unknown) {
+        exec::op_end(op);
+        give_back(out_base, out_size);
+        return s;
     }
+    if (k == View::resource_image) {  // an image that can run no code: no module to judge
+        exec::op_end(op);
+        give_back(out_base, out_size);
+        return s;
+    }
+    if (k == View::code_image) {
+        // A trusted view is recorded as a module; a handle we cannot prove is the game's own may not
+        // plant one, so an image on such a handle is taken back rather than recorded.
+        if (!confirmed || !gate::on_image_view(section, lbase, lsize)) {
+            real_NtUnmapViewOfSection(process, lbase);
+            lbase = nullptr;
+            exec::op_end(op);
+            give_back(out_base, out_size);
+            return kAccessDenied;
+        }
+    } else if (execguard::executable(protect)) {  // an executable data view
+        if (!confirmed) {  // never recorded as allowed on an unproven handle
+            real_NtUnmapViewOfSection(process, lbase);
+            lbase = nullptr;
+            exec::op_end(op);
+            give_back(out_base, out_size);
+            return kAccessDenied;
+        }
+        execguard::record(reinterpret_cast<std::uintptr_t>(lbase), lsize, req, exec::Source::map);
+    }
+    // A non-executable data view (whatever NtQuerySection said) can run no code: nothing to judge.
+    (void)image;
     exec::op_end(op);
+    give_back(out_base, out_size);
     return s;
 }
 
@@ -196,9 +227,8 @@ NTSTATUS NTAPI hook_NtMapViewOfSection(HANDLE section, HANDLE process, PVOID* ba
                                        SIZE_T commit, PLARGE_INTEGER offset, PSIZE_T view_size, ULONG inherit,
                                        ULONG allocation, ULONG protect) {
     if (is_token(base, 1)) return canary(1);
-    return map_view("NtMapViewOfSection", section, process, base, view_size, protect, [&] {
-        return real_NtMapViewOfSection(section, process, base, zero_bits, commit, offset, view_size, inherit,
-                                       allocation, protect);
+    return map_view("NtMapViewOfSection", section, process, base, view_size, protect, [&](PVOID* b, PSIZE_T sz) {
+        return real_NtMapViewOfSection(section, process, b, zero_bits, commit, offset, sz, inherit, allocation, protect);
     });
 }
 
@@ -206,9 +236,8 @@ NTSTATUS NTAPI hook_NtMapViewOfSectionEx(HANDLE section, HANDLE process, PVOID* 
                                          PSIZE_T view_size, ULONG allocation, ULONG protect, PVOID extended,
                                          ULONG extended_count) {
     if (is_token(base, 7)) return canary(7);
-    return map_view("NtMapViewOfSectionEx", section, process, base, view_size, protect, [&] {
-        return real_NtMapViewOfSectionEx(section, process, base, offset, view_size, allocation, protect, extended,
-                                         extended_count);
+    return map_view("NtMapViewOfSectionEx", section, process, base, view_size, protect, [&](PVOID* b, PSIZE_T sz) {
+        return real_NtMapViewOfSectionEx(section, process, b, offset, sz, allocation, protect, extended, extended_count);
     });
 }
 
@@ -301,12 +330,20 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
     }
     const auto addr = reinterpret_cast<std::uintptr_t>(*base);
-    // Image pages (relocations, import tables, other hooks) belong to the load gate.
-    if (modules::find(addr) || exec::covers(addr, addr + (*size ? *size : 1))) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool on_image = modules::find(addr) ||
+                          (VirtualQuery(*base, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE);
+    if (on_image) {
+        // An image page made executable (relocations, import tables, a trusted overlay's hooks) belongs
+        // to the load gate — but foreign code making jvm.dll's own .text writable-and-executable to run
+        // from its padding, or restoring ntdll's hooked bytes, reaches an image page too. The loader
+        // itself sets these during a load (only system frames: no requester); anyone else is judged.
+        const execguard::Requester req = execguard::find_requester();
+        if (req.address != 0 && !execguard::may_create_exec(req, "NtProtectVirtualMemory", addr, *size))
+            return kAccessDenied;
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
     }
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(*base, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE) {
+    if (exec::covers(addr, addr + (*size ? *size : 1))) {
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
     }
     const execguard::Requester req = execguard::find_requester();
@@ -366,6 +403,7 @@ Target g_targets[kHookCount] = {
     {"NtAllocateVirtualMemoryEx", reinterpret_cast<void**>(&real_NtAllocateVirtualMemoryEx), reinterpret_cast<void*>(&hook_NtAllocateVirtualMemoryEx), nullptr, {}},
 };
 constexpr int kRequiredHooks = 6;  // the six of the ТЗ; the Ex variants only where ntdll has them
+constexpr unsigned kMandatoryMask = (1u << kRequiredHooks) - 1;  // always in the self-check mask
 
 // Other threads must not run inside the bytes being patched: Detours suspends them.
 std::vector<HANDLE> other_threads() {
@@ -424,28 +462,38 @@ bool install(std::string* failed) {
         }
     }
 
-    std::vector<HANDLE> threads = other_threads();
-    LONG err = DetourTransactionBegin();
-    if (err == NO_ERROR) err = DetourUpdateThread(GetCurrentThread());
-    for (HANDLE t : threads) DetourUpdateThread(t);
-    int failed_index = -1;
-    for (int i = 0; i < kHookCount && err == NO_ERROR; ++i) {
-        if (!g_targets[i].entry) continue;  // an Ex variant this Windows does not have
-        err = DetourAttach(g_targets[i].real, g_targets[i].hook);
-        if (err != NO_ERROR) failed_index = i;
-    }
-    if (err == NO_ERROR) {
-        err = DetourTransactionCommit();
-    } else {
-        DetourTransactionAbort();
-    }
-    for (HANDLE t : threads) CloseHandle(t);
-    if (err != NO_ERROR) {
-        if (failed) {
-            *failed = failed_index >= 0 ? g_targets[failed_index].name : "DetourTransactionCommit";
-            *failed += " error " + std::to_string(err);
+    // One transaction patches the required six at once; each Ex variant is retried on its own, so one
+    // the system has already patched in a way Detours cannot relocate cannot roll the rest back.
+    auto attach = [&](const std::vector<int>& which, std::string* why) -> bool {
+        std::vector<HANDLE> threads = other_threads();
+        LONG err = DetourTransactionBegin();
+        if (err == NO_ERROR) err = DetourUpdateThread(GetCurrentThread());
+        for (HANDLE t : threads) DetourUpdateThread(t);
+        const char* at = "DetourTransactionCommit";
+        for (int i : which) {
+            if (err != NO_ERROR) break;
+            err = DetourAttach(g_targets[i].real, g_targets[i].hook);
+            if (err != NO_ERROR) at = g_targets[i].name;
         }
+        if (err == NO_ERROR) err = DetourTransactionCommit();
+        else DetourTransactionAbort();
+        for (HANDLE t : threads) CloseHandle(t);
+        if (err != NO_ERROR && why) *why = std::string(at) + " error " + std::to_string(err);
+        return err == NO_ERROR;
+    };
+
+    std::vector<int> required;
+    for (int i = 0; i < kRequiredHooks; ++i) required.push_back(i);
+    if (std::string why; !attach(required, &why)) {  // the six of the ТЗ must all go in
+        if (failed) *failed = why;
         return false;
+    }
+    // The Ex variants, each on its own: one a security product has already patched is left out — the
+    // periodic sweep still covers that path — instead of failing the whole install and closing an
+    // honest game (hardening_failed).
+    for (int i = kRequiredHooks; i < kHookCount; ++i) {
+        if (!g_targets[i].entry) continue;
+        if (!attach({i}, nullptr)) g_targets[i].entry = nullptr;  // not hooked after all
     }
     g_installed = 0;
     for (int i = 0; i < kHookCount; ++i) {
@@ -479,7 +527,10 @@ unsigned canary_round() {
         a.NtUnmapViewOfSectionEx(nullptr, const_cast<PVOID>(static_cast<const volatile void*>(&g_tokens[8])), 0);
     if (g_installed & (1u << 9))
         a.NtAllocateVirtualMemoryEx(nullptr, const_cast<PVOID*>(&g_tokens[9]), &zero, 0, 0, nullptr, 0);
-    return static_cast<unsigned>(InterlockedCompareExchange(&g_canary_hits, 0, 0)) & g_installed;
+    // The six of the ТЗ are always in the mask, whatever g_installed holds: a 4-byte write to that
+    // global must not take them out of the self-check — with the mandatory bits forced on, a canary
+    // that no longer reaches a removed hook reads as "not reached" and the game is closed.
+    return static_cast<unsigned>(InterlockedCompareExchange(&g_canary_hits, 0, 0)) & (g_installed | kMandatoryMask);
 }
 
 namespace {
@@ -527,7 +578,7 @@ void check_entries(EntryCheck out[kHookCount]) {
     for (int i = 0; i < kHookCount; ++i) {
         const auto* p = static_cast<const unsigned char*>(g_targets[i].entry);
         out[i].name = g_targets[i].name;
-        out[i].present = (g_installed & (1u << i)) != 0;
+        out[i].present = i < kRequiredHooks || (g_installed & (1u << i)) != 0;
         out[i].bytes_same = p && std::memcmp(p, g_targets[i].expected, sizeof(g_targets[i].expected)) == 0;
         out[i].first_jump = p ? jump_target(p) : 0;
     }

@@ -65,6 +65,13 @@ std::atomic<HANDLE> g_watchdog{nullptr};
 std::atomic<HANDLE> g_watchdog_own{nullptr};
 std::atomic<bool> g_watchdog_created{false};
 std::atomic<std::uint64_t> g_created_at{0};  // when start() ran: the clock of threads that have not beaten yet
+// Whether stderr is a console, decided once at start(): a stuck console write or a QuickEdit
+// selection must not make the kill path call GetFileType/WriteFile, which would block behind it.
+std::atomic<int> g_stderr_console{-1};
+bool stderr_console() {
+    const int c = g_stderr_console.load(std::memory_order_relaxed);
+    return c >= 0 ? c != 0 : win::stderr_is_console();
+}
 // The worker's thread id, set by the worker itself. No TLS: SlowWork and worker_beat run on any
 // thread, also in a loader callback on a thread that has no TLS block yet or any more. Windows
 // may hand the id of a thread that has ended to a new one, which would then beat for a dead
@@ -113,28 +120,42 @@ bool stopped(HANDLE t) { return ended(t) || suspended(t) == 1; }
 // moment it next called one (process_hold on a Windows ARM64 runner, half a minute into the hold). A
 // cheat that stops the guard's threads leaves the game's running: a game held whole cannot be played,
 // and when it is let go, the guard runs again. Never for a close already pending (see check_from_hook).
+bool thread_ran(HANDLE t) {
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetThreadTimes(t, &c, &e, &k, &u)) return true;  // cannot tell: do not dismiss it
+    const auto busy = [](FILETIME f) { return (static_cast<std::uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    return busy(k) != 0 || busy(u) != 0;
+}
+
 bool process_held(HANDLE worker, HANDLE watchdog) {
+    // A hold never ends a thread: a killed guard thread is tampering, not a pause.
+    if (ended(worker) || (watchdog && ended(watchdog))) return false;
     const auto& a = nt::api();
     if (!a.NtGetNextThread) return false;
     const DWORD self = GetCurrentThreadId();
     const DWORD guard_ids[2] = {worker ? GetThreadId(worker) : 0, watchdog ? GetThreadId(watchdog) : 0};
-    int others = 0, held = 0;
+    // THREAD_QUERY_LIMITED_INFORMATION only: it is all the guard's own thread DACL grants the user, and
+    // enough for the suspend count and the times. Asking for more opens no protected thread at all, so
+    // an honest game held whole looked like no threads, and was closed with guard_stalled.
+    int ran = 0, held = 0;
     HANDLE prev = nullptr;
-    for (int n = 0; n < 4096; ++n) {
+    for (int n = 0; n < 8192; ++n) {
         HANDLE next = nullptr;
-        if (!nt::ok(a.NtGetNextThread(nt::current_process(), prev, THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
-                                      0, 0, &next)) ||
-            !next)
+        if (!nt::ok(a.NtGetNextThread(nt::current_process(), prev, THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &next)) || !next)
             break;
         if (prev) CloseHandle(prev);
         prev = next;
         const DWORD id = GetThreadId(next);
         if (id == self || (id && (id == guard_ids[0] || id == guard_ids[1]))) continue;
-        ++others;
+        if (!thread_ran(next)) continue;  // a suspended decoy (CREATE_SUSPENDED, never run) is no proof of a hold
+        ++ran;
         if (suspended(next) == 1) ++held;
     }
     if (prev) CloseHandle(prev);
-    return others > 0 && held * 4 >= others * 3;
+    // Most of the threads that have actually run are suspended: the whole game stands. A cheat that
+    // suspends only the guard's threads leaves the game's own running, so held stays far below ran,
+    // and suspended decoys it adds to pad the ratio never ran and do not count.
+    return ran > 0 && held * 4 >= ran * 3;
 }
 
 template <typename Still>
@@ -320,7 +341,7 @@ DWORD WINAPI last_words_main(void*) {
         id = pending ? pending : stalled.id;
         what = "the guard ended the process";
     }
-    if (!win::stderr_is_console()) write_close_line(id, code, what);
+    if (!stderr_console()) write_close_line(id, code, what);
     kill_process(code);
 }
 
@@ -347,8 +368,9 @@ DWORD WINAPI last_words_main(void*) {
         // killed the guard's threads got it too — exactly when the launcher log needs the line.
         // Written from here when stderr is a pipe or a file; a console can be held by a selection
         // and would hold the kill with it.
-        const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-        if (err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_CHAR) write_close_line(id, code, what);
+        // The console state was read at start(), before any thread could be frozen: no GetFileType here,
+        // which on a synchronous stderr handle serialises behind the last-words thread's stuck write.
+        if (!stderr_console()) write_close_line(id, code, what);
     }
     kill_process(code);
 }
@@ -512,6 +534,7 @@ void start(HANDLE worker) {
     if (!worker_copy || !config::enabled(config::Module::guard_watchdog)) return;
     g_worker.store(worker_copy, std::memory_order_release);
     g_created_at.store(now_100ns(), std::memory_order_relaxed);
+    g_stderr_console.store(win::stderr_is_console() ? 1 : 0, std::memory_order_relaxed);
     // The last-words thread first: a stall found a moment later already has it.
     g_say = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_said = CreateEventW(nullptr, TRUE, FALSE, nullptr);

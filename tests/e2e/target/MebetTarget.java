@@ -79,6 +79,9 @@ public class MebetTarget {
                 String name = action.substring("load-library ".length()).trim();
                 System.loadLibrary(name);                // a JDK library by name (java.library.path)
                 System.out.println("TARGET did load-library " + name);
+            } else if (action.startsWith("unreadable-module ")) {
+                String src = action.substring("unreadable-module ".length()).trim();
+                System.out.println("TARGET did unreadable-module " + unreadableModule(src));
             } else if (action.startsWith("thread-churn ")) {
                 int n = Integer.parseInt(action.substring("thread-churn ".length()).trim());
                 System.out.println("TARGET did thread-churn " + threadChurn(n));
@@ -106,6 +109,39 @@ public class MebetTarget {
             System.out.println("TARGET action-failed " + t);
         }
         System.out.flush();
+    }
+
+    // A library loaded fine (a copy of a JDK one, made by the game itself), whose file then cannot be
+    // opened any more — its permissions changed, as when a share drops or a folder is locked: it was
+    // judged when it loaded, and the game must go on. Its permissions are put back afterwards.
+    private static String unreadableModule(String src) throws Exception {
+        java.nio.file.Path dir = Paths.get("unreadable-" + ProcessHandle.current().pid()).toAbsolutePath();
+        Files.createDirectories(dir);
+        java.nio.file.Path dll = dir.resolve(Paths.get(src).getFileName());
+        Files.copy(Paths.get(src), dll, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        System.load(dll.toString());
+        icacls(dll, "/deny", "*S-1-1-0:(R)");
+        try {
+            try (java.io.InputStream in = Files.newInputStream(dll)) {
+                throw new IllegalStateException("the file still reads after the deny: the check proves nothing");
+            } catch (java.io.IOException expected) {
+                // denied, as wanted
+            }
+            System.out.println("TARGET module file made unreadable");
+            System.out.flush();
+            Thread.sleep(16_000);  // three periodic sweeps
+        } finally {
+            icacls(dll, "/remove:d", "*S-1-1-0");
+        }
+        return dll.toString();
+    }
+
+    private static void icacls(java.nio.file.Path file, String... args) throws Exception {
+        java.util.List<String> cmd = new java.util.ArrayList<>(java.util.List.of("icacls", file.toString()));
+        cmd.addAll(java.util.List.of(args));
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        String out = new String(p.getInputStream().readAllBytes());
+        if (p.waitFor() != 0) throw new IllegalStateException("icacls " + String.join(" ", args) + " failed: " + out);
     }
 
     // Many short-lived threads, 50 at a time: every start and exit goes through the guard's
