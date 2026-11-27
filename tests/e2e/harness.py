@@ -108,6 +108,8 @@ class Ctx:
         self.classes = self.work / "classes"
         self.marker_jar = self.work / "mebet-marker.jar"
         self.native = None  # filled by build_fixtures()
+        self.inject_dll = None  # mebet_inject_marker.dll (Windows), filled by build_fixtures()
+        self.injector = None    # mebet_injector.exe (Windows), filled by build_fixtures()
         self.ffm = False    # Foreign Function & Memory API in the target (Java 22+)
         self.admin = bool(winpriv and winpriv.is_admin())
         self.no_skip = False
@@ -352,6 +354,22 @@ def probe_remote_code_moving(pid, proc):
     return winpriv.as_other("admin", move)
 
 
+def probe_inject(technique):
+    """A program the harness starts brings the marker library into the game by `technique`
+    (mebet_injector). It runs at the test's own level — the same user as the game — so what decides
+    is the guard, not Windows. Its one line goes into the game's output."""
+    def run(pid, proc, ctx=None):
+        if not ctx or not ctx.injector or not ctx.inject_dll:
+            return "PROBE inject: no injector fixture (no toolchain for the game's architecture)"
+        if not _wait_line(proc, r"TARGET action: ", 60):
+            return "PROBE inject: the game never got to its action"
+        time.sleep(1.0)  # the game is in its heartbeat loop now
+        r, out, _ = run_cmd([ctx.injector, technique, str(pid), ctx.inject_dll], os.environ.copy(), 60)
+        line = (out.strip().splitlines() or ["(no output)"])[-1]
+        return "PROBE %s (exit %d)" % (line, r)
+    return run
+
+
 PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code,
           "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving}
 
@@ -381,6 +399,9 @@ def build_fixtures(ctx):
         raise RuntimeError("jar (marker) failed:\n" + out)
 
     ctx.native = _build_native(ctx)
+    if ctx.os == "windows":
+        ctx.inject_dll = _build_win(ctx, "mebet_inject_marker.c", "mebet_inject_marker.dll", dll=True)
+        ctx.injector = _build_win(ctx, "mebet_injector.c", "mebet_injector.exe", dll=False)
     return ctx
 
 
@@ -388,6 +409,34 @@ def _javac(ctx, sources, out_dir):
     r, out, _ = run_cmd([ctx.tool("javac"), "-d", out_dir] + list(sources), os.environ.copy(), 180)
     if r != 0:
         raise RuntimeError("javac %s failed:\n%s" % (", ".join(s.name for s in sources), out))
+
+
+def _build_win(ctx, source, name, dll):
+    """A Windows test fixture for the injection scenarios, built for the game's Java (its PE machine
+    type checked, as for the unsigned native). None when no toolchain makes a fitting one."""
+    src = HERE / "attacks" / "native" / source
+    out_dir = ctx.work / "native"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / name
+    arch = java_arch(ctx.java_home)
+    targets = {"x86": "i686-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}
+    kind = ["-shared"] if dll else []
+    tries = []
+    if arch in targets:
+        tries.append(["clang", "--target=" + targets[arch]] + kind + ["-o", out, src])
+    tries.append(["gcc"] + (["-m32"] if arch == "x86" else []) + kind + (["-municode"] if not dll else []) +
+                 ["-o", out, src])
+    for cmd in tries:
+        if out.exists():
+            out.unlink()
+        if shutil.which(cmd[0]) and run_cmd(cmd, os.environ.copy(), 120)[0] == 0 and pe_arch(out) == arch:
+            return out
+    if shutil.which("cl"):
+        flags = ["/LD"] if dll else []
+        if run_cmd(["cl", "/nologo"] + flags + [src, "/Fe:" + str(out)], os.environ.copy(), 120,
+                   cwd=out_dir)[0] == 0 and pe_arch(out) == arch:
+            return out
+    return None
 
 
 def _build_native(ctx):
@@ -459,7 +508,10 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
                 if proc.wait(0.05):
                     break
         if pid:
-            fn = lambda: PROBES[probe](pid, proc)  # noqa: E731
+            if probe.startswith("inject:"):  # the injection probes need the fixtures' paths
+                fn = lambda: probe_inject(probe.split(":", 1)[1])(pid, proc, ctx)  # noqa: E731
+            else:
+                fn = lambda: PROBES[probe](pid, proc)  # noqa: E731
             proc.lines.append((winpriv.as_other(other, fn) if other else fn()) + "\n")
     timed_out = not proc.wait(max(0.0, limit - (time.monotonic() - start)))
     if timed_out:
@@ -540,6 +592,17 @@ def _dacl_expect(game, other):
     # The other program as the same user (or as an elevated admin without SeDebugPrivilege):
     # without the guard Windows lets it in, with the guard only the DACL can keep it out.
     return {}
+
+
+def _inject_expect(done, reason):
+    """Injection from another program: the guard's DACL keeps out a program of the same user (or an
+    elevated one without SeDebugPrivilege) — it cannot even open the game. An administrator with
+    SeDebugPrivilege gets past any DACL; then the layers inside the game must catch what it brings in."""
+    def expect(game, other):
+        if other == "admin":
+            return dict(guard="close:" + reason, proof=[done])
+        return dict(guard="neutralize", proof=[r"PROBE INJECTOR failed: OpenProcess"])
+    return expect
 
 
 SCENARIOS = [
@@ -679,6 +742,13 @@ SCENARIOS = [
         proof=[r"PROBE remote-code moved [1-9]\d* times"],
         title="Чужая программа пишет исполняемую память в игру и двигает её — поймать за один обход",
         build=lambda ctx, native, jar: dict(action="none", iters=160)),
+    # ---- injection from another program into the running game (mebet_injector) ----------------
+    _sc(id="inject_remote_thread", kind="attack", module="module_trust", os=WIN, ingame=True,
+        guard="close:untrusted_module", probe="inject:remote-thread", timeout=60, privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR remote-thread done", "untrusted_module"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR remote-thread done"],
+        title="Внедрение DLL: путь в память игры + CreateRemoteThread(LoadLibraryW)",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
     _sc(id="process_dacl_open", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],
@@ -742,6 +812,8 @@ def applies(sc, ctx, variant=(None, None)):
         return "не для %s" % ctx.os
     if sc["needs_dev_mode"] and not ctx.expect_dev_mode:
         return "только для prod-сборки на машине в dev-режиме (запускается с --expect-dev-mode)"
+    if str(sc.get("probe") or "").startswith("inject:") and not (ctx.injector and ctx.inject_dll):
+        return "нет компилятора для фикстур внедрения под архитектуру Java игры"
     if sc["needs_native"] and ctx.native is None:
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:
