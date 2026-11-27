@@ -30,7 +30,7 @@
 | `module_trust` | `hooks/load_gate.cpp` (решение в потоке загрузки), `trust/*` (правила) |
 | `foreign_threads` | `scan/scans.cpp` (`on_thread_attach`, `thread_sweep`) |
 | `hidden_images` | `scan/scans.cpp` (`memory_sweep`) |
-| `foreign_exec_memory` | `hooks/exec_guard.cpp` (учёт), `scan/scans.cpp` (обход) |
+| `foreign_exec_memory` | `hooks/exec_guard.cpp` (учёт), `scan/scans.cpp` (обход), `core/foreign_stop.cpp` (остановка найденного кода) |
 | `jvm_agents`, `jvm_classes` | `src/common/jvm_guard.cpp`, `hooks/load_gate.cpp` (`instrument`/`jdwp`/`attach`) |
 | `hook_self_check` | `hooks/hook_check.cpp` (канарейка + байты входа) |
 | `virtual_machine`, `dev_mode`, `kernel_state`, `driver_names`, `wine`, `debugger`, `time_check`, `extension_points` | `system/environment.cpp` |

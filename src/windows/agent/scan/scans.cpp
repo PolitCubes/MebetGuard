@@ -16,6 +16,7 @@
 
 #include "config.hpp"
 #include "core/exec_table.hpp"
+#include "core/foreign_stop.hpp"
 #include "core/guard.hpp"
 #include "core/module_table.hpp"
 #include "core/watchdog.hpp"
@@ -74,6 +75,10 @@ void close_foreign_thread(std::uintptr_t start, DWORD tid, const char* when) {
     ev.extra_json = w.take();
     ev.fingerprint = {"close.foreign_thread", key.empty() ? std::string("no_region") : key};
     guard::signal(config::Module::foreign_threads, config::Reason::foreign_thread, std::wstring(), std::move(ev));
+    // The thread is running in there already: stop its code (core/foreign_stop.hpp). Not before the
+    // guard is armed — at start-up the walk would stop regions still to be judged, and the main
+    // thread that carries that close out could run into one of them.
+    if (guard::armed() && config::closes(config::Module::foreign_threads)) stop::foreign_code(start);
 }
 
 // `path`: the file mapped there, read when the image was found (it may be gone by now).
@@ -97,6 +102,7 @@ void close_hidden_image(std::uintptr_t base, const std::wstring& path) {
     ev.extra_json = w.take();
     ev.fingerprint = {"close.hidden_image", group};
     guard::signal(config::Module::hidden_images, config::Reason::hidden_image, win::file_name_of(path), std::move(ev));
+    if (guard::armed() && config::closes(config::Module::hidden_images)) stop::hidden_image(base);
 }
 
 void close_foreign_region(const MEMORY_BASIC_INFORMATION& mbi, const char* when) {
@@ -115,6 +121,9 @@ void close_foreign_region(const MEMORY_BASIC_INFORMATION& mbi, const char* when)
     ev.extra_json = w.take();
     ev.fingerprint = {"close.foreign_code", key.empty() ? std::string("unreadable") : key};
     guard::signal(config::Module::foreign_exec_memory, config::Reason::foreign_code, std::wstring(), std::move(ev));
+    // Hashed for the report above; now it stops running (and so does every other unvouched region).
+    if (guard::armed() && config::closes(config::Module::foreign_exec_memory))
+        stop::foreign_code(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress));
 }
 
 bool loader_knows(std::uintptr_t addr) {
@@ -675,12 +684,20 @@ void on_thread_attach() {
     t.known[tid] = created;
     ReleaseSRWLockExclusive(&t.lock);
     if (guard::armed() && start && config::enabled(config::Module::foreign_threads) && !allowed_code(start)) {
+        // The thread has not run one instruction of its own yet. A hand-mapped image (memory written
+        // from outside, sections relocated and imports resolved by the injector, a thread started at
+        // its entry — no loader, so no load gate) was only reported here, and the thread then went on
+        // into the cheat while the close took its time. Its code is made non-executable before this
+        // returns: the thread faults on its first instruction and is parked there
+        // (core/foreign_stop.hpp). Only when the close is real — in report mode the game runs on.
+        const unsigned stopped = config::closes(config::Module::foreign_threads) ? stop::foreign_code(start) : 0u;
         // Inside DllMain: keep it light, the worker builds the full report.
         report::Event ev;
         ev.type = "close.foreign_thread";
         ev.level = report::Level::error;
         ev.title = "Closed: thread starting outside allowed code";
-        ev.extra_json = "{\"when\":\"thread_attach\",\"start\":\"" + cards::address_hex(start) + "\"}";
+        ev.extra_json = "{\"when\":\"thread_attach\",\"start\":\"" + cards::address_hex(start) +
+                        "\",\"stopped_regions\":" + std::to_string(stopped) + "}";
         ev.fingerprint = {"close.foreign_thread", "thread_attach"};
         guard::signal(config::Module::foreign_threads, config::Reason::foreign_thread, std::wstring(), std::move(ev));
     }

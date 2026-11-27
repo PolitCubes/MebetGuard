@@ -16,6 +16,7 @@
 
 #include "boot_info.hpp"
 #include "config.hpp"
+#include "core/foreign_stop.hpp"
 #include "core/guard.hpp"
 #include "core/module_table.hpp"
 #include "core/timing.hpp"
@@ -200,6 +201,7 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
             guard::close_now(config::Reason::hardening_failed, win::wide(failed), std::move(ev));
         }
         gate::register_loader_notifications();
+        stop::install();  // parks threads that run into foreign code once it is stopped
     }
 
     // 4. Developer mode and virtual machine — before the start (ТЗ §8). Off only in the
