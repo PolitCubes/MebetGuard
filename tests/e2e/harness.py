@@ -514,6 +514,7 @@ def _sc(**kw):
     kw.setdefault("ingame", False)         # the attack runs inside the started game (an action)
     kw.setdefault("needs_dev_mode", False)
     kw.setdefault("needs_admin", False)    # the test itself must run as an administrator (its probe)
+    kw.setdefault("corrupts_jvm", False)   # the attack breaks the JVM (TerminateThread): no clean exit
     return kw
 
 
@@ -700,7 +701,7 @@ SCENARIOS = [
         build=lambda ctx, native, jar: dict(action="ffm-unload-guard " + str(native), iters=2)),
     # Then the code comes from outside (probe remote_code): past every hook, so only the sweep can see it.
     _sc(id="tamper_jam_sweep", kind="attack", module="foreign_exec_memory", os=WIN, needs_ffm=True, ingame=True,
-        needs_admin=True, guard="close:foreign_code", timeout=90, probe="remote_code",
+        needs_admin=True, corrupts_jvm=True, guard="close:foreign_code", timeout=90, probe="remote_code",
         title="Убить потоки посреди хука, затем чужая программа пишет код в игру (только обход)",
         marker="TARGET did ffm-jam-sweep", proof=[r"TARGET killed [1-9]\d* threads inside MapViewOfFile",
                                                   r"PROBE remote-code written at 0x[0-9a-f]+"],
@@ -756,6 +757,16 @@ def baseline_ok(sc, base, exp=None):
     """Without the guard: an attack must work, a legit action must run; the app finishes.
     exp["baseline"] == "denied": Windows itself stops this attack at this privilege variant."""
     exp = exp or dict(baseline="works")
+    if sc["corrupts_jvm"] and exp.get("baseline", "works") == "works":
+        # TerminateThread leaves the JVM's own bookkeeping broken, so its exit code and whether it
+        # reaches "TARGET exit" are the attack's doing, not the app's. The attack is proven to have
+        # worked by its marker and its proof; the clean-exit checks do not apply.
+        if not has(base, sc["marker"]):
+            return False, "атака не воспроизвелась: нет маркера %r" % sc["marker"]
+        for rx in exp.get("proof") or sc["proof"]:
+            if not re.search(rx, base["out"]):
+                return False, "атака не доказана (нет %r)" % rx
+        return True, "атака сработала (JVM повреждена TerminateThread)"
     if base["exit"] != 0:
         return False, "приложение не завершилось чисто (exit %s)" % base["exit"]
     if not has(base, "TARGET exit"):
