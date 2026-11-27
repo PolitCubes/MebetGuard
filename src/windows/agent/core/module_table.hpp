@@ -22,6 +22,9 @@ struct Record {
     std::uint64_t serial = 0;  // unique per add: tells this record from a later one at the same base
     trust::FileIdentity id{};  // of the file the trust engine judged, when id_known
     bool id_known = false;
+    std::wstring kernel_name;  // the mapping's name as the kernel gives it (same form the sweep reads):
+                               // a different file mapped at this base has a different name, even when
+                               // its own file cannot be read to compare ids.
 };
 
 void init();  // remembers ntdll / kernelbase / kernel32 / self / exe ranges

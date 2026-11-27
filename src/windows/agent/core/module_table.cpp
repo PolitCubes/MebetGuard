@@ -96,6 +96,8 @@ void init() {
 // without its range (or with the range of the one that is gone).
 void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstring& path, const trust::FileIdentity* id) {
     if (!base || !size) return;
+    // Before the lock: a syscall must not be held across it (the sweep's swap check reads this later).
+    std::wstring kernel_name = win::mapped_file_name(reinterpret_cast<void*>(base));
     Names& n = names();
     AcquireSRWLockExclusive(&n.lock);
     auto it = n.records.find(base);
@@ -104,8 +106,10 @@ void add(std::uintptr_t base, std::size_t size, trust::Trust t, const std::wstri
     if (it != n.records.end() && it->second.size > size)
         ranges().remove_where(base, base + it->second.size, [base](const Payload& p) { return p.base == base; });
     ranges().add(base, base + size, Payload{t, base}, false);
-    n.records[base] = Record{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1,
-                             id ? *id : trust::FileIdentity{}, id != nullptr};
+    Record rec{base, size, t, path, g_serial.fetch_add(1, std::memory_order_relaxed) + 1,
+               id ? *id : trust::FileIdentity{}, id != nullptr};
+    rec.kernel_name = std::move(kernel_name);  // for the sweep's swap check
+    n.records[base] = std::move(rec);
     n.pending.erase(base);
     ReleaseSRWLockExclusive(&n.lock);
 }

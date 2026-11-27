@@ -334,12 +334,14 @@ NTSTATUS NTAPI hook_NtProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T 
     const bool on_image = modules::find(addr) ||
                           (VirtualQuery(*base, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE);
     if (on_image) {
-        // An image page made executable (relocations, import tables, a trusted overlay's hooks) belongs
-        // to the load gate — but foreign code making jvm.dll's own .text writable-and-executable to run
-        // from its padding, or restoring ntdll's hooked bytes, reaches an image page too. The loader
-        // itself sets these during a load (only system frames: no requester); anyone else is judged.
+        // An image page made executable (relocations, import tables, a module's own self-modification,
+        // a trusted overlay's hooks) belongs to the load gate. Only code the JVM itself never emits such
+        // a request from — Java reaching the OS through the Foreign Function API (from_jvm_code) to make
+        // jvm.dll's own .text writable-and-executable and run from its padding, or to restore ntdll's
+        // hooked bytes — is judged here. The loader and every module (trusted or merely unrecognized)
+        // pass, so no honest self-decrypting or relocating image is denied.
         const execguard::Requester req = execguard::find_requester();
-        if (req.address != 0 && !execguard::may_create_exec(req, "NtProtectVirtualMemory", addr, *size))
+        if (req.from_jvm_code && !execguard::may_create_exec(req, "NtProtectVirtualMemory", addr, *size))
             return kAccessDenied;
         return real_NtProtectVirtualMemory(process, base, size, protect, old);
     }

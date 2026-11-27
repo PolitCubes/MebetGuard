@@ -13,6 +13,14 @@ GLIBCXX_FLOOR="GLIBCXX_3.4.25"
 CXXABI_FLOOR="CXXABI_1.3.11"
 GCC_FLOOR="GCC_7.0.0"
 
+command -v readelf >/dev/null || { echo "::error::readelf not found: cannot check symbol versions"; exit 2; }
+for f in "$@"; do
+  [ -f "$f" ] || { echo "::error::no such file to check: $f"; exit 2; }
+done
+# The files must actually carry symbol versions (a stripped or non-ELF file would read as 'needs
+# nothing' for every floor and pass vacuously): require at least one GLIBC version across them all.
+readelf -V "$@" | grep -q "GLIBC_[0-9]" || { echo "::error::no GLIBC symbol versions found in $*: not validated"; exit 2; }
+
 newest() {  # newest "<prefix>_<version>" the files need, empty when none
   # grep finds nothing when no such symbol is needed: that is an answer, not a failure.
   { readelf -V "${@:2}" | grep -o "$1_[0-9][0-9.]*" || true; } | sort -uV | tail -1

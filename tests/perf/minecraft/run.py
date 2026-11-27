@@ -133,8 +133,17 @@ def one(a, mode, copy, pristine, profile, cp, run_no):
     env["JAVA_HOME"] = str(java_home)
     env["MEBET_TEST_NO_UI"] = "1"
     t0 = time.perf_counter()
-    p = subprocess.run([str(c) for c in cmd], cwd=str(copy), env=env, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=900)
+    # A hung client must not discard the runs already done: it is recorded as a failed run and the rest
+    # goes on (the caller writes the json after each run), rather than crashing the whole measurement.
+    try:
+        p = subprocess.run([str(c) for c in cmd], cwd=str(copy), env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=900)
+    except subprocess.TimeoutExpired as e:
+        secs = time.perf_counter() - t0
+        out = (e.stdout or b"").decode("utf-8", "replace")
+        (copy.parent / ("run%02d-%s.log" % (run_no, mode))).write_text(out, encoding="utf-8")
+        return {"error": "timed out", "exit": None, "wall_s": round(secs, 1),
+                "guard": [l for l in out.splitlines() if l.startswith("[Mebet]")][-6:]}
     secs = time.perf_counter() - t0
     out = p.stdout.decode("utf-8", "replace")
     (copy.parent / ("run%02d-%s.log" % (run_no, mode))).write_text(out, encoding="utf-8")
@@ -185,6 +194,8 @@ def main():
             rec = one(a, mode, copy, pristine, profile, cp, k)
             runs[mode].append(rec)
             print("run %d (%s): %s" % (k, mode, json.dumps(rec, ensure_ascii=False)), flush=True)
+            if a.json:  # after every run, so a later hang cannot lose what is already measured
+                Path(a.json).write_text(json.dumps(runs, ensure_ascii=False, indent=2), encoding="utf-8")
 
     md = render(runs, a)
     if a.markdown:

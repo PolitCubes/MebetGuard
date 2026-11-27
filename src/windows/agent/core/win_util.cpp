@@ -299,19 +299,45 @@ std::wstring dos_root_of_volume(const std::wstring& device) {
 
 }  // namespace
 
-std::wstring nt_to_dos(const std::wstring& nt_path) {
-    // Drive letters, refreshed on every call: a game can mount a drive while running.
+// The drive letter -> device map, cached for a few seconds: without this every nt_to_dos ran a
+// GetLogicalDriveStringsW plus a QueryDosDeviceW per drive, and the sweep resolves the same mapped
+// names again and again. A drive mounted while the game runs is still picked up within the window.
+std::vector<std::pair<std::wstring, std::wstring>> drive_map() {
+    struct Cache {
+        SRWLOCK lock = SRWLOCK_INIT;
+        std::vector<std::pair<std::wstring, std::wstring>> entries;
+        std::uint64_t at_ms = 0;
+    };
+    static Cache c;
+    const std::uint64_t now = GetTickCount64();
+    AcquireSRWLockShared(&c.lock);
+    if (c.at_ms && now - c.at_ms < 5000) {
+        auto snapshot = c.entries;
+        ReleaseSRWLockShared(&c.lock);
+        return snapshot;
+    }
+    ReleaseSRWLockShared(&c.lock);
+    std::vector<std::pair<std::wstring, std::wstring>> fresh;
     wchar_t drives[512];
     const DWORD n = GetLogicalDriveStringsW(511, drives);
     if (n > 0 && n < 511) {
         for (const wchar_t* d = drives; *d; d += wcslen(d) + 1) {
             const wchar_t letter[3] = {d[0], L':', 0};
             wchar_t device[MAX_PATH];
-            if (!QueryDosDeviceW(letter, device, MAX_PATH)) continue;
-            const std::wstring dev = device;
-            if (nt_path.size() > dev.size() && istarts_with(nt_path, dev) && nt_path[dev.size()] == L'\\') {
-                return std::wstring(letter) + nt_path.substr(dev.size());
-            }
+            if (QueryDosDeviceW(letter, device, MAX_PATH)) fresh.emplace_back(letter, device);
+        }
+    }
+    AcquireSRWLockExclusive(&c.lock);
+    c.entries = fresh;
+    c.at_ms = now ? now : 1;
+    ReleaseSRWLockExclusive(&c.lock);
+    return fresh;
+}
+
+std::wstring nt_to_dos(const std::wstring& nt_path) {
+    for (const auto& [letter, dev] : drive_map()) {
+        if (nt_path.size() > dev.size() && istarts_with(nt_path, dev) && nt_path[dev.size()] == L'\\') {
+            return letter + nt_path.substr(dev.size());
         }
     }
     if (istarts_with(nt_path, L"\\Device\\Mup\\")) return L"\\\\" + nt_path.substr(12);

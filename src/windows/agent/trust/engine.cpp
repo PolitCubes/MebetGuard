@@ -116,15 +116,16 @@ bool in_display_driver_dir(const std::wstring& path) {
 
 std::string product_version(const std::wstring& path) {
     gate::OwnReadScope own;
-    // GetFileVersionInfo trims a dot or a space at the end of a name: for "name.dll." it reads the
-    // "name.dll" next to it, while the signature was verified on the dotted file through its
-    // handle. No version then — and a publisher rule with a version floor does not match.
-    if (win::exact_path(path) != path) return std::string();
+    // The exact name the file system uses. GetFileVersionInfo otherwise trims a trailing dot or space
+    // ("name.dll." reads the "name.dll" next to it, not the dotted file the signature was verified on)
+    // and cannot open a path at or past MAX_PATH; the \\?\ form it returns reads the very file. Bailing
+    // for any rewritten path, as before, denied a correctly-signed DLL under a deep path a version floor.
+    const std::wstring exact = win::exact_path(path);
     DWORD dummy = 0;
-    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    const DWORD size = GetFileVersionInfoSizeW(exact.c_str(), &dummy);
     if (!size) return std::string();
     std::vector<unsigned char> buf(size);
-    if (!GetFileVersionInfoW(path.c_str(), 0, size, buf.data())) return std::string();
+    if (!GetFileVersionInfoW(exact.c_str(), 0, size, buf.data())) return std::string();
     VS_FIXEDFILEINFO* ffi = nullptr;
     UINT len = 0;
     if (!VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&ffi), &len) || !ffi) return std::string();
@@ -352,10 +353,11 @@ bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
     return ok;
 }
 
-// A cheap 64-bit fingerprint of the file's ends (its first and last page) and its size: enough that an
-// in-place overwrite, which keeps the id and size, changes it. Not a security hash — it only keeps a
-// cached allow from outliving the content it was about; a full signature check still runs on a miss.
-// 0 when nothing could be read (then the fingerprint is simply not used).
+// A cheap 64-bit fingerprint of a file sampled at its start, its three quarter points and its end, with
+// its size: enough that an in-place overwrite — which keeps the id and size — changes it, including one
+// confined to the middle (which a two-ends fingerprint missed). Not a security hash; it only keeps a
+// cached allow from outliving the content it was about, and a full signature check still runs on a miss.
+// 0 when nothing could be read, and 0 is never treated as a match (see the cache lookup).
 std::uint64_t content_edge(HANDLE file, std::uint64_t size) {
     std::uint64_t h = 1469598103934665603ULL;  // FNV-1a
     auto fold = [&](const unsigned char* p, std::size_t n) {
@@ -380,7 +382,13 @@ std::uint64_t content_edge(HANDLE file, std::uint64_t size) {
         }
     };
     read_at(0);
-    if (size > sizeof(buf)) read_at(size - sizeof(buf));
+    if (size > sizeof(buf)) {
+        read_at(size - sizeof(buf));
+        for (int k = 1; k <= 3; ++k) {
+            const std::uint64_t off = (size / 4) * k;
+            if (off + sizeof(buf) <= size) read_at(off);
+        }
+    }
     return any ? h : 0;
 }
 
@@ -397,10 +405,11 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
     if (f.identity_known) {
         AcquireSRWLockShared(&st.lock);
         auto it = st.cache.find(f.identity);
-        // A cached verdict is reused only when the file's ends still hash the same: an unload and an
+        // A cached verdict is reused only when the sampled fingerprint still matches: an unload and an
         // in-place overwrite with cheat code of the same size (its mtime restorable with SetFileTime)
-        // keeps the id, but not this fingerprint, so it is verified again rather than let in.
-        if (it != st.cache.end() && it->second.facts.content_edge == f.content_edge) {
+        // keeps the id, but not this fingerprint, so it is verified again rather than let in. A 0
+        // fingerprint (nothing read) never matches — an unreadable file is re-judged, not waved through.
+        if (it != st.cache.end() && f.content_edge != 0 && it->second.facts.content_edge == f.content_edge) {
             Decision cached = it->second;
             ReleaseSRWLockShared(&st.lock);
             return cached;

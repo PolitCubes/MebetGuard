@@ -376,10 +376,27 @@ bool refusal_stands(std::uintptr_t alloc, const trust::Decision& d) {
 // name (proven once, kept). Unreadable is not proof: a library on its way out is let go when it is
 // gone, but a file kept from the guard by whoever mapped it leaves the record unproven.
 bool record_holds(std::uintptr_t alloc, const modules::Record& rec) {
-    if (!rec.id_known && rec.path.empty()) return true;  // nothing to compare with (the guard's own views)
+    if (!rec.id_known && rec.path.empty() && rec.kernel_name.empty())
+        return true;  // nothing to compare with (the guard's own views)
     bool stale = false;  // set only when a DIFFERENT file is positively seen mapped there
     auto look = [&] {
         if (image_gone(alloc)) return true;  // going: the unmap hook removes the record; hold for now
+        // The mapping's name as the kernel gives it now, against the one stored when the record was made
+        // — both in the same form, so they compare reliably, and a different file swapped in at this base
+        // has a different name even when its own file cannot be opened to compare ids (a cheat unmapping a
+        // trusted DLL by a direct syscall, mapping its own there, and keeping that file unreadable).
+        if (!rec.kernel_name.empty()) {
+            const std::wstring name = win::mapped_file_name(reinterpret_cast<void*>(alloc));
+            if (name.empty()) return false;  // cannot read the mapping's name now: not proof, retry
+            if (!win::name_equals(name, rec.kernel_name)) {
+                stale = true;  // a different file is mapped here
+                return true;
+            }
+            // The same name. An overwrite in place keeps the name, so confirm by id when it can be read.
+            trust::FileIdentity now{};
+            if (rec.id_known && mapped_file_id(alloc, now)) stale = !same_file(now, rec.id);
+            return true;
+        }
         trust::FileIdentity now{};
         if (rec.id_known) {
             if (!mapped_file_id(alloc, now)) return false;  // its file cannot be read now: not proof of a swap

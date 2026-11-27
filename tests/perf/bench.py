@@ -73,13 +73,19 @@ def build(java_home, work):
     shutil.rmtree(classes, ignore_errors=True)
     classes.mkdir(parents=True, exist_ok=True)
     sources = [HERE / "MebetBench.java", HERE / "MebetBenchPayload.java"]
-    if java_feature(java_home) >= 22:
-        sources.append(HERE / "MebetBenchFfm.java")
     javac = Path(java_home) / "bin" / ("javac" + EXE)
-    code, out, _ = run([javac, "-d", classes] + sources, os.environ.copy())
+    # Try to compile the FFM benchmark; whether it compiles — not a parsed release-file version — decides
+    # if the native-memory benchmarks run. An unreadable or odd release file used to silently drop them
+    # (java_feature() -> 0 < 22), hiding a regression in exactly the hooks this measures.
+    code, out, _ = run([javac, "-d", classes] + sources + [HERE / "MebetBenchFfm.java"], os.environ.copy())
+    if code == 0:
+        return classes, True
+    code, out2, _ = run([javac, "-d", classes] + sources, os.environ.copy())
     if code != 0:
-        sys.exit("javac failed:\n" + out)
-    return classes
+        sys.exit("javac failed:\n" + out2)
+    print("::warning::MebetBenchFfm did not compile (Java feature %d, needs 22+); native-memory "
+          "benchmarks (native_alloc, file_mmap, ffm_downcall) are skipped" % java_feature(java_home), flush=True)
+    return classes, False
 
 
 GUARD_TIME = re.compile(r"\[Mebet\] guard time: (.*)")
@@ -114,13 +120,13 @@ def main():
     java = java_home / "bin" / ("java" + EXE)
     guard = Path(a.guard).resolve()
     work = Path(a.work).resolve()
-    classes = build(java_home, work)
+    classes, has_ffm = build(java_home, work)
     env = os.environ.copy()
     env["JAVA_HOME"] = str(java_home)
     env["MEBET_TEST_NO_UI"] = "1"
     # Reports off: a measurement must never send anything, whatever DSN the build has.
     jvm = ["-Xmx" + a.xmx, "-Dmebet.reports=false", "-Dmebet.errors=false"]
-    if java_feature(java_home) >= 22:
+    if has_ffm:
         jvm.append("--enable-native-access=ALL-UNNAMED")
     head = {"baseline": java, "guarded": guard}
 
@@ -133,47 +139,67 @@ def main():
     frames = {"baseline": [], "guarded": []}  # frame_pacing: the full BENCH record per run
     spent = {}  # module -> list of ms per guarded run
 
+    failures = []
+
     def one(mode, args):
-        code, out, secs = run([head[mode]] + jvm + ["-cp", classes, "MebetBench"] + args, env)
+        # A failed or hung single run must not throw away a 20-40 minute measurement: it is recorded as
+        # a failure and the rest goes on. A benchmark left with no data on a side is dropped from the report.
+        try:
+            code, out, secs = run([head[mode]] + jvm + ["-cp", classes, "MebetBench"] + args, env)
+        except subprocess.TimeoutExpired:
+            failures.append("%s %s timed out" % (mode, " ".join(args)))
+            print("::warning::%s" % failures[-1], flush=True)
+            return None, None
         if code != 0:
-            sys.exit("%s %s failed (exit %s):\n%s" % (mode, " ".join(args), code, out))
+            failures.append("%s %s failed (exit %s)" % (mode, " ".join(args), code))
+            print("::warning::%s" % failures[-1], flush=True)
+            return None, None
         if mode == "guarded":
             for k, v in guard_time(out).items():
                 spent.setdefault(k, []).append(v)
         return out, secs
 
+    def write_json():  # after every rep, so a later hang cannot lose what is already measured
+        if not a.json:
+            return
+        rows_now = _rows(values, frames=None)
+        Path(a.json).write_text(json.dumps(dict(rows=rows_now, guard_spent_ms=spent, failures=failures),
+                                           ensure_ascii=False, indent=2), encoding="utf-8")
+
     # Start-up: the whole process, timed outside.
     for i in range(a.startup_reps):
         for mode in (("baseline", "guarded") if i % 2 == 0 else ("guarded", "baseline")):
             _, secs = one(mode, ["startup"])
-            values["startup"][mode].append(secs * 1000)
+            if secs is not None:
+                values["startup"][mode].append(secs * 1000)
+    write_json()
     # Workloads: the in-JVM median round time.
     for rep in range(a.reps):
         for name in names:
             for mode in (("baseline", "guarded") if rep % 2 == 0 else ("guarded", "baseline")):
                 out, _ = one(mode, [name, str(a.warmup), str(a.measure)])
+                if out is None:
+                    continue
                 m = re.search(r"BENCH (\{.*\})", out)
                 if not m:
-                    sys.exit("no BENCH line from %s %s:\n%s" % (mode, name, out))
+                    failures.append("no BENCH line from %s %s" % (mode, name))
+                    print("::warning::%s" % failures[-1], flush=True)
+                    continue
                 rec = json.loads(m.group(1))
                 values[name][mode].append(rec["mean_ms"])
                 if name == "frame_pacing":
                     frames[mode].append(rec)
+        write_json()
         print("rep %d/%d done" % (rep + 1, a.reps), flush=True)
 
-    rows, ratios = [], []
-    for name, v in values.items():
-        b, g = statistics.median(v["baseline"]), statistics.median(v["guarded"])
-        # ± half the larger spread between reps: a difference inside it is not a measurement.
-        noise = max(_spread(v["baseline"]), _spread(v["guarded"])) / 2
-        over = (g - b) / b * 100 if b else 0.0
-        rows.append(dict(name=name, what=WHAT.get(name, ""), baseline_ms=b, guarded_ms=g,
-                         overhead_pct=over, noise_pct=noise, within_noise=abs(over) <= noise))
-        if name != "startup":
-            ratios.append(g / b)
+    rows = _rows(values, frames=None)
+    ratios = [r["guarded_ms"] / r["baseline_ms"] for r in rows
+              if r["name"] != "startup" and r["baseline_ms"]]
     mean = (math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1) * 100 if ratios else 0.0
 
     md = render(rows, mean, spent, a.reps, a.warmup, a.measure, frames)
+    if failures:
+        md += "\nНеудачные прогоны (не вошли в замер):\n" + "\n".join("- " + f for f in failures) + "\n"
     # Files first: a console that cannot print the report must not lose a 20-minute measurement.
     if a.markdown:
         Path(a.markdown).write_text(md, encoding="utf-8")
@@ -181,9 +207,24 @@ def main():
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(md + "\n")
     if a.json:
-        Path(a.json).write_text(json.dumps(dict(rows=rows, mean_overhead_pct=mean, guard_spent_ms=spent),
-                                           ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(a.json).write_text(json.dumps(dict(rows=rows, mean_overhead_pct=mean, guard_spent_ms=spent,
+                                                 failures=failures), ensure_ascii=False, indent=2), encoding="utf-8")
     print(md)
+
+
+def _rows(values, frames=None):
+    """Report rows from whatever was measured; a benchmark with no data on either side is dropped."""
+    rows = []
+    for name, v in values.items():
+        if not v["baseline"] or not v["guarded"]:
+            continue
+        b, g = statistics.median(v["baseline"]), statistics.median(v["guarded"])
+        # ± half the larger spread between reps: a difference inside it is not a measurement.
+        noise = max(_spread(v["baseline"]), _spread(v["guarded"])) / 2
+        over = (g - b) / b * 100 if b else 0.0
+        rows.append(dict(name=name, what=WHAT.get(name, ""), baseline_ms=b, guarded_ms=g,
+                         overhead_pct=over, noise_pct=noise, within_noise=abs(over) <= noise))
+    return rows
 
 
 def _spread(xs):

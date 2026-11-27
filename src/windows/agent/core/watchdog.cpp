@@ -288,6 +288,7 @@ struct LastWords {
     Report report = Report::none;
 };
 LastWords g_words;        // written once by the thread that won g_ending_at, before g_say is set
+std::atomic<bool> g_words_published{false};  // release: its fields are visible once this reads true
 HANDLE g_say = nullptr;   // wakes the last-words thread for the end
 HANDLE g_said = nullptr;  // it has finished
 HANDLE g_tell = nullptr;  // wakes it for the report of the report level
@@ -330,9 +331,14 @@ DWORD WINAPI last_words_main(void*) {
 // log the winner (or its last-words thread) may never have written.
 [[noreturn]] void finish_end(int fallback_code) {
     const auto& stalled = config::reason(config::Reason::guard_stalled);
-    int code = g_words.code;
-    const char* id = g_words.id;
-    const char* what = g_words.what;
+    int code = 0;
+    const char* id = nullptr;
+    const char* what = nullptr;
+    if (g_words_published.load(std::memory_order_acquire)) {  // the winner finished writing its reason
+        code = g_words.code;
+        id = g_words.id;
+        what = g_words.what;
+    }
     if (!code) {
         // Claimed and stopped before its words were written: a close that was pending keeps its own
         // reason (the launcher shows that one), else the guard was stalled.
@@ -358,6 +364,7 @@ DWORD WINAPI last_words_main(void*) {
     g_words.what = what;
     g_words.code = code;
     g_words.report = report;
+    g_words_published.store(true, std::memory_order_release);  // the fields above are now visible to a reader
     bool said = false;
     if (g_say && g_said) {
         SetEvent(g_say);
@@ -531,7 +538,10 @@ void start(HANDLE worker) {
         reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress")));
     const HANDLE worker_copy = query_copy(worker);
     CloseHandle(worker);
-    if (!worker_copy || !config::enabled(config::Module::guard_watchdog)) return;
+    if (!worker_copy || !config::enabled(config::Module::guard_watchdog)) {
+        if (worker_copy) CloseHandle(worker_copy);  // not stored into g_worker: do not leak it
+        return;
+    }
     g_worker.store(worker_copy, std::memory_order_release);
     g_created_at.store(now_100ns(), std::memory_order_relaxed);
     g_stderr_console.store(win::stderr_is_console() ? 1 : 0, std::memory_order_relaxed);
@@ -643,7 +653,12 @@ void check_from_hook() {
         // here as soon as both beats were 8 s old, and the window of a close caused by the
         // watchdog thread itself vanished after 8 seconds), its slow-work limit before that.
         if (stopped(worker)) {
-            if (still_stopped([&] { return stopped(worker); })) end_pending_close("guard threads stopped during the close");
+            // The whole game held (a dump tool, a debugger) and this thread slipped the hold: the
+            // condemned process waits for the hold to lift and the close then finishes, as the honest
+            // stall path does — it is not run to its end mid-suspend, skipping the reason window.
+            if (process_held(worker, watchdog)) return;
+            if (still_stopped([&] { return stopped(worker); }) && !process_held(worker, watchdog))
+                end_pending_close("guard threads stopped during the close");
             return;
         }
         // Before the close starts, the same limit the watchdog thread would apply: the long one
