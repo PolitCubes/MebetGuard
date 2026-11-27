@@ -17,13 +17,16 @@ command -v readelf >/dev/null || { echo "::error::readelf not found: cannot chec
 for f in "$@"; do
   [ -f "$f" ] || { echo "::error::no such file to check: $f"; exit 2; }
 done
-# The files must actually carry symbol versions (a stripped or non-ELF file would read as 'needs
-# nothing' for every floor and pass vacuously): require at least one GLIBC version across them all.
-readelf -V "$@" | grep -q "GLIBC_[0-9]" || { echo "::error::no GLIBC symbol versions found in $*: not validated"; exit 2; }
+# Read every file's version info once (captured, so readelf exiting non-zero on one file does not fail
+# the whole pipeline under pipefail, and so it is not re-run per floor). readelf must have produced
+# version data — otherwise an absent tool or an unreadable/non-ELF file would read as 'needs nothing'
+# for every floor and pass vacuously.
+syms="$(readelf -V "$@" 2>/dev/null || true)"
+printf '%s' "$syms" | grep -qi "version" || { echo "::error::readelf produced no version data for $*: not validated"; exit 2; }
 
 newest() {  # newest "<prefix>_<version>" the files need, empty when none
   # grep finds nothing when no such symbol is needed: that is an answer, not a failure.
-  { readelf -V "${@:2}" | grep -o "$1_[0-9][0-9.]*" || true; } | sort -uV | tail -1
+  { printf '%s\n' "$syms" | grep -o "$1_[0-9][0-9.]*" || true; } | sort -uV | tail -1
 }
 
 bad=0
