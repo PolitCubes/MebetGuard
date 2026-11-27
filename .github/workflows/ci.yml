@@ -1,0 +1,544 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
+#
+# 1. Build — one matrix per OS (build-windows-binaries / build-linux-binaries /
+#    build-macos-binaries). Every arch x variant is its own job and uploads its own artifact
+#    bin-<os>-<arch>-<variant>. prod = release (every module on); dev = devtest (VM, WSL and
+#    dev-mode modules off, so it runs on a VM / dev-mode CI runner). Both unsigned here.
+# 2. e2e — one matrix per OS, after that OS's build matrix passed; one job per arch x feature,
+#    each on that arch's own hardware, runs the attack with the guard and without it.
+# 3. ci-ok — needs only the three e2e matrices and fails if any of them failed, was cancelled
+#    or skipped (an e2e is skipped when its build failed), so a failed build fails it too.
+# 4. sign — release tags only (skipped on pull requests).
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # =================================== 1. build ===================================
+  build-windows-binaries:
+    name: windows ${{ matrix.arch }} ${{ matrix.variant }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   platform: x64,   dir: x86-64-mustdie, variant: prod, kind: release }
+          - { arch: x64,   platform: x64,   dir: x86-64-mustdie, variant: dev,  kind: devtest }
+          - { arch: x86,   platform: Win32, dir: x86-mustdie,    variant: prod, kind: release }
+          - { arch: x86,   platform: Win32, dir: x86-mustdie,    variant: dev,  kind: devtest }
+          - { arch: arm64, platform: ARM64, dir: arm64-mustdie,  variant: prod, kind: release }
+          - { arch: arm64, platform: ARM64, dir: arm64-mustdie,  variant: dev,  kind: devtest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: build
+        shell: pwsh
+        run: ./tools/ci/build-win.ps1 -Platform ${{ matrix.platform }} -Kind ${{ matrix.kind }} -Dir ${{ matrix.dir }}
+      - name: wrapper imports only kernel32
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe "$vs\VC\Tools\MSVC" | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents build\${{ matrix.dir }}-${{ matrix.kind }}\src\windows\Release\MebetGuard.exe | Out-String
+          $static = ($deps -split 'Image has the following delay load dependencies:')[0]
+          $names = [regex]::Matches($static, '(?im)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLower() }
+          $bad = $names | Where-Object { $_ -notin @('kernel32.dll', 'ntdll.dll') }
+          if ($bad) { throw "wrapper imports more than kernel32: $($bad -join ', ')" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-windows-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/${{ matrix.kind }}/
+
+  build-linux-binaries:
+    name: linux ${{ matrix.arch }} ${{ matrix.variant }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # Built inside manylinux_2_28 (AlmaLinux 8), each arch on its own runner: the binaries need
+    # nothing newer than glibc 2.28 and start on Ubuntu 18.10+, Debian 10+, RHEL 8+, Steam Deck.
+    # Built straight on the runner (glibc 2.39) they would not start there at all.
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.machine }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-24.04,     machine: x86_64,  dir: x86-64-linux, variant: prod, kind: release }
+          - { arch: x64,   runner: ubuntu-24.04,     machine: x86_64,  dir: x86-64-linux, variant: dev,  kind: devtest }
+          - { arch: arm64, runner: ubuntu-24.04-arm, machine: aarch64, dir: arm64-linux,  variant: prod, kind: release }
+          - { arch: arm64, runner: ubuntu-24.04-arm, machine: aarch64, dir: arm64-linux,  variant: dev,  kind: devtest }
+    steps:
+      - name: tools
+        run: |
+          dnf install -y java-17-openjdk-devel git
+          /opt/python/cp312-cp312/bin/python -m pip install --no-cache-dir cmake==3.31.6
+          echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DPython3_EXECUTABLE=/opt/python/cp312-cp312/bin/python
+      - name: needs nothing newer than glibc 2.28 and the GCC 8 runtime (symbol versions)
+        run: bash tools/ci/check-glibc.sh dist/${{ matrix.kind }}/${{ matrix.dir }}/*
+      # And really starts there: the guard and a JVM inside this very container (AlmaLinux 8,
+      # glibc 2.28, its own Java 17) — the oldest system promised. The release build too: on Linux it
+      # differs only in the WSL check, which a GitHub runner does not trip.
+      - name: starts a JVM on glibc 2.28 (the guard of this build, Java 17)
+        # bash, for pipefail: the default sh in this container has none, so a guard that crashed (a
+        # non-zero exit) after the JVM had printed the marker still left the step green through the pipe.
+        shell: bash
+        run: |
+          set -o pipefail
+          export JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
+          mkdir -p tests/out
+          "$JAVA_HOME/bin/javac" -d tests/out tests/java/MebetSmoke.java
+          dist/${{ matrix.kind }}/${{ matrix.dir }}/MebetGuard -XX:+DisableAttachMechanism -Dmebet.reports=false \
+            -Dmebet.errors=false -cp tests/out MebetSmoke | tee smoke.out
+          grep -q mebet-smoke-ok smoke.out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/${{ matrix.kind }}/
+
+  build-macos-binaries:
+    name: macos ${{ matrix.arch }} ${{ matrix.variant }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   dir: x86-64-macosx, osx: x86_64, variant: prod, kind: release }
+          - { arch: x64,   dir: x86-64-macosx, osx: x86_64, variant: dev,  kind: devtest }
+          - { arch: arm64, dir: arm64-macosx,  osx: arm64,  variant: prod, kind: release }
+          - { arch: arm64, dir: arm64-macosx,  osx: arm64,  variant: dev,  kind: devtest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: build
+        run: bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx }} -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-macos-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/${{ matrix.kind }}/
+
+  # ========= 2. e2e — every arch of every OS, after the build of the same OS ==========
+  # One job per arch x feature, each arch on its own hardware: Windows x64 and x86 (a 32-bit
+  # process under WOW64; GitHub has no 32-bit Windows) on windows-2022, arm64 on windows-11-arm /
+  # ubuntu-24.04-arm / macos-15, Intel Mac on macos-15-intel. x86 runs 32-bit Java 21: no vendor
+  # ships a 32-bit Windows Java 25. --no-skip: a scenario that cannot run fails the job.
+  e2e-windows:
+    needs: build-windows-binaries
+    name: windows ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout || 25 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86, arm64]
+        feature:
+          # legit: the game's own behaviour must pass the guard untouched
+          - clean_launch
+          - thread_churn
+          - jit_hot
+          - trusted_native_load
+          - ffm_benign
+          - process_hold
+          - native_load_churn
+          - resource_read_unsigned
+          - module_file_unreadable
+          # attacks on the JVM start
+          - env_hardening_jto
+          - env_hardening_jdk
+          - jvm_agents_javaagent
+          - jvm_agents_agentpath
+          - dev_mode
+          # attacks inside the running game
+          - module_trust_load
+          - jvm_agent_module
+          - foreign_exec_alloc
+          - foreign_exec_protect
+          - ex_exec_alloc
+          - ex_image_map
+          - stale_unmap_exec
+          - limited_handle_exec
+          - image_page_protect
+          - overwrite_cached_dll
+          - foreign_exec_moving
+          - process_dacl_open
+          - close_window_timeout
+          # attacks on the guard itself
+          - tamper_freeze_guard
+          - tamper_kill_guard
+          - tamper_unload_guard
+          - tamper_jam_sweep
+          - whole_game_held
+        include:
+          - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     vc: x64,     dir: x86-64-mustdie }
+          - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     vc: x64_x86, dir: x86-mustdie }
+          - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
+          # the prod build must close on a dev-mode runner (203)
+          - { feature: dev_mode, variant: prod, extra: "--expect-dev-mode" }
+          # Awkward paths (tests/e2e/paths.py): every scenario again, with the guard, a copy of the JDK
+          # and the client folder in folders players have — Cyrillic, Ukrainian, German and Spanish
+          # letters, shell specials, and characters beyond the ANSI code page. Two jobs per variant
+          # (the long scenarios apart), each with the usual --no-skip. test_paths.py adds the folders
+          # plain java itself cannot use on the runner's code page (1252).
+          - { arch: x64, feature: paths-cyrillic-quick, extra: "--paths cyrillic", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-cyrillic-long, extra: "--paths cyrillic", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-ukrainian-quick, extra: "--paths ukrainian", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-ukrainian-long, extra: "--paths ukrainian", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-latin-quick, extra: "--paths latin", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-latin-long, extra: "--paths latin", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-specials-quick, extra: "--paths specials", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-specials-long, extra: "--paths specials", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-beyond-quick, extra: "--paths beyond", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+          - { arch: x64, feature: paths-beyond-long, extra: "--paths beyond", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
+              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
+        # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
+        # attacks cannot exist there.
+        exclude:
+          - { arch: x86, feature: ffm_benign }
+          - { arch: x86, feature: native_load_churn }
+          - { arch: x86, feature: foreign_exec_alloc }
+          - { arch: x86, feature: foreign_exec_protect }
+          - { arch: x86, feature: resource_read_unsigned }
+          - { arch: x86, feature: ex_exec_alloc }
+          - { arch: x86, feature: ex_image_map }
+          - { arch: x86, feature: stale_unmap_exec }
+          - { arch: x86, feature: limited_handle_exec }
+          - { arch: x86, feature: image_page_protect }
+          - { arch: x86, feature: overwrite_cached_dll }
+          - { arch: x86, feature: whole_game_held }
+          - { arch: x86, feature: tamper_freeze_guard }
+          - { arch: x86, feature: tamper_kill_guard }
+          - { arch: x86, feature: tamper_unload_guard }
+          - { arch: x86, feature: tamper_jam_sweep }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Liberica (BellSoft): the guard trusts the game Java's publisher, so the JVM's own DLLs
+      # pass the load gate (Temurin's would be closed as untrusted modules, 210).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: ${{ matrix.java }}
+          architecture: ${{ matrix.java_arch }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-windows-${{ matrix.arch }}-${{ matrix.variant || 'dev' }}
+          path: guard
+      - name: e2e fixture (unsigned native, marker only)
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          New-Item -ItemType Directory -Force fixtures | Out-Null
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vc }} && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
+          if (-not (Test-Path fixtures\mebet_fake_cheat.dll)) { throw "fixture not built" }
+      - name: install pytest
+        shell: pwsh
+        run: python -m pip install -q pytest
+      # The "game as a standard user" variants run with a non-admin token: let it read the JDK
+      # and the workspace the elevated runner created (a player's game folder is theirs anyway).
+      - name: standard-user access to the JDK and the workspace
+        shell: pwsh
+        run: |
+          icacls "$env:JAVA_HOME" /grant "*S-1-5-11:(OI)(CI)RX" /T /C /Q | Out-Null
+          icacls "$pwd" /grant "*S-1-5-11:(OI)(CI)M" /T /C /Q | Out-Null
+      # A crash leaves a minidump, so a failed job shows where it crashed, not only an exit code.
+      - name: crash dumps on
+        shell: pwsh
+        run: |
+          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Path $k -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpFolder -Value "$env:RUNNER_TEMP\dumps" -PropertyType ExpandString -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpType -Value 1 -PropertyType DWord -Force | Out-Null
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"   # the verdict lines are Russian: without it the log shows \uXXXX escapes
+        run: |
+          python -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' `
+            --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
+            --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll" ${{ matrix.extra }}
+      - name: crash report (faulting module, JVM hs_err, stack)
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error' } -MaxEvents 3 -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.TimeCreated; $_.Message; '-----' }
+          Get-ChildItem tests\e2e\_work -Recurse -Filter 'hs_err_pid*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -TotalCount 80 }
+          $harch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $cdb = Get-Item "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\$harch\cdb.exe" -ErrorAction SilentlyContinue
+          $dumps = @(Get-ChildItem "$env:RUNNER_TEMP\dumps" -Filter *.dmp -ErrorAction SilentlyContinue)
+          "dumps: $($dumps.Count); cdb: $(if ($cdb) { $cdb.FullName } else { 'not found' })"
+          if ($cdb -and $dumps.Count) {
+            $sym = "$pwd\guard\symbols;srv*$env:RUNNER_TEMP\sym*https://msdl.microsoft.com/download/symbols"
+            & $cdb.FullName -z $dumps[0].FullName -y $sym -c '.ecxr; kn 40; q' 2>&1 | Select-Object -Last 70
+          }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-windows-${{ matrix.arch }}-${{ matrix.feature }}
+          path: ${{ runner.temp }}/dumps
+          if-no-files-found: ignore
+
+  e2e-linux:
+    needs: build-linux-binaries
+    name: linux ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout || 15 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        feature: [clean_launch, thread_churn, jit_hot, ffm_benign,
+                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+        include:
+          - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
+          - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
+          # Awkward paths (tests/e2e/paths.py): every scenario of the OS again, one job per variant
+          - { arch: x64, feature: paths-cyrillic, extra: "--paths cyrillic", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-ukrainian, extra: "--paths ukrainian", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-latin, extra: "--paths latin", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-specials, extra: "--paths specials", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+          - { arch: x64, feature: paths-beyond, extra: "--paths beyond", select: "not dev_mode", runner: ubuntu-24.04, dir: x86-64-linux }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}-dev
+          path: guard
+      - name: prepare
+        run: |
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
+          sudo apt-get update && sudo apt-get install -y python3-pytest
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        run: |
+          python3 -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' \
+            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" ${{ matrix.extra }}
+
+  e2e-macos:
+    needs: build-macos-binaries
+    name: macos ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout || 15 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        feature: [clean_launch, thread_churn, jit_hot, ffm_benign,
+                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+        include:
+          - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
+          - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
+          # The release build — what players get — on the start scenarios (no VM check on macOS).
+          - { arch: x64,   feature: prod-start, variant: prod, select: "clean_launch or env_hardening or jvm_agents", runner: macos-15-intel, dir: x86-64-macosx }
+          - { arch: arm64, feature: prod-start, variant: prod, select: "clean_launch or env_hardening or jvm_agents", runner: macos-15, dir: arm64-macosx }
+          # Awkward paths (tests/e2e/paths.py): every scenario of the OS again, one job per variant
+          - { arch: arm64, feature: paths-cyrillic, extra: "--paths cyrillic", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-ukrainian, extra: "--paths ukrainian", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-latin, extra: "--paths latin", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-specials, extra: "--paths specials", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+          - { arch: arm64, feature: paths-beyond, extra: "--paths beyond", select: "not dev_mode", runner: macos-15, dir: arm64-macosx }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-macos-${{ matrix.arch }}-${{ matrix.variant || 'dev' }}
+          path: guard
+      - name: prepare
+        run: |
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        run: |
+          /tmp/venv/bin/pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' \
+            --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" ${{ matrix.extra }}
+
+  # ======= perf — what the guard costs: a report in the run summary, not part of ci-ok =======
+  # tests/perf/bench.py: every workload gets 3 s of warm-up and at least 10 s measured, without
+  # the guard and through it, the two alternating, 3 reps; the table shows the overhead in %.
+  perf-windows:
+    needs: build-windows-binaries
+    name: perf windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     dir: x86-64-mustdie }
+          - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     dir: x86-mustdie }
+          - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, dir: arm64-mustdie }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: ${{ matrix.java }}
+          architecture: ${{ matrix.java_arch }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-windows-${{ matrix.arch }}-dev
+          path: guard
+      - name: "perf: the same workloads without the guard and through it"
+        shell: pwsh
+        run: python tests/perf/bench.py --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" --json perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-windows-${{ matrix.arch }}
+          path: perf.json
+
+  perf-linux:
+    needs: build-linux-binaries
+    name: perf linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
+          - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}-dev
+          path: guard
+      - name: "perf: the same workloads without the guard and through it"
+        run: |
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
+          python3 tests/perf/bench.py --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" --json perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-linux-${{ matrix.arch }}
+          path: perf.json
+
+  perf-macos:
+    needs: build-macos-binaries
+    name: perf macos ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: macos-15-intel, dir: x86-64-macosx }
+          - { arch: arm64, runner: macos-15,       dir: arm64-macosx }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-macos-${{ matrix.arch }}-dev
+          path: guard
+      - name: "perf: the same workloads without the guard and through it"
+        run: |
+          chmod +x guard/${{ matrix.dir }}/MebetGuard
+          python3 tests/perf/bench.py --guard "$PWD/guard/${{ matrix.dir }}/MebetGuard" --java "$JAVA_HOME" --json perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-macos-${{ matrix.arch }}
+          path: perf.json
+
+  # ======== 3. ci-ok — red if any e2e failed / was cancelled / skipped (= build failed) ======
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [e2e-windows, e2e-linux, e2e-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    steps:
+      - name: every e2e matrix (and so every build) must be green
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: exit 1
+      # needs.*.result does not see every job of a matrix: one that GitHub cancelled because no
+      # runner ever took it (24 min queued on macOS) left the matrix "success", and ci-ok passed with
+      # a feature that never ran. So every build and e2e job of this attempt is asked for by itself.
+      - name: every single build and e2e job ran and passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Pages of 30: a page of 100 of this run's ~150 jobs is answered 502 every time. And the API
+          # answers 502 now and then anyway: asked again, never taken for "nothing is wrong".
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if bad=$(gh api --paginate \
+                "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=30" \
+                --jq '.jobs[] | select(.name != "ci-ok" and .name != "sign" and (.name | startswith("perf ") | not))
+                      | select(.conclusion != "success") | "\(.name): \(.conclusion // .status)"'); then
+              ok=1
+              break
+            fi
+            echo "the GitHub API did not answer (attempt $attempt), asking again"
+            sleep 20
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::the jobs of this run could not be read: not green"
+            exit 1
+          fi
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "::error::not every build and e2e job ran and passed"
+            exit 1
+          fi
+      - name: all green
+        run: echo "all builds and all e2e features passed"
+
+  # ============================ 4. sign — release tags only ============================
+  sign:
+    name: sign
+    needs: ci-ok
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "SignPath signing of MebetGuard.exe / .dll goes here (release tags only)."

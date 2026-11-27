@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <string>
 
 #include "config.hpp"
 #include "core/guard.hpp"
@@ -106,19 +107,61 @@ std::string read_java_version(const std::wstring& java_home) {
     return std::string();
 }
 
-// The path the JVM will see in -agentpath: (ANSI, like every JLI argument). A path the
-// ANSI code page cannot express is replaced by its 8.3 form.
-std::string ansi_agent_path(const std::wstring& path) {
+// JLI hands every path to the JVM in the ANSI code page (GetCommandLineA, GetModuleFileNameA), and
+// only a path that reads back as itself names the same file: Windows writes "?" for a character the
+// code page lacks ("Игры" on a Western-European Windows, an emoji, a Kazakh letter on a Russian one)
+// and a look-alike for some others ("Łódź" becomes "Lódz" on CP1252 — another folder).
+bool ansi_safe(const std::wstring& path) {
     bool lossless = false;
-    std::string a = win::to_ansi(path, &lossless);
-    if (lossless) return a;
-    wchar_t shortp[MAX_PATH * 2];
-    const DWORD n = GetShortPathNameW(path.c_str(), shortp, MAX_PATH * 2);
-    if (n && n < MAX_PATH * 2) {
-        a = win::to_ansi(std::wstring(shortp, n), &lossless);
-        if (lossless) return a;
+    win::to_ansi(path, &lossless);
+    return lossless;
+}
+
+// The 8.3 form of a path, or empty. Many volumes have none (D: by default since Windows 8).
+std::wstring short_path(const std::wstring& path) {
+    const DWORD n = GetShortPathNameW(path.c_str(), nullptr, 0);
+    if (n == 0) return std::wstring();
+    std::wstring s(n, L'\0');
+    const DWORD m = GetShortPathNameW(path.c_str(), &s[0], n);
+    if (m == 0 || m >= n) return std::wstring();
+    s.resize(m);
+    return s;
+}
+
+// The name a folder lists a file under. A launcher may start us by the 8.3 path ("…\MEBETG~1.EXE",
+// a usual way around paths the code page cannot express), and our own exe was then closed as a
+// foreign file next to itself (207).
+std::wstring listed_name_of(const std::wstring& path) {
+    const DWORD n = GetLongPathNameW(path.c_str(), nullptr, 0);
+    if (n != 0) {
+        std::wstring s(n, L'\0');
+        const DWORD m = GetLongPathNameW(path.c_str(), &s[0], n);
+        if (m != 0 && m < n) {
+            s.resize(m);
+            return win::file_name_of(s);
+        }
     }
-    return a;
+    return win::file_name_of(path);
+}
+
+// JLI finds the Java folder from the name jli.dll was loaded by, read back in the ANSI code page,
+// and loads jvm.dll and java.dll by paths built from it. A folder the code page cannot express is
+// loaded by its 8.3 name, which JLI and the JVM then use throughout. Empty when neither works: JLI
+// would stop at a message box of its own ("could not find java.dll") and the launcher would get no
+// reason at all.
+std::wstring jli_dir_for(const std::wstring& bin) {
+    if (ansi_safe(bin)) return bin;
+    const std::wstring s = short_path(bin);
+    return !s.empty() && ansi_safe(s) ? s : std::wstring();
+}
+
+[[noreturn]] void close_unsupported_path(const std::wstring& path) {
+    report::Event ev = event("close.unsupported_path", "Closed: a path Java cannot be given on this Windows");
+    JsonWriter w;
+    w.begin_object().field("path", cards::anonymize(path)).field("code_page", static_cast<unsigned>(GetACP())).end_object();
+    ev.extra_json = w.take();
+    ev.fingerprint = {"close.unsupported_path", std::to_string(GetACP())};
+    guard::close_now(config::Reason::unsupported_path, path, std::move(ev));
 }
 
 // -Djava.library.path may list several folders.
@@ -158,28 +201,44 @@ void locate_java(Context& ctx) {
     ctx.java_home = win::full_path(win::env(L"JAVA_HOME"));
     if (ctx.java_home.empty()) close_java_missing(L"JAVA_HOME");
     if (!win::file_exists(ctx.java_home + L"\\bin\\jli.dll")) close_java_missing(ctx.java_home + L"\\bin\\jli.dll");
+    ctx.jli_dir = jli_dir_for(ctx.java_home + L"\\bin");
+    if (ctx.jli_dir.empty()) close_unsupported_path(ctx.java_home);
     const std::string version = read_java_version(ctx.java_home);
     report::Reporter::instance().set_tag("java", version.empty() ? "unknown" : version);
 }
 
 void load_jli_and_parse(Context& ctx) {
     const std::wstring bin = ctx.java_home + L"\\bin";
-    // ТЗ §4 step 5: the Java bin folder joins the user directories, then jli.dll by full path.
+    // ТЗ §4 step 5: the Java bin folder joins the user directories, then jli.dll by full path —
+    // by the name JLI can read back (jli_dir_for).
     using AddDllDirectoryFn = PVOID(WINAPI*)(PCWSTR);  // Windows 7 needs KB2533623
     if (auto add = reinterpret_cast<AddDllDirectoryFn>(
             reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "AddDllDirectory"))))
         add(bin.c_str());
-    g_jli.dll = LoadLibraryW((bin + L"\\jli.dll").c_str());
+    g_jli.dll = LoadLibraryW((ctx.jli_dir + L"\\jli.dll").c_str());
     if (!g_jli.dll) {
         if (guard::closing()) guard::close_now(config::Reason::untrusted_module, L"jli.dll", report::Event{});
         close_java_missing(bin + L"\\jli.dll");
     }
-    auto get = [&](const char* name) { return reinterpret_cast<void*>(GetProcAddress(g_jli.dll, name)); };
-    g_jli.launch = reinterpret_cast<JliLaunchFn>(get("JLI_Launch"));
-    g_jli.cmd_to_args = reinterpret_cast<JliCmdToArgsFn>(get("JLI_CmdToArgs"));
-    g_jli.get_args = reinterpret_cast<JliGetStdArgsFn>(get("JLI_GetStdArgs"));
-    g_jli.get_argc = reinterpret_cast<JliGetStdArgcFn>(get("JLI_GetStdArgc"));
-    g_jli.init_arg_processing = reinterpret_cast<JliInitArgProcessingFn>(get("JLI_InitArgProcessing"));
+    // A 32-bit JDK exports these JNICALL (__stdcall) functions decorated, e.g. _JLI_Launch@56
+    // (the number is the bytes of arguments on the stack); 64-bit ones use the plain names.
+    auto get = [&](const char* name, int stack_bytes) {
+        void* p = reinterpret_cast<void*>(GetProcAddress(g_jli.dll, name));
+#if defined(_M_IX86)
+        if (!p) {
+            const std::string decorated = "_" + std::string(name) + "@" + std::to_string(stack_bytes);
+            p = reinterpret_cast<void*>(GetProcAddress(g_jli.dll, decorated.c_str()));
+        }
+#else
+        (void)stack_bytes;
+#endif
+        return p;
+    };
+    g_jli.launch = reinterpret_cast<JliLaunchFn>(get("JLI_Launch", 56));
+    g_jli.cmd_to_args = reinterpret_cast<JliCmdToArgsFn>(get("JLI_CmdToArgs", 4));
+    g_jli.get_args = reinterpret_cast<JliGetStdArgsFn>(get("JLI_GetStdArgs", 0));
+    g_jli.get_argc = reinterpret_cast<JliGetStdArgcFn>(get("JLI_GetStdArgc", 0));
+    g_jli.init_arg_processing = reinterpret_cast<JliInitArgProcessingFn>(get("JLI_InitArgProcessing", 8));
     if (!g_jli.launch || !g_jli.cmd_to_args || !g_jli.get_args || !g_jli.get_argc || !g_jli.init_arg_processing)
         close_java_missing(bin + L"\\jli.dll (JLI_* exports)");
 
@@ -198,10 +257,10 @@ void load_jli_and_parse(Context& ctx) {
 void check_files(const Context& ctx) {
     if (!config::enabled(config::Module::proxy_dll)) return;
     // Only the guard next to the exe (ТЗ §4: «рядом с exe — только файлы стража»).
-    const std::wstring exe_name = win::file_name_of(ctx.exe_path);
-    const std::wstring agent_name = win::file_name_of(ctx.agent_path);
+    const std::wstring exe_name = listed_name_of(ctx.exe_path);
+    const std::wstring agent_name = listed_name_of(ctx.agent_path);
     for (const auto& name : win::list_dir(ctx.exe_dir)) {
-        if (iequals_ascii(name, exe_name) || iequals_ascii(name, agent_name)) continue;
+        if (win::name_equals(name, exe_name) || win::name_equals(name, agent_name)) continue;
         report::Event ev = event("close.extra_file", "Closed: foreign file in the guard folder ");
         ev.title += to_utf8(name);
         JsonWriter w;
@@ -263,9 +322,14 @@ void check_agent_args(Context& ctx) {
 
 int run_jvm(Context& ctx) {
     // ТЗ §4 step 9: our -agentpath right after the program name — the JVM calls
-    // Agent_OnLoad in the DLL that is already loaded.
+    // Agent_OnLoad in the DLL that is already loaded. By its file name only: the JVM's LoadLibraryA
+    // finds a loaded module by that name before any search. The full path would go through the
+    // ANSI code page (ansi_safe) and the JVM cuts -agentpath:<path>=<options> at the first "=";
+    // its 8.3 form, in turn, made the JVM map the agent once more under another name, and the load
+    // gate refused that mapping (210). A guard folder "D:\Игры" on a Western-European Windows, or
+    // one named "a=b", never started.
     std::vector<std::string> argv = ctx.argv;
-    argv.insert(argv.begin() + (argv.empty() ? 0 : 1), "-agentpath:" + ansi_agent_path(ctx.agent_path));
+    argv.insert(argv.begin() + (argv.empty() ? 0 : 1), "-agentpath:" + win::to_ansi(win::file_name_of(ctx.agent_path), nullptr));
     std::vector<char*> raw;
     raw.reserve(argv.size() + 1);
     for (auto& a : argv) raw.push_back(&a[0]);

@@ -9,6 +9,7 @@
 #include "core/guard.hpp"
 #include "core/module_table.hpp"
 #include "core/timing.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "json_writer.hpp"
 #include "mebet_trust_data.hpp"
@@ -25,24 +26,29 @@ struct ThreadState {
     HANDLE last_section;         // section the gate just approved on this thread
     trust::Trust last_trust;
     std::wstring* last_path;     // owned
+    trust::FileIdentity* last_id;  // owned; the judged file
 };
-thread_local ThreadState t_gate = {false, nullptr, trust::Trust::unknown, nullptr};
+thread_local ThreadState t_gate = {false, nullptr, trust::Trust::unknown, nullptr, nullptr};
 thread_local int t_own_read = 0;
 
 std::atomic<bool> g_jvm_started{false};
 PVOID g_cookie = nullptr;
 
-void set_last(HANDLE section, trust::Trust t, const std::wstring& path) {
+void set_last(HANDLE section, trust::Trust t, const std::wstring& path, const trust::FileIdentity* id) {
     t_gate.last_section = section;
     t_gate.last_trust = t;
     delete t_gate.last_path;
     t_gate.last_path = new std::wstring(path);
+    delete t_gate.last_id;
+    t_gate.last_id = id ? new trust::FileIdentity(*id) : nullptr;
 }
 
 void clear_last() {
     t_gate.last_section = nullptr;
     delete t_gate.last_path;
     t_gate.last_path = nullptr;
+    delete t_gate.last_id;
+    t_gate.last_id = nullptr;
 }
 
 bool system_path(const std::wstring& path) {
@@ -153,14 +159,18 @@ bool decide_and_apply(const trust::Decision& d, const char* phase) {
 
 VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data, PVOID) {
     if (!data || guard::shutting_down()) return;
+    // A loader event is another thread touching the guard: if a cheat has frozen or killed the guard's
+    // threads, let this one notice the stall and finish the close, rather than only publish one that a
+    // frozen worker never carries out. The loader always calls this on a thread with its TLS in place.
+    watchdog::check_from_hook();
     const auto base = reinterpret_cast<std::uintptr_t>(data->DllBase);
     if (reason == nt::kLdrDllNotificationUnloaded) {
-        modules::remove(base);
+        modules::remove_unloading(base);
         return;
     }
     if (reason != nt::kLdrDllNotificationLoaded) return;
     if (modules::find(base)) return;  // mapped through our hook: already decided
-    // Mapped by a path the hook does not see (NtMapViewOfSectionEx): decide now. The DLL
+    // Mapped past the hooks (a direct system call, a view another process mapped): decide now. The DLL
     // entry point has not run yet; the close is requested before it can matter much.
     std::wstring path = win::mapped_file_name(data->DllBase);
     if (path.empty() && data->FullDllName && data->FullDllName->Buffer)
@@ -168,7 +178,9 @@ VOID NTAPI on_loader_event(ULONG reason, const nt::LdrDllNotificationData* data,
     timing::Scope scope(config::Module::module_trust);
     const trust::Decision d = trust::decide_path(path);
     if (d.verdict.allowed) {
-        modules::add(base, data->SizeOfImage, d.verdict.trust, d.facts.path);
+        // The size the kernel has mapped, not the one in the loader's data.
+        if (const std::size_t extent = win::image_extent(base))
+            modules::add(base, extent, d.verdict.trust, d.facts.path, d.facts.identity_known ? &d.facts.identity : nullptr);
         report_inventory(d);
     } else {
         deny_module(d, d.verdict.reason, "loader_notification");
@@ -212,7 +224,8 @@ bool on_image_section(HANDLE file) {
     }
     t_gate.busy = false;
     const bool allow = decide_and_apply(d, jvm_started() ? "game" : "prestart");
-    if (allow) set_last(nullptr, d.verdict.allowed ? d.verdict.trust : trust::Trust::unknown, d.facts.path);
+    if (allow) set_last(nullptr, d.verdict.allowed ? d.verdict.trust : trust::Trust::unknown, d.facts.path,
+                        d.facts.identity_known ? &d.facts.identity : nullptr);
     return allow;
 }
 
@@ -227,7 +240,7 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         return true;
     }
     if (section && section == t_gate.last_section) {
-        modules::add(b, size, t_gate.last_trust, t_gate.last_path ? *t_gate.last_path : std::wstring());
+        modules::add(b, size, t_gate.last_trust, t_gate.last_path ? *t_gate.last_path : std::wstring(), t_gate.last_id);
         clear_last();
         return true;
     }
@@ -252,15 +265,19 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         return true;
     }
     // Any other image section (created before the hooks, by NtCreateSectionEx, or handed
-    // over from another process): judge the file that is actually mapped.
+    // over from another process): judge the file that is actually mapped. That can take seconds
+    // on a cold disk, and the sweep must not take the view for an image mapped around the loader
+    // meanwhile: it is marked as being judged. Not recorded: a record would exempt it from every
+    // later sweep, and a judging thread that never finishes would leave it so for good.
     const std::wstring path = win::mapped_file_name(base);
+    modules::add_pending(b);
     trust::Decision d;
     {
         timing::Scope scope(config::Module::module_trust);
         d = trust::decide_path(path);
     }
     if (d.verdict.allowed) {
-        modules::add(b, size, d.verdict.trust, d.facts.path);
+        modules::add(b, size, d.verdict.trust, d.facts.path, d.facts.identity_known ? &d.facts.identity : nullptr);
         report_inventory(d);
         return true;
     }
@@ -269,6 +286,7 @@ bool on_image_view(HANDLE section, void* base, SIZE_T size) {
         modules::add(b, size, trust::Trust::unknown, d.facts.path);
         return true;
     }
+    modules::remove(b);  // the caller unmaps the view
     return false;
 }
 
@@ -286,6 +304,15 @@ trust::Decision decide_loaded_module(std::uintptr_t base, std::size_t, const std
 }
 
 void deny_module(const trust::Decision& d, config::Reason reason, const char* phase) {
+    // Test builds: which rule refused the file, so a failed e2e run says why. Not into a console:
+    // this can run inside the load hook, and a console held by a text selection would hold the
+    // loading thread with it.
+    if (config::kTestBuild && !win::stderr_is_console()) {
+        std::fprintf(stderr, "[Mebet] refused: %s rule=%s identity=%s phase=%s path=%s\n", config::reason(reason).id,
+                     d.verdict.rule.empty() ? "-" : d.verdict.rule.c_str(), d.facts.identity_known ? "yes" : "no",
+                     phase, to_utf8(d.facts.path).c_str());
+        std::fflush(stderr);
+    }
     const std::wstring file = win::file_name_of(d.facts.path);
     const std::uintptr_t requester = load_requester();
     const std::uintptr_t start = current_thread_start();

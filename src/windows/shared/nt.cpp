@@ -21,6 +21,10 @@ Api load() {
     resolve(a.ntdll, a.NtAllocateVirtualMemory, "NtAllocateVirtualMemory");
     resolve(a.ntdll, a.NtProtectVirtualMemory, "NtProtectVirtualMemory");
     resolve(a.ntdll, a.NtFreeVirtualMemory, "NtFreeVirtualMemory");
+    resolve(a.ntdll, a.NtCreateSectionEx, "NtCreateSectionEx");
+    resolve(a.ntdll, a.NtMapViewOfSectionEx, "NtMapViewOfSectionEx");
+    resolve(a.ntdll, a.NtUnmapViewOfSectionEx, "NtUnmapViewOfSectionEx");
+    resolve(a.ntdll, a.NtAllocateVirtualMemoryEx, "NtAllocateVirtualMemoryEx");
     resolve(a.ntdll, a.NtQueryVirtualMemory, "NtQueryVirtualMemory");
     resolve(a.ntdll, a.NtQuerySection, "NtQuerySection");
     resolve(a.ntdll, a.NtQuerySystemInformation, "NtQuerySystemInformation");

@@ -3,7 +3,9 @@
 #include "core/win_util.hpp"
 
 #include <cwchar>
+#include <utility>
 
+#include "core/watchdog.hpp"
 #include "strings.hpp"
 
 namespace mebet::win {
@@ -41,6 +43,16 @@ bool is_native_x86_os() {
 #endif
 }
 
+USHORT wow64_native_machine() {
+    if (!is_wow64()) return IMAGE_FILE_MACHINE_UNKNOWN;
+    using Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+    static const Fn fn = reinterpret_cast<Fn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2")));
+    USHORT process = IMAGE_FILE_MACHINE_UNKNOWN, native = IMAGE_FILE_MACHINE_UNKNOWN;
+    if (fn && fn(GetCurrentProcess(), &process, &native) && native != IMAGE_FILE_MACHINE_UNKNOWN) return native;
+    return IMAGE_FILE_MACHINE_AMD64;  // IsWow64Process2 is Windows 10+; before it WOW64 ran only on x64
+}
+
 std::string utf8(const std::wstring& w) { return to_utf8(w); }
 std::wstring wide(const std::string& s) { return from_utf8(s); }
 
@@ -55,11 +67,14 @@ std::wstring from_ansi(const std::string& s) {
 std::string to_ansi(const std::wstring& w, bool* lossless) {
     if (lossless) *lossless = true;
     if (w.empty()) return std::string();
-    BOOL used_default = FALSE;
     const int n = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
     std::string s(static_cast<std::size_t>(n > 0 ? n : 0), '\0');
-    if (n > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, &used_default);
-    if (lossless) *lossless = n > 0 && !used_default;
+    if (n > 0 && WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr) != n)
+        s.clear();
+    // Lossless only when it reads back as the same text. lpUsedDefaultChar misses the best fit,
+    // where Windows quietly writes a look-alike ("Łódź" → "Lódz", a fullwidth quote → '"'): another
+    // path, reported as exact. It also misses a lone surrogate turned into U+FFFD under UTF-8.
+    if (lossless) *lossless = !s.empty() && from_ansi(s) == w;
     return s;
 }
 
@@ -133,17 +148,29 @@ std::wstring strip_long_prefix(const std::wstring& p) {
 }
 }  // namespace
 
+bool name_equals(std::wstring_view a, std::wstring_view b) {
+    if (a.size() != b.size()) return false;
+    if (a.empty()) return true;
+    // The system's own upper-case table, the one file systems use (Vista+).
+    return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) ==
+           CSTR_EQUAL;
+}
+
+bool name_starts_with(std::wstring_view s, std::wstring_view prefix) {
+    return s.size() >= prefix.size() && name_equals(s.substr(0, prefix.size()), prefix);
+}
+
 bool path_under(const std::wstring& path, const std::wstring& dir) {
     const std::wstring p = strip_long_prefix(path);
     std::wstring d = strip_long_prefix(dir);
     while (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
     if (d.empty() || p.size() <= d.size()) return false;
-    if (!istarts_with(p, d)) return false;
+    if (!name_starts_with(p, d)) return false;
     return p[d.size()] == L'\\' || p[d.size()] == L'/';
 }
 
 bool same_path(const std::wstring& a, const std::wstring& b) {
-    return iequals_ascii(strip_long_prefix(full_path(a)), strip_long_prefix(full_path(b)));
+    return name_equals(strip_long_prefix(full_path(a)), strip_long_prefix(full_path(b)));
 }
 
 bool file_exists(const std::wstring& path) {
@@ -176,36 +203,238 @@ std::vector<std::wstring> list_dir(const std::wstring& dir, bool* had_subdirs) {
     return out;
 }
 
-std::wstring nt_to_dos(const std::wstring& nt_path) {
-    // Drive letters, refreshed on every call: a game can mount a drive while running.
+namespace {
+
+// GetFinalPathNameByHandleW into a string of any length; empty on failure.
+std::wstring final_name(HANDLE h, DWORD flags) {
+    wchar_t small[MAX_PATH + 8];
+    DWORD n = GetFinalPathNameByHandleW(h, small, MAX_PATH + 8, flags);
+    if (n == 0) return std::wstring();
+    if (n < MAX_PATH + 8) return std::wstring(small, n);
+    std::wstring big(n, L'\0');  // n counts the terminating zero here
+    n = GetFinalPathNameByHandleW(h, &big[0], n, flags);
+    if (n == 0 || n >= big.size()) return std::wstring();
+    big.resize(n);
+    return big;
+}
+
+// A file or folder opened only to ask for its name: no data access, so share modes do not stand
+// in the way of a file the loader has mapped.
+HANDLE open_for_name(const std::wstring& path) {
+    return CreateFileW(exact_path(path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+// The DOS root of a volume ("\Device\HarddiskVolume3") from the mount manager: "C:", or
+// "C:\Mount\Data" for a volume mounted only into a folder; empty when it has none. Asked through
+// the volume's root folder, so WOW64 never redirects it.
+std::wstring ask_dos_root_of_volume(const std::wstring& device) {
+    watchdog::SlowWork slow;  // the open can wait on the device
+    const HANDLE h = open_for_name(L"\\\\?\\GLOBALROOT" + device + L"\\");
+    if (h == INVALID_HANDLE_VALUE) return std::wstring();
+    std::wstring root = strip_long_prefix(final_name(h, FILE_NAME_OPENED | VOLUME_NAME_DOS));
+    CloseHandle(h);
+    while (!root.empty() && (root.back() == L'\\' || root.back() == L'/')) root.pop_back();
+    return root;
+}
+
+// Devices that are not volumes: their "root folder" is a server or a pipe namespace. Opening it
+// can wait on the network, and this runs inside the load hook; a path on them has no DOS root to
+// find anyway.
+bool not_a_volume(const std::wstring& device) {
+    static const wchar_t* const kNames[] = {L"\\Device\\Mup",              L"\\Device\\LanmanRedirector",
+                                            L"\\Device\\WebDavRedirector", L"\\Device\\NamedPipe",
+                                            L"\\Device\\Mailslot",         L"\\Device\\Afd",
+                                            L"\\Device\\Null",             L"\\Device\\ConDrv"};
+    for (const wchar_t* n : kNames)
+        if (iequals_ascii(device, n)) return true;
+    return false;
+}
+
+// Asked once per volume: the answer does not change while the volume is mounted, and the question
+// opens a handle — it used to be asked again for every module path, inside the load hook too.
+struct VolumeRoot {
+    std::wstring device;
+    std::wstring root;       // DOS root, "" = none found
+    std::uint64_t asked_ms;  // when
+};
+struct VolumeRoots {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<VolumeRoot> known;
+};
+// "None" may be a volume that really has no DOS name — or one failed open (a filter driver, a
+// moment without resources). Remembered for the whole session, one such failure turned every
+// later path on that volume into the GLOBALROOT form, which compares unequal to every DOS folder.
+constexpr std::uint64_t kNoRootRetryMs = 5000;
+// And a letter can be changed while the volume stays mounted (Disk Management, mountvol): a known
+// answer is asked again after this long.
+constexpr std::uint64_t kRootRetryMs = 30000;
+
+std::wstring dos_root_of_volume(const std::wstring& device) {
+    static VolumeRoots* const roots = new VolumeRoots();  // leaked: hooks use it while the process exits
+    VolumeRoots& v = *roots;
+    const std::uint64_t now = GetTickCount64();
+    AcquireSRWLockShared(&v.lock);
+    for (const VolumeRoot& k : v.known) {
+        if (iequals_ascii(k.device, device) && now - k.asked_ms < (k.root.empty() ? kNoRootRetryMs : kRootRetryMs)) {
+            const std::wstring root = k.root;
+            ReleaseSRWLockShared(&v.lock);
+            return root;
+        }
+    }
+    ReleaseSRWLockShared(&v.lock);
+    const std::wstring root = ask_dos_root_of_volume(device);
+    AcquireSRWLockExclusive(&v.lock);
+    bool kept = false;
+    for (VolumeRoot& k : v.known) {
+        if (!iequals_ascii(k.device, device)) continue;
+        k.root = root;
+        k.asked_ms = now;
+        kept = true;
+    }
+    if (!kept && v.known.size() < 64) v.known.push_back(VolumeRoot{device, root, now});
+    ReleaseSRWLockExclusive(&v.lock);
+    return root;
+}
+
+}  // namespace
+
+// The drive letter -> device map, cached for a few seconds: without this every nt_to_dos ran a
+// GetLogicalDriveStringsW plus a QueryDosDeviceW per drive, and the sweep resolves the same mapped
+// names again and again. A drive mounted while the game runs is still picked up within the window.
+std::vector<std::pair<std::wstring, std::wstring>> drive_map() {
+    struct Cache {
+        SRWLOCK lock = SRWLOCK_INIT;
+        std::vector<std::pair<std::wstring, std::wstring>> entries;
+        std::uint64_t at_ms = 0;
+    };
+    static Cache c;
+    const std::uint64_t now = GetTickCount64();
+    AcquireSRWLockShared(&c.lock);
+    if (c.at_ms && now - c.at_ms < 5000) {
+        auto snapshot = c.entries;
+        ReleaseSRWLockShared(&c.lock);
+        return snapshot;
+    }
+    ReleaseSRWLockShared(&c.lock);
+    std::vector<std::pair<std::wstring, std::wstring>> fresh;
     wchar_t drives[512];
     const DWORD n = GetLogicalDriveStringsW(511, drives);
     if (n > 0 && n < 511) {
         for (const wchar_t* d = drives; *d; d += wcslen(d) + 1) {
             const wchar_t letter[3] = {d[0], L':', 0};
             wchar_t device[MAX_PATH];
-            if (!QueryDosDeviceW(letter, device, MAX_PATH)) continue;
-            const std::wstring dev = device;
-            if (nt_path.size() > dev.size() && istarts_with(nt_path, dev) && nt_path[dev.size()] == L'\\') {
-                return std::wstring(letter) + nt_path.substr(dev.size());
-            }
+            if (QueryDosDeviceW(letter, device, MAX_PATH)) fresh.emplace_back(letter, device);
+        }
+    }
+    AcquireSRWLockExclusive(&c.lock);
+    c.entries = fresh;
+    c.at_ms = now ? now : 1;
+    ReleaseSRWLockExclusive(&c.lock);
+    return fresh;
+}
+
+std::wstring nt_to_dos(const std::wstring& nt_path) {
+    for (const auto& [letter, dev] : drive_map()) {
+        if (nt_path.size() > dev.size() && istarts_with(nt_path, dev) && nt_path[dev.size()] == L'\\') {
+            return letter + nt_path.substr(dev.size());
         }
     }
     if (istarts_with(nt_path, L"\\Device\\Mup\\")) return L"\\\\" + nt_path.substr(12);
+    if (istarts_with(nt_path, L"\\Device\\")) {
+        // No letter matched. QueryDosDeviceW must query the logon session's \?? folder, and its DACL
+        // lets in only SYSTEM, Administrators and its owner — Administrators again when an elevated
+        // token created it. A standard-user token made from an elevated one (`runas /trustlevel`, a
+        // launcher dropping its rights, the CI "game as a user") has Administrators deny-only: every
+        // lookup is refused, C: too. The raw NT path cannot be opened (the guard refused its own exe,
+        // 212), and a GLOBALROOT path compares unequal to every DOS folder (jvm.dll "outside the
+        // client Java", 209; the WOW64 layer "hidden", 214). The mount manager answers any token —
+        // and also names a volume mounted only into a folder.
+        const std::size_t end = nt_path.find(L'\\', 8);
+        const std::wstring device = nt_path.substr(0, end);
+        if (not_a_volume(device)) return nt_path;  // a redirector, a pipe: as the kernel names it
+        if (end != std::wstring::npos) {
+            const std::wstring root = dos_root_of_volume(device);
+            if (!root.empty()) return root + nt_path.substr(end);
+        }
+        // A volume with no DOS name at all: the GLOBALROOT form still opens with every Win32 file API.
+        return L"\\\\?\\GLOBALROOT" + nt_path;
+    }
     return nt_path;
+}
+
+std::wstring exact_path(const std::wstring& path) {
+    if (path.compare(0, 4, L"\\\\?\\") == 0 || path.compare(0, 4, L"\\\\.\\") == 0) return path;
+    if (path.find(L'/') != std::wstring::npos) return path;  // not a name the kernel gave: left to Win32
+    bool trimmed = false;  // a component Win32 would trim (but not "." and "..")
+    for (std::size_t begin = 0; begin < path.size() && !trimmed;) {
+        std::size_t end = path.find(L'\\', begin);
+        if (end == std::wstring::npos) end = path.size();
+        const std::wstring part = path.substr(begin, end - begin);
+        trimmed = !part.empty() && part != L"." && part != L".." && (part.back() == L'.' || part.back() == L' ');
+        begin = end + 1;
+    }
+    // Also an absolute path at or past MAX_PATH: the process is not long-path aware, so CreateFileW on
+    // such a name fails — the kernel's name for a module on a SUBST drive or deep junction can be far
+    // longer than MAX_PATH, and its honest file then could not be opened and the game was closed.
+    const bool is_abs_drive = path.size() >= 3 && path[1] == L':' && path[2] == L'\\';
+    const bool is_unc = path.compare(0, 2, L"\\\\") == 0;
+    if (!trimmed && !((is_abs_drive || is_unc) && path.size() >= MAX_PATH)) return path;
+    if (is_abs_drive) return L"\\\\?\\" + path;
+    if (is_unc) return L"\\\\?\\UNC\\" + path.substr(2);
+    return path;
+}
+
+std::size_t image_extent(std::uintptr_t base) {
+    std::uintptr_t pos = base;
+    for (int guard_count = 0; guard_count < 65536; ++guard_count) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(reinterpret_cast<void*>(pos), &m, sizeof(m)) || m.Type != MEM_IMAGE ||
+            reinterpret_cast<std::uintptr_t>(m.AllocationBase) != base)
+            break;
+        pos = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+    }
+    return pos - base;
+}
+
+std::wstring canonical_path(const std::wstring& path) {
+    if (path.empty()) return std::wstring();
+    const HANDLE h = open_for_name(path);
+    if (h == INVALID_HANDLE_VALUE) return std::wstring();
+    std::wstring out = strip_long_prefix(final_name(h, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS));
+    if (out.empty()) {
+        const std::wstring nt = final_name(h, FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+        if (!nt.empty()) out = L"\\\\?\\GLOBALROOT" + nt;
+    }
+    CloseHandle(h);
+    return out;
 }
 
 std::wstring mapped_file_name(const void* address) {
     const auto& a = nt::api();
     if (!a.NtQueryVirtualMemory) return std::wstring();
-    alignas(8) unsigned char buf[sizeof(UNICODE_STRING) + 2 * 4096];
+    alignas(8) unsigned char small[sizeof(UNICODE_STRING) + 2 * 4096];
     SIZE_T ret = 0;
-    if (!nt::ok(a.NtQueryVirtualMemory(nt::current_process(), const_cast<void*>(address),
-                                       nt::kMemoryMappedFilenameInformation, buf, sizeof(buf), &ret)))
-        return std::wstring();
-    const auto* us = reinterpret_cast<const UNICODE_STRING*>(buf);
-    if (!us->Buffer || !us->Length) return std::wstring();
+    NTSTATUS s = a.NtQueryVirtualMemory(nt::current_process(), const_cast<void*>(address),
+                                        nt::kMemoryMappedFilenameInformation, small, sizeof(small), &ret);
+    const UNICODE_STRING* us = reinterpret_cast<const UNICODE_STRING*>(small);
+    // A path longer than the small buffer (up to the 32767 characters NTFS allows): asked again
+    // with the size the kernel named. An empty answer must mean "nothing is mapped there", never
+    // "the name is long".
+    std::vector<unsigned char> big;
+    if (!nt::ok(s) && ret > sizeof(small) && ret <= sizeof(UNICODE_STRING) + 2 * 32768 + 16) {
+        big.resize(ret + 16);
+        s = a.NtQueryVirtualMemory(nt::current_process(), const_cast<void*>(address),
+                                   nt::kMemoryMappedFilenameInformation, big.data(), big.size(), &ret);
+        us = reinterpret_cast<const UNICODE_STRING*>(big.data());
+    }
+    if (!nt::ok(s) || !us->Buffer || !us->Length) return std::wstring();
     return nt_to_dos(std::wstring(us->Buffer, us->Length / sizeof(wchar_t)));
+}
+
+bool stderr_is_console() {
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    return err && err != INVALID_HANDLE_VALUE && GetFileType(err) == FILE_TYPE_CHAR;
 }
 
 std::wstring reg_string(HKEY root, const wchar_t* subkey, const wchar_t* value, REGSAM extra) {

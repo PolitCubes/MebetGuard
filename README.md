@@ -12,9 +12,10 @@ JVM вместо `javaw.exe`, **одна библиотека-агент** ра�
 | Windows x86 | `MebetGuard.exe` + `MebetGuard.dll` | `x86-mustdie` |
 | Windows ARM64 | `MebetGuard.exe` + `MebetGuard.dll` | `arm64-mustdie` |
 | Linux x64 / ARM64 | `MebetGuard` + `libMebetGuard.so` | `x86-64-linux` / `arm64-linux` |
-| macOS (universal) | `MebetGuard` + `libMebetGuard.dylib` | `x86-64-macosx` / `arm64-macosx` |
+| macOS x64 / ARM64 | `MebetGuard` + `libMebetGuard.dylib` | `x86-64-macosx` / `arm64-macosx` |
 
-Сборки — во вкладке Actions (артефакты `mebet-*`). Подписанных релизов пока нет: условие
+Сборки — во вкладке Actions: артефакты `bin-<os>-<arch>-prod` (release) и `-dev` (devtest, только для
+тестов); у macOS отдельная сборка на каждую архитектуру, не universal. Подписанных релизов пока нет: условие
 первого релиза — собранный список разрешённого и закрытый чеклист `[скан]` (см. ниже).
 
 ## Что проверяет страж
@@ -113,8 +114,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMEBET_JAVA_HOME=/path/to/jdk
 cmake --build build
 ```
 
-`-DMEBET_BUILD_KIND=test` — тестовая сборка для стенда (например, без модуля ВМ). Такие
-сборки не подписываются и игрокам не раздаются; дев-режим Windows проверяется в любой.
+`-DMEBET_BUILD_KIND=test` — тестовая сборка для стенда (без модулей ВМ и WSL), `devtest` — она
+же без проверки дев-режима Windows (так CI гоняет e2e на дев-режимных раннерах GitHub). Обе не
+подписываются и игрокам не раздаются; в `release` и `test` дев-режим проверяется всегда. CI
+собирает `release` (prod) и `devtest` (dev); `test` собирается вручную для стенда.
 
 Списки разрешённого правятся только в `config/` и требуют пересборки и переподписи:
 `publishers.json` — доверенные издатели, `roots.json` + `roots/` — закреплённые корни,

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "nt.hpp"
@@ -19,6 +20,9 @@ const OsVersion& os_version();  // RtlGetVersion: not affected by compatibility 
 bool is_windows8_or_later();
 bool is_wow64();
 bool is_native_x86_os();  // 32-bit Windows (not WOW64)
+// The OS's own machine type when this process runs under WOW64 (IMAGE_FILE_MACHINE_AMD64 or
+// _ARM64), else IMAGE_FILE_MACHINE_UNKNOWN.
+USHORT wow64_native_machine();
 
 std::string utf8(const std::wstring& w);
 std::wstring wide(const std::string& s);       // from UTF-8
@@ -33,14 +37,38 @@ std::wstring env(const wchar_t* name);
 std::wstring dir_of(const std::wstring& path);
 std::wstring file_name_of(const std::wstring& path);
 std::wstring full_path(const std::wstring& path);  // GetFullPathNameW, no trailing separator
+// Equal as Windows compares file names: case-insensitively for every letter, not only ASCII.
+// "C:\Ігри" and "C:\ігри", "Äpfel" and "äpfel" are one folder; an ASCII-only compare made a
+// JAVA_HOME typed in another case than its folder a path outside the client Java.
+bool name_equals(std::wstring_view a, std::wstring_view b);
+bool name_starts_with(std::wstring_view s, std::wstring_view prefix);
 bool path_under(const std::wstring& path, const std::wstring& dir);  // case-insensitive
 bool same_path(const std::wstring& a, const std::wstring& b);
 bool file_exists(const std::wstring& path);
 bool dir_exists(const std::wstring& path);
 std::vector<std::wstring> list_dir(const std::wstring& dir, bool* had_subdirs = nullptr);
 
-// "\Device\HarddiskVolume3\…" → "C:\…" (kernel paths from MemoryMappedFilenameInformation).
+// "\Device\HarddiskVolume3\…" → "C:\…" (kernel paths from MemoryMappedFilenameInformation). A volume
+// whose letter this token cannot look up gets its DOS root from the mount manager (also a folder it
+// is mounted into); one with no DOS name at all comes back as "\\?\GLOBALROOT\Device\…", which every
+// Win32 file API still opens.
 std::wstring nt_to_dos(const std::wstring& nt_path);
+// The path in the form that opens exactly the file it names. Win32 drops a dot or a space at the
+// end of a path component: a mapped image named "name.dll." would be judged by the trusted
+// "name.dll" lying next to it. Such a path gets the long-path prefix, which switches that off;
+// every other path is returned as it is.
+std::wstring exact_path(const std::wstring& path);
+// The size of the image mapped at `base` as the kernel has it: its regions with that allocation
+// base, one after another. Not SizeOfImage from its header or from the loader's entry — both sit
+// in memory the process can write, and a rewritten header made a range of almost the whole
+// address space "the system's own image". 0 when no image starts at `base`.
+std::size_t image_extent(std::uintptr_t base);
+// stderr is a console (not a pipe or a file): a write to it can block while a selection is held.
+bool stderr_is_console();
+// An existing file or folder as the file system names it (GetFinalPathNameByHandleW): long names,
+// junctions and symbolic links resolved, the DOS form where its volume has one, else the GLOBALROOT
+// form; empty when it cannot be opened. Not for System32 paths in a WOW64 process (redirected).
+std::wstring canonical_path(const std::wstring& path);
 // Kernel path of the image/file mapped at an address (ТЗ §6: identity from the kernel, not the PEB).
 std::wstring mapped_file_name(const void* address);
 

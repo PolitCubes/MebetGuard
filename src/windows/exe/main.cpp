@@ -35,17 +35,48 @@ bool russian_ui() {
     return lang == LANG_RUSSIAN || lang == LANG_UKRAINIAN || lang == LANG_BELARUSIAN || lang == LANG_KAZAK;
 }
 
+std::string utf8(const std::wstring& w);
+
+struct FailBox {
+    std::wstring title, text;
+};
+
+DWORD WINAPI fail_box_main(void* p) {
+    const auto* box = static_cast<const FailBox*>(p);
+    MessageBoxW(nullptr, box->text.c_str(), box->title.c_str(), MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    return 0;
+}
+
+// The wrapper's own close, before the agent exists: the same rules as the agent's (guard.cpp).
+// The reason goes to the launcher log first; the window is skipped in test builds with
+// MEBET_TEST_NO_UI (a damaged-files close in a test hung on it), and it waits for the player at most
+// close_window_max_ms — a window nobody dismisses no longer keeps the process alive for good.
 [[noreturn]] void fail(Reason r, const std::wstring& detail) {
     const auto& d = mebet::config::reason(r);
-    const bool ru = russian_ui();
-    std::wstring text = ru ? d.text_ru : d.text_en;
-    const auto pos = text.find(L"{file}");
-    if (pos != std::wstring::npos) text.replace(pos, 6, detail);
-    text += ru ? L"\n\nКод: " : L"\n\nCode: ";
-    text += std::to_wstring(d.exit_code);
-    std::wstring title = L"Mebet Anticheat — ";
-    title += ru ? d.title_ru : d.title_en;
-    MessageBoxW(nullptr, text.c_str(), title.c_str(), MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    const std::string line = std::string("[Mebet] closed: ") + d.id + " (code " + std::to_string(d.exit_code) + ") " +
+                             utf8(detail) + "\n";
+    DWORD written = 0;
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (err && err != INVALID_HANDLE_VALUE) WriteFile(err, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+
+    wchar_t no_ui[2] = {};
+    const bool skip_ui = mebet::config::kTestBuild && GetEnvironmentVariableW(L"MEBET_TEST_NO_UI", no_ui, 2) > 0;
+    if (!skip_ui) {
+        const bool ru = russian_ui();
+        static FailBox box;  // lives until the process ends: the window thread is not waited for to the end
+        box.text = ru ? d.text_ru : d.text_en;
+        const auto pos = box.text.find(L"{file}");
+        if (pos != std::wstring::npos) box.text.replace(pos, 6, detail);
+        box.text += ru ? L"\n\nКод: " : L"\n\nCode: ";
+        box.text += std::to_wstring(d.exit_code);
+        box.title = L"Mebet Anticheat — ";
+        box.title += ru ? d.title_ru : d.title_en;
+        // No thread for it (out of resources): no box — shown here it would wait with no time limit.
+        if (HANDLE t = CreateThread(nullptr, 0, &fail_box_main, &box, 0, nullptr)) {
+            WaitForSingleObject(t, mebet::config::opt::close_window_max_ms);
+            CloseHandle(t);
+        }
+    }
     ExitProcess(static_cast<UINT>(d.exit_code));
 }
 

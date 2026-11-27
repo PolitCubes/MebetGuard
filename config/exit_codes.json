@@ -75,6 +75,12 @@
       "en": "A class that does not come from the verified client files was loaded: {file}." },
     { "id": "hardening_failed",    "code": 224, "title_ru": "Не удалось включить защиту", "title_en": "Protection could not be enabled",
       "ru": "Страж не смог включить защиту процесса ({file}). Перезапустите игру. Если повторяется — напишите нам, указав код.",
-      "en": "The guard could not enable process protection ({file}). Restart the game. If it happens again, contact us with this code." }
+      "en": "The guard could not enable process protection ({file}). Restart the game. If it happens again, contact us with this code." },
+    { "id": "guard_stalled",       "code": 225, "title_ru": "Страж остановлен", "title_en": "Guard stopped",
+      "ru": "Посторонняя программа заморозила или остановила поток стража.",
+      "en": "A foreign program froze or stopped a guard thread." },
+    { "id": "unsupported_path",    "code": 226, "title_ru": "Путь к игре не подходит для Java", "title_en": "Java cannot use the game path",
+      "ru": "В пути к файлам игры есть символы, которые Java на этом компьютере принять не может: {file}. Переместите игру в папку без таких символов (например, C:\\Games) и запустите её снова.",
+      "en": "The path to the game files contains characters that Java cannot accept on this computer: {file}. Move the game to a folder without such characters (for example C:\\Games) and start it again." }
   ]
 }

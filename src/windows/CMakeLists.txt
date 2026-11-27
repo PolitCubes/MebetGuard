@@ -36,6 +36,7 @@ add_library(mebet_agent SHARED
     agent/core/timing.cpp
     agent/core/win_util.cpp
     agent/core/guard.cpp
+    agent/core/watchdog.cpp
     agent/trust/file_identity.cpp
     agent/trust/signatures.cpp
     agent/trust/engine.cpp
@@ -60,7 +61,11 @@ set_target_properties(mebet_agent PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/agent")
 target_include_directories(mebet_agent PRIVATE agent ${MEBET_JNI_INCLUDES})
 target_compile_options(mebet_agent PRIVATE ${MEBET_WIN_CFLAGS})
-target_link_options(mebet_agent PRIVATE ${MEBET_WIN_LFLAGS})
+# /MANIFEST:NO: the linker's default DLL manifest (resource #2, only trustInfo, which means nothing
+# for a DLL) makes the loader build an activation context, and that fails with error 206 once the
+# DLL path is 252 characters long: a guard folder of ~237 characters, the exe itself still
+# startable, closed as agent_integrity (201).
+target_link_options(mebet_agent PRIVATE ${MEBET_WIN_LFLAGS} /MANIFEST:NO)
 target_link_libraries(mebet_agent PRIVATE mebet_win_shared mebet_common detours
     wintrust crypt32 winhttp version psapi advapi32 user32 gdi32)
 

@@ -6,12 +6,14 @@
 #include <intrin.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "config.hpp"
 #include "core/guard.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "json_writer.hpp"
 #include "report/cards.hpp"
@@ -166,6 +168,13 @@ std::vector<std::wstring> kernel_modules() {
     return out;
 }
 
+// Drivers that load inside a guest. The Hyper-V root uses vmbusr.sys, not vmbus.sys. vmci.sys is the
+// VMware VMCI driver of the guest tools — and of VMware Workstation on a real PC: next to a Hyper-V
+// hypervisor (Hyper-V or Memory Integrity on a real PC) it is no sign at all; such a PC had "both
+// signs" and was closed as a virtual machine. Without a hypervisor bit it still counts (a VMware
+// guest that hides the bit, and says so in its SMBIOS).
+constexpr const char* kHostAlsoLoads = "vmci.sys";
+
 std::vector<std::string> guest_drivers() {
     static const char* const kGuest[] = {"vmbus.sys", "storvsc.sys", "netvsc.sys", "hyperkbd.sys", "vmbushid.sys",
                                          "vboxguest.sys", "vboxmouse.sys", "vboxsf.sys", "vboxwddm.sys", "vmhgfs.sys",
@@ -278,6 +287,7 @@ void check_virtual_machine() {
     } else if (hv.vendor == "Microsoft Hv") {
         const bool root = hv.features_known && (hv.features_ebx & 1u) && (hv.features_ebx & (1u << 12));
         guests = guest_drivers();
+        guests.erase(std::remove(guests.begin(), guests.end(), std::string(kHostAlsoLoads)), guests.end());
         const bool second_sign = bios_vm || !guests.empty();
         if (root) {
             cls = second_sign ? "root_with_vm_hardware" : "host_hypervisor";
@@ -316,7 +326,16 @@ void check_virtual_machine() {
     ev.extra_json = w.take();
     ev.fingerprint = {ev.type, cls, hv.vendor};
     if (close && config::closes(config::Module::virtual_machine)) {
-        guard::close_now(config::Reason::virtual_machine, std::wstring(), std::move(ev));
+        // The signs go into the launcher log line too: without a report channel it is the only
+        // trace of why a PC was taken for a virtual machine.
+        std::string why = cls + ": hypervisor '" + (hv.present ? hv.vendor : std::string("none")) + "'";
+        if (!hv.vendor_100.empty()) why += " / '" + hv.vendor_100 + "'";
+        if (bios_vm) why += ", SMBIOS '" + bios.manufacturer + " | " + bios.product + " | " + bios.bios_vendor + "'";
+        if (!guests.empty()) {
+            why += ", guest drivers:";
+            for (const auto& g : guests) why += " " + g;
+        }
+        guard::close_now(config::Reason::virtual_machine, win::wide(why), std::move(ev));
     }
     if (config::enabled(config::Module::virtual_machine)) {
         ev.dedupe_key = ev.type;
@@ -423,6 +442,8 @@ void report_drivers() {
     unsigned listed = 0;
     for (const auto& kernel_path : kernel_modules()) {
         if (listed >= config::kLimit_list_items) break;
+        if (guard::closing()) return;  // a close is pending: it must not wait for this report
+        watchdog::worker_beat();  // a signature and a hash per driver: minutes on a slow disk
         const std::wstring path = kernel_path_to_dos(kernel_path);
         const trust::Decision d = trust::decide_path(path);
         if (d.verdict.trust == trust::Trust::os) continue;  // Microsoft

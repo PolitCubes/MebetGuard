@@ -2,6 +2,9 @@
 // Copyright (c) 2026 PolitCubes
 #include "trust/file_identity.hpp"
 
+#include "core/watchdog.hpp"
+#include "core/win_util.hpp"
+
 namespace mebet::trust {
 
 namespace {
@@ -27,6 +30,46 @@ GetFileInformationByHandleExFn get_info_ex() {
     static const auto fn = reinterpret_cast<GetFileInformationByHandleExFn>(
         reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetFileInformationByHandleEx")));
     return fn;
+}
+
+// NtQueryInformationFile(FileInternalInformation) and NtQueryVolumeInformationFile(FileFsVolume): the
+// 64-bit NTFS file id and the volume serial, from a handle with no access rights at all — the last
+// resort on Windows 7, where the loader's section-file handle gives neither of the two above, so a
+// record would have no id and an image swapped in under the same name could keep its trust.
+struct IoStatusBlock {
+    union {
+        LONG Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+};
+struct FileInternalInfo {
+    LARGE_INTEGER IndexNumber;
+};
+struct FileFsVolumeInfo {
+    LARGE_INTEGER VolumeCreationTime;
+    ULONG VolumeSerialNumber;
+    ULONG VolumeLabelLength;
+    BOOLEAN SupportsObjects;
+    WCHAR VolumeLabel[1];
+};
+using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, IoStatusBlock*, PVOID, ULONG, int);
+using NtQueryVolumeInformationFileFn = LONG(NTAPI*)(HANDLE, IoStatusBlock*, PVOID, ULONG, int);
+
+bool nt_file_id(HANDLE file, FileIdentity& out) {
+    static const auto q = reinterpret_cast<NtQueryInformationFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    static const auto qv = reinterpret_cast<NtQueryVolumeInformationFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryVolumeInformationFile")));
+    if (!q || !qv) return false;
+    IoStatusBlock iosb{};
+    FileInternalInfo id{};
+    if (q(file, &iosb, &id, sizeof(id), 6 /*FileInternalInformation*/) < 0) return false;  // STATUS_SUCCESS is 0
+    alignas(8) unsigned char buf[sizeof(FileFsVolumeInfo) + 64] = {};
+    if (qv(file, &iosb, buf, sizeof(buf), 1 /*FileFsVolumeInformation*/) < 0) return false;
+    out.volume = reinterpret_cast<const FileFsVolumeInfo*>(buf)->VolumeSerialNumber;
+    std::memcpy(out.file_id, &id.IndexNumber.QuadPart, 8);  // upper 8 bytes stay 0, as the other paths leave them
+    return true;
 }
 
 }  // namespace
@@ -60,6 +103,12 @@ bool identity_of(HANDLE file, FileIdentity& out) {
             }
         }
     }
+    if (!have && nt_file_id(file, out)) {
+        FileStandardInfo st{};
+        if (auto ex = get_info_ex(); ex && ex(file, kFileStandardInfoClass, &st, sizeof(st)))
+            out.size = static_cast<std::uint64_t>(st.EndOfFile.QuadPart);
+        have = true;  // an id and a volume: enough to tell this file from the one swapped in for it
+    }
     return have;
 }
 
@@ -81,8 +130,9 @@ std::wstring final_path(HANDLE file) {
 }
 
 HANDLE open_read(const std::wstring& path) {
-    return CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    watchdog::SlowWork slow;  // an open can wait on a slow or unreachable disk
+    return CreateFileW(win::exact_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
 }  // namespace mebet::trust

@@ -134,6 +134,10 @@ def read_pem(path):
 
 def gen_modules(cfg, kind):
     check_keys(cfg, "modules.json", ["modules", "options"])
+    # `devtest` is the test build with the dev_mode module turned off, so the other layers can
+    # be tested on a dev-mode CI runner (GitHub Windows has test signing). Unsigned, never
+    # shipped. Its levels come from the test column; only dev_mode is forced off.
+    base = "test" if kind == "devtest" else kind
     mods = []
     seen = set()
     for i, m in enumerate(cfg["modules"]):
@@ -150,12 +154,13 @@ def gen_modules(cfg, kind):
             fail("%s: the release build enables every module (ТЗ §3); 'off' is only for test" % where)
         if m.get("locked") and (m["release"] != "close" or m["test"] != "close"):
             fail("%s: a locked module closes in every build" % where)
-        mods.append((mid, m["title"], m[kind], bool(m.get("locked"))))
+        if mid == "dev_mode" and (not m.get("locked") or m["release"] != "close" or m["test"] != "close"):
+            fail("%s: dev_mode must be locked to close in release and test (ТЗ §8)" % where)
+        # devtest drops only dev_mode (its layers are tested on a dev-mode CI runner).
+        level = "off" if (kind == "devtest" and mid == "dev_mode") else m[base]
+        mods.append((mid, m["title"], level, bool(m.get("locked"))))
     if "dev_mode" not in seen:
         fail("modules.json: dev_mode is mandatory")
-    for mid, _, level, locked in mods:
-        if mid == "dev_mode" and (level != "close" or not locked):
-            fail("modules.json: dev_mode must be locked to 'close' (ТЗ §8)")
     opts = []
     for name, o in cfg["options"].items():
         if name == "$comment":
@@ -328,7 +333,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--kind", required=True, choices=("release", "test"))
+    ap.add_argument("--kind", required=True, choices=("release", "test", "devtest"))
     ap.add_argument("--os", required=True, choices=("windows", "linux", "macos"))
     ap.add_argument("--arch", required=True, choices=("x64", "x86", "arm64", "universal"))
     ap.add_argument("--version", required=True)
@@ -383,7 +388,7 @@ def main():
     h.extend("    " + o for o in options)
     h.append("}  // namespace opt")
     h.append("inline constexpr const char* kBuildKind = %s;" % c_str(a.kind))
-    h.append("inline constexpr bool kTestBuild = %s;" % ("true" if a.kind == "test" else "false"))
+    h.append("inline constexpr bool kTestBuild = %s;" % ("true" if a.kind in ("test", "devtest") else "false"))
     h.append("inline constexpr const char* kVersion = %s;" % c_str(a.version))
     h.append("inline constexpr const char* kCommit = %s;" % c_str(a.commit))
     h.append("inline constexpr const char* kErrorsDsn = %s;" % c_str(rep["errors_dsn"]))

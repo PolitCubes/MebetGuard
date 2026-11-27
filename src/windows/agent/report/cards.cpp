@@ -13,6 +13,7 @@
 #include "config.hpp"
 #include "core/exec_table.hpp"
 #include "core/module_table.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "hooks/load_gate.hpp"
 #include "json_writer.hpp"
@@ -58,6 +59,20 @@ void build_prefixes(Prefixes& p) {
     p.ready = true;
 }
 
+// Where the volume part of a path with no drive letter ends (the "\" after it):
+// "\\?\GLOBALROOT\Device\HarddiskVolume7\…", "\Device\HarddiskVolume7\…", "\\?\Volume{…}\…".
+// npos for any other path. `low` is lower-cased.
+std::size_t letterless_root_end(const std::wstring& low) {
+    std::size_t at = 0;
+    if (low.compare(0, 14, L"\\\\?\\globalroot") == 0) at = 14;
+    if (low.compare(at, 8, L"\\device\\") == 0) return low.find(L'\\', at + 8);
+    if (low.compare(0, 11, L"\\\\?\\volume{") == 0) {
+        const auto close = low.find(L'}');
+        return close == std::wstring::npos ? std::wstring::npos : close + 1;
+    }
+    return std::wstring::npos;
+}
+
 std::string json_string_or_null(const std::string& s) {
     JsonWriter w;
     if (s.empty()) w.null_value(); else w.value(s);
@@ -81,6 +96,8 @@ struct VersionStrings {
 VersionStrings version_strings(const std::wstring& path) {
     gate::OwnReadScope own;  // GetFileVersionInfo maps the file; it may be the refused one
     VersionStrings v;
+    // GetFileVersionInfo trims a dot or a space at the end of a name and would read another file.
+    if (win::exact_path(path) != path) return v;
     DWORD dummy = 0;
     const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);
     if (!size || size > (4u << 20)) return v;
@@ -155,7 +172,7 @@ PeFacts pe_facts(const std::wstring& path) {
 }
 
 bool dir_writable(const std::wstring& dir) {
-    HANDLE h = CreateFileW(dir.c_str(), FILE_ADD_FILE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    HANDLE h = CreateFileW(win::exact_path(dir).c_str(), FILE_ADD_FILE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     CloseHandle(h);
@@ -165,9 +182,10 @@ bool dir_writable(const std::wstring& dir) {
 const char* root_class_name(const trust::Signer& s) {
     if (s.ms_os) return "ms_os";
     if (s.ms_app) return "ms_app";
-    if (s.pinned_root >= 0) {
-        return config::kRoots[s.pinned_root].cls == config::RootClass::ms_ivr ? "ms_ivr" : "public";
-    }
+    int root = s.pinned_root;  // the chain's own end; else the first pinned root inside it
+    for (int i = 0; root < 0 && i < 32; ++i)
+        if (s.pinned_mask & (1u << i)) root = i;
+    if (root >= 0) return config::kRoots[root].cls == config::RootClass::ms_ivr ? "ms_ivr" : "public";
     return "unknown";
 }
 
@@ -183,6 +201,11 @@ void write_signer(JsonWriter& w, const trust::Signer& s) {
     w.field("root", s.root_cn);
     w.field("root_class", root_class_name(s));
     if (s.pinned_root >= 0) w.field("root_id", config::kRoots[s.pinned_root].id);
+    // Every pinned root whose key anchors the chain: what the publisher rule matched on.
+    w.key("pinned_roots").begin_array();
+    for (std::size_t i = 0; i < sizeof(config::kRoots) / sizeof(config::kRoots[0]); ++i)
+        if (s.pinned_mask & (1u << i)) w.value(config::kRoots[i].id);
+    w.end_array();
     w.key("eku").begin_array();
     for (const auto& e : s.ekus) w.value(e);
     w.end_array();
@@ -217,18 +240,26 @@ std::string anonymize(const std::wstring& path) {
     if (!p.ready) build_prefixes(p);
     std::wstring out = path;
     for (const auto& kv : p.list) {
-        if (out.size() >= kv.first.size() && istarts_with(out, kv.first) &&
+        if (out.size() >= kv.first.size() && win::name_starts_with(out, kv.first) &&
             (out.size() == kv.first.size() || out[kv.first.size()] == L'\\' || out[kv.first.size()] == L'/')) {
             out = kv.second + out.substr(kv.first.size());
             break;
         }
     }
     ReleaseSRWLockExclusive(&p.lock);
-    // Any other user folder: hide the name.
-    const std::wstring users = L":\\Users\\";
-    const auto pos = lower_ascii(out).find(lower_ascii(users));
-    if (pos != std::wstring::npos) {
-        const auto start = pos + users.size();
+    // Any other user folder: hide the name — "C:\Users\<user>\…", and the same on a volume with no
+    // DOS name ("\\?\GLOBALROOT\Device\HarddiskVolume7\Users\…"), which none of the prefixes match.
+    const std::wstring low = lower_ascii(out);
+    const std::wstring users = L"\\users\\";
+    std::size_t start = std::wstring::npos;
+    const auto drive = low.find(L":" + users);
+    if (drive != std::wstring::npos) {
+        start = drive + 1 + users.size();
+    } else {
+        const auto root = letterless_root_end(low);
+        if (root != std::wstring::npos && low.compare(root, users.size(), users) == 0) start = root + users.size();
+    }
+    if (start != std::wstring::npos) {
         const auto end = out.find(L'\\', start);
         out = out.substr(0, start) + L"<user>" + (end == std::wstring::npos ? std::wstring() : out.substr(end));
     }
@@ -271,6 +302,7 @@ std::string file_label(const trust::Decision& d) {
 }
 
 std::string file_card_json(const trust::Decision& d) {
+    watchdog::SlowWork slow;  // the folder, the headers and the version strings: each an open of its own
     const trust::FileFacts& f = d.facts;
     JsonWriter w;
     w.begin_object();

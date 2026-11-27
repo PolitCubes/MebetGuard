@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "hooks/load_gate.hpp"
 #include "mebet_trust_data.hpp"
@@ -115,11 +116,16 @@ bool in_display_driver_dir(const std::wstring& path) {
 
 std::string product_version(const std::wstring& path) {
     gate::OwnReadScope own;
+    // The exact name the file system uses. GetFileVersionInfo otherwise trims a trailing dot or space
+    // ("name.dll." reads the "name.dll" next to it, not the dotted file the signature was verified on)
+    // and cannot open a path at or past MAX_PATH; the \\?\ form it returns reads the very file. Bailing
+    // for any rewritten path, as before, denied a correctly-signed DLL under a deep path a version floor.
+    const std::wstring exact = win::exact_path(path);
     DWORD dummy = 0;
-    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    const DWORD size = GetFileVersionInfoSizeW(exact.c_str(), &dummy);
     if (!size) return std::string();
     std::vector<unsigned char> buf(size);
-    if (!GetFileVersionInfoW(path.c_str(), 0, size, buf.data())) return std::string();
+    if (!GetFileVersionInfoW(exact.c_str(), 0, size, buf.data())) return std::string();
     VS_FIXEDFILEINFO* ffi = nullptr;
     UINT len = 0;
     if (!VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&ffi), &len) || !ffi) return std::string();
@@ -129,15 +135,15 @@ std::string product_version(const std::wstring& path) {
     return v;
 }
 
-// Trusted publisher: CN + O variant + pinned root class (ТЗ §6). Never by serial/thumbprint.
+// Trusted publisher: CN + O variant + one of its pinned roots anchoring the chain, by the root's
+// identity anywhere in it (ТЗ §6). Never by serial/thumbprint.
 int publisher_of(const Signer& s, const std::wstring& path, bool* new_cert) {
     *new_cert = false;
-    if (s.pinned_root < 0) return -1;
-    const std::uint32_t bit = 1u << s.pinned_root;
+    if (s.pinned_mask == 0) return -1;
     const std::string cn = normalize_name(s.cn), o = normalize_name(s.o), issuer = normalize_name(s.issuer_cn);
     for (const auto& d : config::kSigners) {
         const auto& p = config::kPublishers[d.publisher];
-        if ((p.root_mask & bit) == 0 || cn != d.cn || o != d.o) continue;
+        if ((p.root_mask & s.pinned_mask) == 0 || cn != d.cn || o != d.o) continue;
         if (d.issuer_cn && issuer != d.issuer_cn) continue;
         if (p.min_product_version && compare_versions(product_version(path), p.min_product_version) < 0) continue;
         bool seen = false;
@@ -276,7 +282,16 @@ void init_engine(const std::wstring& java_home) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&init_engine), &self);
     s.self_known = identity_of_path(win::module_path(self), s.self_id);
+    const DWORD self_err = GetLastError();
     s.exe_known = identity_of_path(win::module_path(nullptr), s.exe_id);
+    const DWORD exe_err = GetLastError();
+    // Test builds: say when our own files cannot be identified — they would be refused next.
+    if (config::kTestBuild && (!s.self_known || !s.exe_known)) {
+        std::fprintf(stderr, "[Mebet] own identity: agent=%s (error %lu) exe=%s (error %lu) %s\n",
+                     s.self_known ? "yes" : "no", s.self_known ? 0ul : self_err, s.exe_known ? "yes" : "no",
+                     s.exe_known ? 0ul : exe_err, to_utf8(win::module_path(nullptr)).c_str());
+        std::fflush(stderr);
+    }
 
     // Catalog infrastructure check: kernel32.dll is catalog-signed on every Windows.
     const std::wstring k32 = win::system_dir() + L"\\kernel32.dll";
@@ -293,7 +308,32 @@ const std::wstring& java_home() { return state().java_home; }
 
 bool is_java_dir_file(const std::wstring& path) { return win::path_under(path, state().java_home); }
 
+namespace {
+
+// Hashes a mapped file chunk by chunk, so that on the worker thread a big file on a slow disk is
+// work the watchdog can see, not half a minute of silence. False when the view faults (the file
+// shrank under it). In a function of its own: structured exception handling cannot share one
+// with objects that have destructors.
+bool sha256_of_view(const void* view, std::size_t total, Sha256Digest& out) {
+    __try {
+        const auto* bytes = static_cast<const unsigned char*>(view);
+        const std::size_t chunk = 4u << 20;
+        Sha256 h;
+        for (std::size_t done = 0; done < total; done += chunk) {
+            h.update(bytes + done, total - done < chunk ? total - done : chunk);
+            watchdog::worker_beat();
+        }
+        out = h.finish();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+}  // namespace
+
 bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
+    watchdog::SlowWork slow;  // the first touch of a file on a cold disk
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) || static_cast<std::uint64_t>(size.QuadPart) > max_bytes) return false;
     if (size.QuadPart == 0) {
@@ -306,30 +346,70 @@ bool sha256_of(HANDLE file, Sha256Digest& out, std::uint64_t max_bytes) {
     const void* view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
     bool ok = false;
     if (view) {
-        __try {
-            out = Sha256::of(view, static_cast<std::size_t>(size.QuadPart));
-            ok = true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            ok = false;  // the file shrank under us
-        }
+        ok = sha256_of_view(view, static_cast<std::size_t>(size.QuadPart), out);
         UnmapViewOfFile(view);
     }
     CloseHandle(map);
     return ok;
 }
 
+// A cheap 64-bit fingerprint of a file sampled at its start, its three quarter points and its end, with
+// its size: enough that an in-place overwrite — which keeps the id and size — changes it, including one
+// confined to the middle (which a two-ends fingerprint missed). Not a security hash; it only keeps a
+// cached allow from outliving the content it was about, and a full signature check still runs on a miss.
+// 0 when nothing could be read, and 0 is never treated as a match (see the cache lookup).
+std::uint64_t content_edge(HANDLE file, std::uint64_t size) {
+    std::uint64_t h = 1469598103934665603ULL;  // FNV-1a
+    auto fold = [&](const unsigned char* p, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+    };
+    unsigned char sz[8];
+    for (int i = 0; i < 8; ++i) sz[i] = static_cast<unsigned char>((size >> (i * 8)) & 0xFF);
+    fold(sz, 8);
+    unsigned char buf[4096];
+    bool any = false;
+    auto read_at = [&](std::uint64_t off) {
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(off & 0xFFFFFFFFu);
+        ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+        DWORD got = 0;
+        if (ReadFile(file, buf, sizeof(buf), &got, &ov) && got) {
+            fold(buf, got);
+            any = true;
+        }
+    };
+    read_at(0);
+    if (size > sizeof(buf)) {
+        read_at(size - sizeof(buf));
+        for (int k = 1; k <= 3; ++k) {
+            const std::uint64_t off = (size / 4) * k;
+            if (off + sizeof(buf) <= size) read_at(off);
+        }
+    }
+    return any ? h : 0;
+}
+
 Decision decide(HANDLE file, const std::wstring& path_hint) {
+    watchdog::SlowWork slow;  // a signature or catalog check shows nothing while it runs
     State& st = state();
     Decision d;
     FileFacts& f = d.facts;
     f.path = final_path(file);
     if (f.path.empty()) f.path = path_hint;
     f.identity_known = identity_of(file, f.identity);
+    f.content_edge = content_edge(file, f.identity_known ? f.identity.size : 0);
 
     if (f.identity_known) {
         AcquireSRWLockShared(&st.lock);
         auto it = st.cache.find(f.identity);
-        if (it != st.cache.end()) {
+        // A cached verdict is reused only when the sampled fingerprint still matches: an unload and an
+        // in-place overwrite with cheat code of the same size (its mtime restorable with SetFileTime)
+        // keeps the id, but not this fingerprint, so it is verified again rather than let in. A 0
+        // fingerprint (nothing read) never matches — an unreadable file is re-judged, not waved through.
+        if (it != st.cache.end() && f.content_edge != 0 && it->second.facts.content_edge == f.content_edge) {
             Decision cached = it->second;
             ReleaseSRWLockShared(&st.lock);
             return cached;
@@ -350,6 +430,7 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
     }
 
     const LARGE_INTEGER t0 = qpc();
+    const std::uint64_t witnessed0 = watchdog::witnessed_100ns();
     Verdict& v = d.verdict;
     bool decided = false;
 
@@ -406,7 +487,17 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
     }
 
     d.ms = ms_since(t0);
-    if (d.ms > static_cast<double>(config::opt::verify_timeout_ms)) {
+    // The limit is on the time the check took, not on the time the game was held meanwhile: a
+    // game paused as a whole (Suspend in a task manager) in the middle of a library load came
+    // back with half a minute on the clock, and a correctly signed system DLL was refused as
+    // verify_timeout. With the watchdog running, no more is counted than it saw the process run
+    // (plus its own granularity).
+    double judged_ms = d.ms;
+    if (witnessed0) {
+        const double seen_ms = static_cast<double>(watchdog::witnessed_100ns() - witnessed0) / 10000.0 + 1500.0;
+        if (seen_ms < judged_ms) judged_ms = seen_ms;
+    }
+    if (judged_ms > static_cast<double>(config::opt::verify_timeout_ms)) {
         v.allowed = false;
         v.reason = config::Reason::verify_timeout;
         v.rule = "timeout";
@@ -421,6 +512,7 @@ Decision decide(HANDLE file, const std::wstring& path_hint) {
 }
 
 Decision decide_path(const std::wstring& path) {
+    watchdog::SlowWork slow;  // the open itself can wait on a slow disk
     HANDLE f = open_read(path);
     if (f == INVALID_HANDLE_VALUE) {
         Decision d;

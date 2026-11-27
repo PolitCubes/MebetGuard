@@ -7,10 +7,10 @@ cmake_minimum_required(VERSION 3.18)
 project(MebetGuard VERSION 0.1.0 LANGUAGES C CXX)
 
 set(MEBET_BUILD_KIND "release" CACHE STRING
-    "release: every module on, the build players get; test: modules may be off (VM stand), never signed")
-set_property(CACHE MEBET_BUILD_KIND PROPERTY STRINGS release test)
-if(NOT MEBET_BUILD_KIND MATCHES "^(release|test)$")
-    message(FATAL_ERROR "MEBET_BUILD_KIND must be release or test")
+    "release: every module on, the build players get; test: VM/WSL off (stand); devtest: also dev_mode off (dev-mode CI). test and devtest are never signed")
+set_property(CACHE MEBET_BUILD_KIND PROPERTY STRINGS release test devtest)
+if(NOT MEBET_BUILD_KIND MATCHES "^(release|test|devtest)$")
+    message(FATAL_ERROR "MEBET_BUILD_KIND must be release, test or devtest")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

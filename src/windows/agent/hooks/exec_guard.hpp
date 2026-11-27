@@ -19,12 +19,18 @@ struct Requester {
     std::uintptr_t module_base = 0;
     bool allowed = false;
     bool from_exec_region = false;  // JIT stub or other recorded executable memory
+    bool from_jvm_code = false;     // that memory is code the JVM generated (JIT, FFM stubs)
 };
 
 Requester find_requester();
 
 inline bool executable(ULONG protect) { return (protect & 0xF0) != 0; }  // PAGE_EXECUTE*
+// True when a request on `process` could reach the game's own address space: its own process, or a
+// handle we cannot tie to another one (judge it rather than wave it through).
 bool is_current_process(HANDLE process);
+// True only when `process` is *proven* to be the game's own: a recording of trust, or forgetting one,
+// is done only then — never on a handle that merely might be ours.
+bool confirmed_current_process(HANDLE process);
 
 // Called before the real call. false = deny (the close was requested).
 bool may_create_exec(const Requester& r, const char* operation, std::uintptr_t address, std::size_t size);

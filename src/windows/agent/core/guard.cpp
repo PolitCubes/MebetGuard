@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/timing.hpp"
+#include "core/watchdog.hpp"
 #include "core/win_util.hpp"
 #include "strings.hpp"
 #include "window/game_window.hpp"
@@ -32,13 +33,18 @@ struct Periodic {
     std::uint64_t next_ms;
 };
 
+// Read by every hook, also on a thread that has no TLS block (see nt_hooks.cpp): a plain
+// global, not a member of the function-local static below.
+std::atomic<bool> g_shutdown{false};
+
 struct Core {
     const BootInfo* boot = nullptr;
     std::atomic<bool> closing{false};
-    std::atomic<bool> shutdown{false};
     std::atomic<bool> armed{false};
     std::atomic<bool> flow_started{false};
+    std::atomic<bool> report_claimed{false};  // the report of the close: sent by run_close or by the watchdog
     std::atomic<int> exit_code{0};
+    std::atomic<int> reason{-1};  // of the pending close, set together with exit_code
     std::atomic<CloseRequest*> close{nullptr};
     HANDLE wake = nullptr;
     DWORD worker_tid = 0;
@@ -71,43 +77,102 @@ void drain_deferred() {
     items.swap(c.deferred);
     ReleaseSRWLockExclusive(&c.deferred_lock);
     for (auto& fn : items) {
+        // A close is pending: the rest (inventory cards, reports) can wait for ever — the close
+        // and its report must not wait for them.
+        if (c.closing.load(std::memory_order_acquire)) break;
         if (fn) fn();
+        watchdog::worker_beat();
     }
+}
+
+// The event of a close as it is sent: the detection's own, marked with the reason and the code.
+report::Event close_event(const CloseRequest& r, report::Event ev) {
+    const auto& def = config::reason(r.reason);
+    if (ev.type.empty()) ev.type = std::string("close.") + def.id;
+    if (ev.title.empty()) ev.title = std::string("Closed: ") + def.id;
+    ev.level = report::Level::error;
+    ev.tags.emplace_back("reason", def.id);
+    ev.tags.emplace_back("exit_code", std::to_string(def.exit_code));
+    return ev;
 }
 
 [[noreturn]] void run_close(CloseRequest& r) {
     Core& c = core();
-    c.flow_started.store(true);
+    if (c.flow_started.exchange(true)) {
+        for (;;) Sleep(INFINITE);  // another thread is already closing
+    }
     const auto& def = config::reason(r.reason);
 
     // 1. The game disappears at once; the splash gives way to the reason window (ТЗ §4).
     splash::hide_now();
     EnumWindows(&hide_window, 0);
 
-    // 2. The report goes out while the window is on screen (ТЗ §12: send or 3 s).
+    // 2. The report goes out while the window is on screen (ТЗ §12: send or 3 s) — unless the
+    //    watchdog, which ends a close that came too late, has sent it already.
     const std::uint64_t started = win::now_ms();
     std::atomic<bool> sent{false};
-    report::Event ev = std::move(r.event);
-    if (ev.type.empty()) ev.type = std::string("close.") + def.id;
-    if (ev.title.empty()) ev.title = std::string("Closed: ") + def.id;
-    ev.level = report::Level::error;
-    ev.tags.emplace_back("reason", def.id);
-    ev.tags.emplace_back("exit_code", std::to_string(def.exit_code));
-    std::thread sender([&sent, ev]() mutable {
-        report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+    std::thread sender;
+    if (!c.report_claimed.exchange(true)) {
+        report::Event ev = close_event(r, std::move(r.event));
+        try {
+            sender = std::thread([&sent, ev]() mutable {
+                try {
+                    report::Reporter::instance().send_now(std::move(ev), config::opt::close_report_wait_ms);
+                } catch (...) {
+                    // out of memory or threads: no report, but never an abort instead of the close
+                }
+                sent.store(true);
+            });
+        } catch (...) {
+            sent.store(true);  // no thread to send it: the close goes on without the report
+        }
+    } else {
         sent.store(true);
-    });
+    }
 
-    // 3. Reason and code in the launcher log too (no log file, ТЗ §3).
-    std::fprintf(stderr, "[Mebet] closed: %s (code %d) %s\n", def.id, def.exit_code, to_utf8(r.detail).c_str());
-    std::fflush(stderr);
+    // 3. Reason and code in the launcher log too (no log file, ТЗ §3). Steps 3 and 4 allocate:
+    //    out of memory, an exception there would end the process with a crash code instead of the
+    //    reason's — it ends with the reason's code all the same, without them.
+    try {
+        std::fprintf(stderr, "[Mebet] closed: %s (code %d) %s\n", def.id, def.exit_code, to_utf8(r.detail).c_str());
+        std::fflush(stderr);
 
-    // 4. The reason window (draft layout until the mockups are chosen). Test builds on CI
-    //    skip it when MEBET_TEST_NO_UI is set, so a smoke test cannot hang on a dialog.
-    std::wstring title;
-    const std::wstring text = reason_text(r.reason, r.detail, &title);
-    const bool no_ui = config::kTestBuild && !win::env(L"MEBET_TEST_NO_UI").empty();
-    if (!no_ui) reason_window::show(title, text);
+        // 4. The reason window (draft layout until the mockups are chosen). Test builds on CI
+        //    skip it when MEBET_TEST_NO_UI is set, so a smoke test cannot hang on a dialog.
+        //    It waits for the player, but not for ever: the game is hidden but its threads still run
+        //    behind it, and nothing else of the guard works meanwhile. A window nobody dismisses
+        //    (covered, hidden by code in the process, a player who walked away) used to keep that
+        //    state for good — on every path, before the worker and the watchdog exist too. So the
+        //    window has a thread of its own, and the close goes on after close_window_max_ms.
+        std::wstring title;
+        const std::wstring text = reason_text(r.reason, r.detail, &title);
+        const bool no_ui = config::kTestBuild && !win::env(L"MEBET_TEST_NO_UI").empty();
+        if (!no_ui) {
+            const HANDLE dismissed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            bool own_thread = false;
+            if (dismissed) {
+                try {
+                    std::thread([title, text, dismissed] {
+                        reason_window::show(title, text);
+                        SetEvent(dismissed);
+                    }).detach();
+                    own_thread = true;
+                } catch (...) {
+                    // No thread for the window (out of resources): an exception here would abort the
+                    // process instead of closing it with the reason's code.
+                }
+            }
+            // No thread for the window (out of resources): no window — shown here instead it would wait
+            // for the player with no time limit. The line in the launcher log says why.
+            if (own_thread && WaitForSingleObject(dismissed, config::opt::close_window_max_ms) == WAIT_TIMEOUT) {
+                std::fprintf(stderr, "[Mebet] the reason window was not closed in %u s: the game ends without it\n",
+                             config::opt::close_window_max_ms / 1000);
+                std::fflush(stderr);
+            }
+        }
+    } catch (...) {
+        std::fputs("[Mebet] closed: the reason could not be shown (out of memory)\n", stderr);
+    }
 
     // 5. Wait for the report at most until 3 s after the close started.
     while (!sent.load() && win::now_ms() - started < config::opt::close_report_wait_ms) Sleep(20);
@@ -119,6 +184,7 @@ void drain_deferred() {
 }
 
 DWORD WINAPI worker_main(void*) {
+    watchdog::worker_started();
     Core& c = core();
     game_window::install_in_worker();
     for (;;) {
@@ -129,6 +195,7 @@ DWORD WINAPI worker_main(void*) {
             if (left < timeout) timeout = static_cast<DWORD>(left);
         }
         MsgWaitForMultipleObjectsEx(1, &c.wake, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        watchdog::worker_tick();  // heartbeat; is the watchdog thread still alive?
 
         if (CloseRequest* r = c.close.load()) run_close(*r);
 
@@ -148,6 +215,7 @@ DWORD WINAPI worker_main(void*) {
                 p.task();
             }
             p.next_ms = win::now_ms() + p.interval_ms;
+            watchdog::worker_beat();
             if (CloseRequest* r = c.close.load()) run_close(*r);
         }
     }
@@ -163,29 +231,49 @@ void init(const BootInfo* boot) {
 
 const BootInfo& boot() { return *core().boot; }
 
-bool closing() { return core().closing.load(std::memory_order_acquire); }
-bool shutting_down() { return core().shutdown.load(std::memory_order_relaxed); }
-void set_shutting_down() { core().shutdown.store(true); }
+// A close is pending once its request is published — the request is what the worker acts on, and a
+// requester stopped right after publishing it must not leave "no close" visible.
+bool closing() { return core().close.load(std::memory_order_acquire) != nullptr; }
+bool close_running() { return core().flow_started.load(std::memory_order_acquire); }
+
+void send_pending_close_report(unsigned timeout_ms) {
+    Core& c = core();
+    CloseRequest* r = c.close.load();
+    if (!r || c.report_claimed.exchange(true)) return;  // no close, or its report is on its way
+    report::Reporter::instance().send_now(close_event(*r, r->event), timeout_ms);
+}
+bool shutting_down() { return g_shutdown.load(std::memory_order_relaxed); }
+void set_shutting_down() { g_shutdown.store(true); }
 bool armed() { return core().armed.load(std::memory_order_acquire); }
 void arm() { core().armed.store(true, std::memory_order_release); }
 
 void request_close(config::Reason reason, const std::wstring& detail, report::Event ev) {
     Core& c = core();
-    bool expected = false;
-    if (!c.closing.compare_exchange_strong(expected, true)) return;  // the first reason wins
+    // The first reason wins, by publishing its request: the worker acts on the request itself, so a
+    // requester stopped right after winning (a thread parked there on purpose) still gets its
+    // close carried out. Winning by the exit code first, as before, left a window in which every
+    // later close was refused and none was ever published. The code and the reason follow before
+    // the close is visible as pending: whoever ends a pending close must not find code 0.
+    if (c.close.load(std::memory_order_acquire)) return;
+    auto* request = new CloseRequest{reason, detail, std::move(ev)};
+    CloseRequest* none = nullptr;
+    if (!c.close.compare_exchange_strong(none, request, std::memory_order_acq_rel)) {
+        delete request;
+        return;
+    }
+    c.reason.store(static_cast<int>(reason));
     c.exit_code.store(config::reason(reason).exit_code);
-    c.close.store(new CloseRequest{reason, detail, std::move(ev)});
+    c.closing.store(true, std::memory_order_release);
     if (c.wake) SetEvent(c.wake);
 }
 
 void close_now(config::Reason reason, const std::wstring& detail, report::Event ev) {
     request_close(reason, detail, std::move(ev));
     Core& c = core();
-    CloseRequest* r = c.close.load();
-    if (!r || c.flow_started.load()) {
-        for (;;) Sleep(INFINITE);  // another thread is closing
-    }
-    run_close(*r);
+    // A request is published now — this one or another thread's, which won the race. It is carried
+    // out here either way (run_close lets only one thread through): waiting for good on someone
+    // else's close hung the start before the worker existed, with nobody left to carry it out.
+    run_close(*c.close.load(std::memory_order_acquire));
 }
 
 void defer(std::function<void()> fn) {
@@ -231,12 +319,20 @@ void add_periodic(const char* name, unsigned interval_ms, Task task, config::Mod
 void start_worker() {
     Core& c = core();
     HANDLE t = CreateThread(nullptr, 0, &worker_main, nullptr, 0, &c.worker_tid);
-    if (t) CloseHandle(t);
+    watchdog::start(t);  // watches the worker, and the worker watches it
 }
 
 DWORD worker_thread_id() { return core().worker_tid; }
 
-int pending_exit_code() { return closing() ? core().exit_code.load() : 0; }
+int pending_exit_code() {
+    const CloseRequest* r = core().close.load(std::memory_order_acquire);
+    return r ? config::reason(r->reason).exit_code : 0;
+}
+
+const char* pending_reason_id() {
+    const CloseRequest* r = core().close.load(std::memory_order_acquire);
+    return r ? config::reason(r->reason).id : nullptr;
+}
 
 std::wstring reason_text(config::Reason reason, const std::wstring& detail, std::wstring* title) {
     const auto& d = config::reason(reason);

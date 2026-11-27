@@ -104,6 +104,15 @@ void check_jvm_library(const wchar_t* name, const std::wstring& expected_dir) {
     if (!m) return;
     const std::wstring path = win::mapped_file_name(m);
     if (path.empty() || win::path_under(path, expected_dir)) return;
+    // The same folder under another name — JAVA_HOME through a junction or an 8.3 name, on a volume
+    // mounted into a folder: both sides as the file system names them.
+    const std::wstring file = win::canonical_path(path), dir = win::canonical_path(expected_dir);
+    if (!file.empty() && !dir.empty() && win::path_under(file, dir)) return;
+    if (config::kTestBuild) {  // test builds: which path was judged, so a failed e2e run says why
+        std::fprintf(stderr, "[Mebet] jvm library outside the client Java: %s (%s) not under %s (%s)\n",
+                     to_utf8(path).c_str(), to_utf8(file).c_str(), to_utf8(expected_dir).c_str(), to_utf8(dir).c_str());
+        std::fflush(stderr);
+    }
     report::Event ev;
     ev.type = "close.jvm_path";
     ev.level = report::Level::error;
@@ -145,6 +154,13 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
     static std::atomic<bool> entered{false};
     if (!boot || boot->size < sizeof(BootInfo) || boot->version != kBootInfoVersion || entered.exchange(true)) return 200;
     guard::init(boot);
+    // Pinned: FreeLibrary on the agent (a mod calling it through the Foreign Function API, say)
+    // no longer unloads the guard and leaves the hooks jumping into freed memory.
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&MebetGuardMain), &self);
+    }
     nt::api();
     modules::init();
 
@@ -186,8 +202,9 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
         gate::register_loader_notifications();
     }
 
-    // 4. Developer mode (locked) and virtual machine — before the start (ТЗ §8).
-    env::check_dev_mode();
+    // 4. Developer mode and virtual machine — before the start (ТЗ §8). Off only in the
+    //    unsigned devtest build, so its layers can be tested on a dev-mode CI runner.
+    if (config::enabled(config::Module::dev_mode)) env::check_dev_mode();
     if (config::enabled(config::Module::virtual_machine)) env::check_virtual_machine();
     env::tag_kernel_state();
 

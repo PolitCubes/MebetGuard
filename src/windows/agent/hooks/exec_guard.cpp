@@ -39,7 +39,10 @@ void close_foreign_code(const Requester& r, const char* operation, std::uintptr_
     ev.level = report::Level::error;
     char title[160];
     std::snprintf(title, sizeof(title), "Closed: executable memory requested by %s (%s)",
-                  r.address ? "a module that is not allowed" : "code outside any module", operation);
+                  r.from_jvm_code ? "Java code through the Foreign Function API"
+                  : r.address     ? "a module that is not allowed"
+                                  : "code outside any module",
+                  operation);
     ev.title = title;
     JsonWriter w;
     w.begin_object();
@@ -48,18 +51,59 @@ void close_foreign_code(const Requester& r, const char* operation, std::uintptr_
     w.field("address", cards::address_hex(address));
     w.field("size", static_cast<std::uint64_t>(size));
     w.key("requester").raw(cards::address_json(r.address));
+    if (r.from_jvm_code) w.field("requester_kind", "jvm_generated_code");
     w.end_object();
     ev.extra_json = w.take();
-    ev.fingerprint = {"close.foreign_code", cards::address_owner_key(r.address)};
+    // Java code has no module to name it by, and the hash of the JIT region it sits in is new in
+    // every session: one issue for all such requests.
+    ev.fingerprint = {"close.foreign_code", r.from_jvm_code ? std::string("jvm_generated_code")
+                                                             : cards::address_owner_key(r.address)};
     guard::signal(config::Module::foreign_exec_memory, config::Reason::foreign_code, std::wstring(), std::move(ev));
 }
 
 }  // namespace
 
+namespace {
+using NtCompareObjectsFn = NTSTATUS(NTAPI*)(HANDLE first, HANDLE second);
+// Resolved when the agent loads, so that a hook on a thread without TLS can use them (see nt_hooks).
+const NtCompareObjectsFn g_compare_objects = reinterpret_cast<NtCompareObjectsFn>(
+    reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCompareObjects")));
+// A real handle to this process (the pseudo-handle is not one the kernel compares by object).
+HANDLE self_handle() {
+    HANDLE h = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &h, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS))
+        return nullptr;
+    return h;
+}
+const HANDLE g_self = self_handle();  // never closed: hooks use it while the process exits
+}  // namespace
+
+// Three states: ours, another, or a handle too stripped to tell. A handle without
+// PROCESS_QUERY_LIMITED_INFORMATION tells no id, yet VirtualAllocEx needs no more than
+// PROCESS_VM_OPERATION; the kernel compares the objects behind two handles whatever they allow
+// (Windows 10 1607+, NtCompareObjects). Where even that cannot be asked, the owner stays unknown.
+enum class Owner { ours, other, unknown };
+Owner process_owner(HANDLE process) {
+    if (process == nt::current_process()) return Owner::ours;
+    if (!process) return Owner::other;
+    if (const DWORD pid = GetProcessId(process)) return pid == GetCurrentProcessId() ? Owner::ours : Owner::other;
+    if (g_compare_objects && g_self) return nt::ok(g_compare_objects(process, g_self)) ? Owner::ours : Owner::other;
+    return Owner::unknown;
+}
+
 bool is_current_process(HANDLE process) {
-    if (process == nt::current_process()) return true;
-    if (!process) return false;
-    return GetProcessId(process) == GetCurrentProcessId();
+    // Unknown counts as ours here, so a stripped handle to the game is judged (and refused), not waved
+    // through. On a genuinely foreign handle mistaken for unknown, a view lands in another address
+    // space, so VirtualQuery finds nothing of it here and nothing is recorded (see nt_hooks).
+    return process_owner(process) != Owner::other;
+}
+
+bool confirmed_current_process(HANDLE process) {
+    // For recording trust or forgetting it: only a handle proven to be the game's own. An unknown
+    // handle is not enough — trust it and a KnownDlls view mapped into another process would be
+    // recorded in the game as a trusted module.
+    return process_owner(process) == Owner::ours;
 }
 
 Requester find_requester() {
@@ -92,7 +136,22 @@ Requester find_requester() {
         r.trust = owner.trust;
         r.module_base = owner.module_base;
         r.from_exec_region = true;
-        r.allowed = owner.trust != trust::Trust::unknown;
+        // The JVM asks for executable memory from jvm.dll, never from the code it generated.
+        // A request whose first frame is in that code (JIT, interpreter, a downcall stub) is
+        // Java code calling the OS through the Foreign Function API: a mod's way to shellcode
+        // without a DLL of its own.
+        //
+        // Not on 32-bit x86. There the stack is walked by frame pointers, jvm.dll is built
+        // without them, and the walk can skip its frames and land in the Java code that called
+        // into the JVM: the code cache growing would look like such a request and close the
+        // game. And there is nothing to catch: 32-bit Windows Java has no Foreign Function
+        // linker at all. The periodic sweep covers executable memory there as everywhere.
+#if defined(_M_IX86)
+        r.from_jvm_code = false;
+#else
+        r.from_jvm_code = owner.trust == trust::Trust::java;
+#endif
+        r.allowed = owner.trust != trust::Trust::unknown && !r.from_jvm_code;
     }
     return r;
 }
