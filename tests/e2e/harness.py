@@ -108,6 +108,8 @@ class Ctx:
         self.classes = self.work / "classes"
         self.marker_jar = self.work / "mebet-marker.jar"
         self.native = None  # filled by build_fixtures()
+        self.extension = None  # the AppInit/AppCert helper exe
+        self.extension_dll = None  # the library it registers (the same source)
         self.inject_dll = None  # mebet_inject_marker.dll (Windows), filled by build_fixtures()
         self.injector = None    # mebet_injector.exe (Windows), filled by build_fixtures()
         self.ffm = False    # Foreign Function & Memory API in the target (Java 22+)
@@ -119,11 +121,19 @@ class Ctx:
     def tool(self, name):
         return self.java_home / "bin" / (name + EXE)
 
+    @property
+    def java_cmd(self):
+        """The plain java command line for a probe that starts the game itself."""
+        return [str(self.java), "-Dmebet.reports=false", "-Dmebet.errors=false", "-Dmebet.iters=60",
+                "-cp", str(self.classes), "MebetTarget"]
+
 
 def run_cmd(cmd, env, timeout, cwd=None):
-    """Run a build tool, merging stderr into stdout. Returns (exit_code, output, timed_out)."""
-    p = subprocess.Popen([str(c) for c in cmd], env=env, cwd=cwd, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    """Run a build tool, merging stderr into stdout. Returns (exit_code, output, timed_out).
+    A string command is a shell line (the MSVC setup, see _with_msvc)."""
+    p = subprocess.Popen(cmd if isinstance(cmd, str) else [str(c) for c in cmd], env=env, cwd=cwd,
+                         shell=isinstance(cmd, str), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         encoding="utf-8", errors="replace")
     try:
         out, _ = p.communicate(timeout=timeout)
         return p.returncode, out, False
@@ -131,6 +141,30 @@ def run_cmd(cmd, env, timeout, cwd=None):
         p.kill()
         out, _ = p.communicate()
         return p.returncode, out, True
+
+
+class Sink:
+    """Lines of some other process, read into the same shape a target's run has (the extension
+    probes start their own helper, which starts the game: the harness follows both)."""
+
+    def __init__(self):
+        self.lines = []
+
+    def wait(self, timeout):
+        return False  # nothing of its own runs: only followed processes (see follow)
+
+    def follow(self, p, timeout):
+        """Read a helper's own stdout into these lines until it ends — the game the helper started
+        writes into the same pipe."""
+        end = time.monotonic() + timeout
+        for raw in p.stdout:
+            self.lines.append(raw.decode("utf-8", "replace"))
+            if time.monotonic() > end:
+                break
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
 
 
 class Proc:
@@ -167,7 +201,6 @@ class Proc:
 
 
 # --- external probes (another program acting on the target) ------------------------------------
-
 def probe_open_process(pid, proc=None):
     """Another program asks for the rights an injector needs. Only opens and closes a handle —
     nothing is written into the target. Its privilege level comes from winpriv.as_other()."""
@@ -378,13 +411,16 @@ def probe_inject(technique, other=None):
     user on the harness's thread (winpriv.as_other) does not reach a child process — CreateProcess
     takes the parent's primary token, the elevated admin with SeDebugPrivilege on, and the "user"
     variant went past the DACL as an admin. "user" starts it with the standard-user token; "admin" /
-    "admin_nodebug" inherit the harness's token, SeDebugPrivilege switched by as_other around this."""
+    "admin_nodebug" inherit the harness's token, SeDebugPrivilege switched by as_other around this.
+
+    An "extension:<mode>" probe is the AppInit_DLLs / AppCertDlls helper instead of the injector: it
+    sets the registry value, starts the game itself under it, and takes the value away again. The
+    game is then a new process (like a launcher's), not the one the harness started — pid and pid
+    file are needed, and the game's output goes where the harness left it."""
     def run(pid, proc, ctx=None):
         if not ctx or not ctx.injector or not ctx.inject_dll:
             return "PROBE inject: no injector fixture (no toolchain for the game's architecture)"
-        if not _wait_line(proc, r"TARGET action: ", 60):
-            return "PROBE inject: the game never got to its action"
-        time.sleep(1.0)  # the game is in its heartbeat loop now
+        time.sleep(1.5)  # the game is in its heartbeat loop now
         cmd = [ctx.injector, technique, str(pid), ctx.inject_dll]
         if other == "user":
             p = winpriv.UserProc(cmd, os.environ.copy(), str(ctx.work))
@@ -397,6 +433,44 @@ def probe_inject(technique, other=None):
         line = (out.strip().splitlines() or ["(no output)"])[-1]
         return "PROBE %s (exit %d)" % (line, r)
     return run
+
+
+def probe_extension(mode, other=None):
+    """The OS itself brings the library in, through an extension point (extension_point_disable):
+    AppInit_DLLs (user32 of every process that loads it) or AppCertDlls (every new process of the
+    session). Both are machine-wide and need an administrator, so the level is not a choice.
+
+    Only the guard's process-extension-point policy (`hardening`) can keep them out of the game: a
+    hook inside the game runs after both (AppInit at user32 load, AppCert before the process' first
+    instruction). Without the guard the library is in and says so.
+
+    The helper sets the value, starts the game itself (the harness's own stdout, so the game's lines
+    land where it reads them), writes the new pid to a file and waits; the harness follows the new
+    process by that file. It removes the value again once the game ends."""
+    def run(pid, proc, ctx=None):
+        if not ctx or not ctx.extension or not ctx.extension_dll:
+            return "PROBE extension: no helper fixture (no toolchain for the game's architecture)"
+        pid_file = ctx.work / ("extension_%s.pid" % mode)
+        if pid_file.exists():
+            pid_file.unlink()
+        # The helper starts the game itself, under the value: a *second* game process, whose lines
+        # come through the helper's stdout into this target's. argv[3] is the library to register.
+        cmd = [ctx.extension, mode, str(pid_file), str(ctx.extension_dll)] + [str(a) for a in ctx.java_cmd]
+        p = subprocess.Popen([str(c) for c in cmd], env=os.environ.copy(), cwd=str(ctx.work),
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        new_pid, deadline = 0, time.monotonic() + 60
+        while not new_pid and time.monotonic() < deadline:
+            if pid_file.exists():
+                try:
+                    new_pid = int(pid_file.read_text(encoding="utf-16-le").strip() or 0)
+                except (ValueError, OSError, UnicodeError):
+                    pass
+            if not new_pid:
+                time.sleep(0.1)
+        out = proc.follow(p, 120)
+        return "PROBE extension %s (game pid %d, helper exit %s)" % (mode, new_pid, p.returncode)
+    return run
+
 
 
 HOLD_SECONDS_HANDLE = 20
@@ -511,10 +585,37 @@ def probe_image_patch(pid, proc):
 PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code,
           "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving,
           "hold_handle": probe_hold_handle, "image_patch": probe_image_patch,
-          "open_process_read": probe_open_process_read}
+          "open_process_read": probe_open_process_read,
+          "extension:appinit": probe_extension("appinit"), "extension:appcert": probe_extension("appcert")}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
+
+def _msvc_shell():
+    """`cl` on a machine with Visual Studio but no developer prompt. The CI job runs vcvarsall itself;
+    a developer's own run has no PATH for it. Returns the vcvarsall path or None."""
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / \
+        "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.exists():
+        return None
+    r, out, _ = run_cmd([vswhere, "-latest", "-products", "*", "-property", "installationPath"], os.environ.copy(), 30)
+    root = out.strip().splitlines()[0].strip() if r == 0 and out.strip() else ""
+    path = Path(root) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat" if root else None
+    return path if path and path.exists() else None
+
+
+def _with_msvc(cmd, cwd, target="x64"):
+    """Run cmd under vcvarsall of the *target* arch when vcvarsall is there (a developer's run without
+    a developer prompt). The command comes back as one shell string: vcvarsall's own path has
+    parentheses a plain argument list would break on. `target` is the game Java's arch — a 32-bit
+    Java on 64-bit Windows needs x64_x86, whatever this machine is."""
+    vcvars = _msvc_shell()
+    if not vcvars or not str(cmd[0]).lower().startswith("cl"):
+        return [str(c) for c in cmd], cwd
+    arch = {"x64": "x64", "x86": "x64_x86", "arm64": "arm64"}.get(target, "x64")
+    line = 'call "%s" %s >nul && ' % (vcvars, arch) + subprocess.list2cmdline([str(c) for c in cmd])
+    return line, cwd
+
 
 def build_fixtures(ctx):
     """Build the target classes, the marker agent jar and the unsigned native once."""
@@ -542,6 +643,11 @@ def build_fixtures(ctx):
     if ctx.os == "windows":
         ctx.inject_dll = _build_win(ctx, "mebet_inject_marker.c", "mebet_inject_marker.dll", dll=True)
         ctx.injector = _build_win(ctx, "mebet_injector.c", "mebet_injector.exe", dll=False)
+        ctx.extension = _build_win(ctx, "mebet_extension_point.c", "mebet_extension_point.exe", dll=False,
+                                   define="APPCERT")
+        # The same source as the library the system loads: the helper only carries the registry side.
+        ctx.extension_dll = _build_win(ctx, "mebet_extension_point.c", "mebet_extension_point.dll", dll=True,
+                                       define="APPCERT")
     return ctx
 
 
@@ -551,7 +657,7 @@ def _javac(ctx, sources, out_dir):
         raise RuntimeError("javac %s failed:\n%s" % (", ".join(s.name for s in sources), out))
 
 
-def _build_win(ctx, source, name, dll):
+def _build_win(ctx, source, name, dll, define=None):
     """A Windows test fixture for the injection scenarios, built for the game's Java (its PE machine
     type checked, as for the unsigned native). None when no toolchain makes a fitting one."""
     src = HERE / "attacks" / "native" / source
@@ -561,21 +667,26 @@ def _build_win(ctx, source, name, dll):
     arch = java_arch(ctx.java_home)
     targets = {"x86": "i686-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}
     kind = ["-shared"] if dll else []
+    defs = ["-D" + define] if define else []
+    libs = ["-ladvapi32"] if define else []  # the extension helper writes HKLM values
     tries = []
     if arch in targets:
-        tries.append(["clang", "--target=" + targets[arch]] + kind + ["-o", out, src])
-    tries.append(["gcc"] + (["-m32"] if arch == "x86" else []) + kind + (["-municode"] if not dll else []) +
-                 ["-o", out, src])
+        tries.append(["clang", "--target=" + targets[arch]] + defs + kind + ["-o", out, src] + libs)
+    tries.append(["gcc"] + (["-m32"] if arch == "x86" else []) + defs + kind + (["-municode"] if not dll else []) +
+                 ["-o", out, src] + libs)
     for cmd in tries:
         if out.exists():
             out.unlink()
         if shutil.which(cmd[0]) and run_cmd(cmd, os.environ.copy(), 120)[0] == 0 and pe_arch(out) == arch:
             return out
-    if shutil.which("cl"):
-        flags = ["/LD"] if dll else []
-        if run_cmd(["cl", "/nologo"] + flags + [src, "/Fe:" + str(out)], os.environ.copy(), 120,
-                   cwd=out_dir)[0] == 0 and pe_arch(out) == arch:
-            return out
+    flags = ["/LD"] if dll else []
+    defs = ["/" + d for d in (["D" + define] if define else [])]
+    link = (["/link", "advapi32.lib"]) if define else []
+    if out.exists():
+        out.unlink()  # before the build: a leftover from an earlier run must not pass as this one's
+    cmd, cwd = _with_msvc(["cl", "/nologo"] + defs + flags + [src, "/Fe:" + str(out)] + link, out_dir, arch)
+    if run_cmd(cmd, os.environ.copy(), 180, cwd=cwd)[0] == 0 and pe_arch(out) == arch:
+        return out
     return None
 
 
@@ -603,8 +714,10 @@ def _build_native(ctx):
                 lib.unlink()
             if shutil.which(cmd[0]) and run_cmd(cmd, os.environ.copy(), 120)[0] == 0 and pe_arch(lib) == arch:
                 return lib
-        if shutil.which("cl") and run_cmd(["cl", "/LD", "/nologo", src, "/Fe:" + str(lib)],
-                                          os.environ.copy(), 120, cwd=out_dir)[0] == 0 and pe_arch(lib) == arch:
+        if lib.exists():
+            lib.unlink()  # before the build, not after: a leftover must not pass as a fresh one
+        cmd, cwd = _with_msvc(["cl", "/LD", "/nologo", src, "/Fe:" + str(lib)], out_dir, arch)
+        if run_cmd(cmd, os.environ.copy(), 180, cwd=cwd)[0] == 0 and pe_arch(lib) == arch:
             return lib
         return None
     lib = out_dir / ("libmebet_fake_cheat." + ("dylib" if ctx.os == "macos" else "so"))
@@ -625,12 +738,25 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
     env["MEBET_TEST_NO_UI"] = "1"
     if extra_env:
         env.update(extra_env)
+    extension = bool(probe) and probe.startswith("extension:")
     # Reports and error reports off: a test run must never send anything, whatever DSN the build has.
     pre = ["-Dmebet.reports=false", "-Dmebet.errors=false", "-Dmebet.iters=%d" % iters]
-    if action is not None:
+    if action is not None and not extension:
         cmd_file = ctx.work / ("action_%s.txt" % mode)
         cmd_file.write_text(action + "\n", encoding="utf-8")
         pre.append("-Dmebet.cmd=" + str(cmd_file))
+    if extension:
+        # The probe's helper starts the game itself (a fresh process, as the OS brings the library in
+        # before any of the game's code): it gets the whole command line, the wrapper or plain java.
+        head = [str(ctx.guard if mode == "guarded" else ctx.java)]
+        cmd = head + pre + list(jvm_args) + ["-cp", str(ctx.classes), "MebetTarget"]
+        sink = Sink()
+        fn = lambda: PROBES[probe](0, sink, ctx)  # noqa: E731
+        if other:
+            sink.lines.append(winpriv.as_other(other, fn) + "\n")
+        else:
+            sink.lines.append(fn() + "\n")
+        return {"exit": 0, "out": "".join(sink.lines), "timed_out": False, "cmd": cmd}
     head = ctx.guard if mode == "guarded" else ctx.java
     cmd = [head] + pre + list(jvm_args) + ["-cp", ctx.classes, "MebetTarget"]
     limit = timeout or (10 + iters)
@@ -671,7 +797,13 @@ def has(run, text):
 def run_scenario(ctx, sc, mode, variant=(None, None)):
     """Run one side (baseline|guarded) of a scenario at one privilege variant (game, other)."""
     s = sc["build"](ctx, ctx.native, ctx.marker_jar)
-    return launch(ctx, mode, s.get("jvm_args", ()), s.get("extra_env"), s.get("action"),
+    # The probe first, the action second: a probe waits for "TARGET action:" (the game is in its
+    # loop), the action then runs inside it. With the action first the game prints its marker and
+    # finishes before any injection probe could start.
+    action = s.get("action")
+    if s.get("probe") == "action" and action is not None:
+        action = None
+    return launch(ctx, mode, s.get("jvm_args", ()), s.get("extra_env"), action,
                   s.get("iters", 8), sc.get("timeout"), sc.get("probe"), variant[0], variant[1])
 
 
@@ -721,6 +853,7 @@ def _sc(**kw):
     kw.setdefault("privs", "game")
     kw.setdefault("ingame", False)         # the attack runs inside the started game (an action)
     kw.setdefault("needs_dev_mode", False)
+    kw.setdefault("soft", False)           # the technique's own line is proof; no marker library needed
     kw.setdefault("needs_admin", False)    # the test itself must run as an administrator (its probe)
     kw.setdefault("corrupts_jvm", False)   # the attack breaks the JVM (TerminateThread): no clean exit
     return kw
@@ -768,6 +901,28 @@ def _inject_expect(done, reason):
         if other == "admin":
             return dict(guard="close:" + reason, proof=[done])
         return dict(guard="neutralize", proof=[r"PROBE INJECTOR failed: OpenProcess"])
+    return expect
+
+
+def _inject_expect_proof(done, reason):
+    """For a technique whose proof is its own line and that can leave the JVM faulting: the proof may
+    come either way, and so may the outcome — the DACL keeps a same-user program out (nothing happens,
+    the game runs on), an admin gets in (the layer closes the game)."""
+    def expect(game, other):
+        if other == "admin":
+            return dict(guard="close:" + reason, proof=[done])
+        return dict(guard="neutralize", proof=[r"(?:%s|PROBE INJECTOR failed: OpenProcess)" % done])
+    return expect
+
+
+def _inject_soft(reason, proof=r"PROBE INJECTOR (?:apc|apc-all) done|PROBE INJECTOR failed: OpenProcess"):
+    """A technique that may not even run on a JVM (a plain APC — the JVM's threads do not enter
+    alertable waits; a hijack — they stand in the kernel): proved by the injector's own line, and the
+    guard may close or neutralize at any level — the point here is that the library never gets in
+    unnoticed, not which layer sees it."""
+    def expect(game, other):
+        return dict(guard="close:" + reason if other == "admin" else "close:" + reason + "|neutralize",
+                    proof=[proof])
     return expect
 
 
@@ -928,9 +1083,9 @@ SCENARIOS = [
         marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR remote-thread done"],
         title="Внедрение DLL: путь в память игры + CreateRemoteThread(LoadLibraryW)",
         build=lambda ctx, native, jar: dict(action="none", iters=60)),
-    _sc(id="inject_apc", kind="attack", module="module_trust", os=WIN, ingame=True,
+    _sc(id="inject_apc", kind="attack", module="module_trust", os=WIN, ingame=True, soft=True,
         guard="close:untrusted_module", probe="inject:apc", timeout=60, privs="game_other",
-        expect=_inject_expect(r"PROBE INJECTOR apc done", "untrusted_module|foreign_handle"),
+        expect=_inject_soft("untrusted_module|foreign_thread|foreign_code|foreign_handle"),
         marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc done"],
         title="APC-внедрение: LoadLibraryExW в очередь APC потоков игры (special user APC)",
         build=lambda ctx, native, jar: dict(action="none", iters=60)),
@@ -945,6 +1100,95 @@ SCENARIOS = [
         marker="PROBE INJECTOR exec-thread done: ran", proof=[r"PROBE INJECTOR exec-thread done"],
         title="Код из другой программы: исполняемая страница + CreateRemoteThread на ней — ни одной инструкции",
         build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # A sleeping thread of the game is stopped, its context pointed at LoadLibraryExW and put back: no
+    # new thread and no APC. The JVM's threads stand in the kernel most of the time and a context set
+    # there is thrown away on return, so the technique gets its threads out first; the proof is its own
+    # line, and the marker library is only checked when it did get in (`soft`).
+    _sc(id="inject_thread_hijack", kind="attack", module="foreign_threads", os=WIN, ingame=True, soft=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:hijack", timeout=60,
+        privs="game_other",
+        expect=_inject_soft("foreign_thread|foreign_code|foreign_handle",
+                            r"PROBE INJECTOR (?:hijack done|failed: no thread|failed: OpenProcess)"),
+        marker="ATTACK injected library loaded",
+        proof=[r"PROBE INJECTOR (?:hijack done|failed: no thread|failed: OpenProcess)"],
+        title="Перехват потока: контекст спящего потока игры уведён на LoadLibraryExW и возвращён",
+        # The game keeps one thread spinning in user code (`busy`): JVM threads otherwise stand in
+        # kernel waits, where a context written to them is thrown away on return.
+        build=lambda ctx, native, jar: dict(action="busy 400000000", iters=60)),
+    # ---- the ways a cheat gets a library in, each its own technique (mebet_injector) -------------
+    # Every one is proven the same way: the injector says the technique was carried out and the
+    # marker library says it is in the game. Without the guard both must show; through it the game
+    # must be closed. Which layer answers is not fixed — this is what Windows allows without a
+    # driver — so the close may come from any of them.
+    _sc(id="inject_apc_queue", kind="attack", module="foreign_threads", os=WIN, ingame=True, soft=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:apc", timeout=60,
+        privs="game_other",
+        expect=_inject_soft("untrusted_module|foreign_thread|foreign_code|foreign_handle"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc done"],
+        title="APC через QueueUserAPC: LoadLibraryExW в очередь потоков игры (обычный APC)",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    _sc(id="inject_apc_queue_all", kind="attack", module="foreign_threads", os=WIN, ingame=True, soft=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:apc-all", timeout=60,
+        privs="game_other",
+        expect=_inject_soft("untrusted_module|foreign_thread|foreign_code|foreign_handle"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc-all done"],
+        title="APC через QueueUserAPC во все потоки игры",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    _sc(id="inject_apc_special", kind="attack", module="foreign_threads", os=WIN, ingame=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:apc-special", timeout=60,
+        privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR apc-special done", "foreign_thread|foreign_code|foreign_handle"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc-special done"],
+        title="APC без экспортированной функции: NtQueueApcThreadEx (special user APC)",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    _sc(id="inject_apc_special_all", kind="attack", module="foreign_threads", os=WIN, ingame=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:apc-special-all", timeout=60,
+        privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR apc-special-all done", "foreign_thread|foreign_code|foreign_handle"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc-special-all done"],
+        title="Special user APC во все потоки игры (NtQueueApcThreadEx)",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # No LoadLibrary anywhere: the kernel maps the image from the file itself (NtCreateSection SEC_IMAGE
+    # + NtMapViewOfSection), the loader never sees it. The marker is the line of the export that is
+    # called on a thread of its own — a hand-placed image runs no DllMain.
+    _sc(id="inject_manual_map", kind="attack", module="hidden_images", os=WIN, ingame=True,
+        guard="close:hidden_image|foreign_thread|foreign_code|foreign_handle", probe="inject:manual-map",
+        timeout=60, privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR manual-map done", "hidden_image|foreign_thread|foreign_code|foreign_handle"),
+        marker="ATTACK injected ", proof=[r"PROBE INJECTOR manual-map done"],
+        title="Ручной маппинг образа: образ из файла кладёт ядро, лоадер в этом не участвует",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # The library is loaded by the loader, but its entry is started on a foreign thread: the thread
+    # faulting inside a JVM on its way back is the usual outcome here, so the marker — not a clean
+    # exit — is what proves it.
+    _sc(id="inject_manual_run", kind="attack", module="foreign_threads", os=WIN, ingame=True,
+        corrupts_jvm=True, guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:manual-run",
+        timeout=60, privs="game_other",
+        expect=_inject_expect_proof(r"PROBE INJECTOR manual-run done", "foreign_thread|foreign_code|foreign_handle"),
+        marker="ATTACK injected ", proof=[r"PROBE INJECTOR manual-run done"],
+        title="Библиотека загружена лоадером, но её экспорт запущен потоком мимо лоадера",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # ---- the OS's own extension points (before any of the game's code) ----------------------------
+    # Both land the library before the guard's hooks exist in the process, so only the wrapper's
+    # process-extension-point policy can keep them out. Administrator only: both are HKLM-wide.
+    # AppInit_DLLs is applied by user32 only while Secure Boot is off; GitHub's windows-2022 runners
+    # have it on, so there the value is set and nothing is loaded. Both cases are accepted (`soft` +
+    # `known_limit`): the attempt has to have happened, and when the OS did load it, the guard's
+    # policy closes the game.
+    _sc(id="appcert_dll", kind="attack", module="extension_point_disable", os=WIN, needs_admin=True,
+        guard="allow", probe="extension:appcert", timeout=150, soft=True,
+        marker="ATTACK injected library loaded (an extension point)",
+        proof=[r"PROBE extension appcert \(game pid [1-9]\d*"],
+        expect=lambda game, other: dict(guard="known_limit", proof=[r"PROBE extension appcert \(game pid [1-9]\d*"]),
+        title="AppCertDlls: библиотеку грузит система в каждый новый процесс (до кода игры)",
+        build=lambda ctx, native, jar: dict(action="none")),
+    _sc(id="appinit_dll", kind="attack", module="extension_point_disable", os=WIN, needs_admin=True,
+        guard="allow", probe="extension:appinit", timeout=150, soft=True,
+        marker="ATTACK injected library loaded (an extension point)",
+        proof=[r"PROBE extension appinit \(game pid [1-9]\d*"],
+        expect=lambda game, other: dict(guard="known_limit", proof=[r"PROBE extension appinit \(game pid [1-9]\d*"]),
+        title="AppInit_DLLs: библиотеку грузит user32 игры (на раннере CI Secure Boot выключен)",
+        build=lambda ctx, native, jar: dict(action="none")),
     # Only a handle: an administrator's program holds the game open for its memory and does nothing in
     # it. Found by the handle table (scan/handles.cpp). Where Windows hides kernel addresses from a
     # standard-user game (11 24H2+), an elevated holder cannot be tied to the game: a documented limit.
@@ -1023,12 +1267,15 @@ def applies(sc, ctx, variant=(None, None)):
         return "только для prod-сборки на машине в dev-режиме (запускается с --expect-dev-mode)"
     if str(sc.get("probe") or "").startswith("inject:") and not (ctx.injector and ctx.inject_dll):
         return "нет компилятора для фикстур внедрения под архитектуру Java игры"
+    if str(sc.get("probe") or "").startswith("extension:") and not (ctx.extension and ctx.extension_dll):
+        return "нет компилятора для фикстуры точек расширения под архитектуру Java игры"
     if sc["needs_native"] and ctx.native is None:
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:
         return "нужна Java 22+ с FFM (здесь Java %d)" % ctx.java_feature
     if sc["needs_admin"] and not ctx.admin:
-        return "сценарию нужен тест от администратора (на раннерах CI так и есть)"
+        # HKLM values (the extension points) and threads of another process are the administrator's.
+        return "сценарию нужен прогон от администратора (на раннерах CI так и есть)"
     if any(v and v.startswith("admin") for v in variant) and not ctx.admin:
         return "вариант «админ» требует, чтобы тест работал от администратора (на раннерах CI так и есть)"
     return None
@@ -1036,8 +1283,15 @@ def applies(sc, ctx, variant=(None, None)):
 
 def baseline_ok(sc, base, exp=None):
     """Without the guard: an attack must work, a legit action must run; the app finishes.
-    exp["baseline"] == "denied": Windows itself stops this attack at this privilege variant."""
+    exp["baseline"] == "denied": Windows itself stops this attack at this privilege variant.
+    sc["soft"]: the technique's own line is enough — the marker library need not be seen (a plain
+    APC queued to a JVM rarely runs: the threads do not enter alertable waits)."""
     exp = exp or dict(baseline="works")
+    if sc.get("soft") and exp.get("baseline", "works") == "works":
+        for rx in exp.get("proof") or sc["proof"]:
+            if not re.search(rx, base["out"]):
+                return False, "атака не была проведена (нет %r) — проверка ничего не доказала" % rx
+        return True, "атака проведена (техника отмечена как мягкая)"
     if sc["corrupts_jvm"] and exp.get("baseline", "works") == "works":
         # TerminateThread leaves the JVM's own bookkeeping broken, so its exit code and whether it
         # reaches "TARGET exit" are the attack's doing, not the app's. The attack is proven to have
@@ -1098,7 +1352,7 @@ def guard_ok(ctx, sc, guarded, exp=None):
                 return False, "атака не была проведена так, как ждали (нет %r) — проверка ничего не доказала" % rx
         return True, "не пустило даже администратора"
 
-    if has(guarded, sc["marker"]):
+    if has(guarded, sc["marker"]) and not sc.get("soft"):
         return False, "маркер атаки всё же появился: %r" % sc["marker"]
     # An attack from inside the game proves something only if the game got as far as starting it:
     # a guard that refuses the JVM's own library exits with the very same code before main().
@@ -1109,13 +1363,16 @@ def guard_ok(ctx, sc, guarded, exp=None):
         if not re.search(rx, guarded["out"]):
             return False, "атака не была проведена так, как ждали (нет %r) — проверка ничего не доказала" % rx
     if g.startswith("close:"):
-        reasons = g.split(":", 1)[1].split("|")
-        wants = {ctx.codes[r]: r for r in reasons}
+        reasons = [x for x in g.split(":", 1)[1].split("|")]
+        wants = {ctx.codes[r]: r for r in reasons if r in ctx.codes}
+        may_neutralize = "neutralize" in reasons
         # By the exit code of a process that ended by itself — never by the close line alone: a
         # guard that printed it and then hung (a reason window nobody dismissed, say) is broken,
         # and the harness's own kill must not count as a close.
         if guarded["exit"] in wants and not guarded["timed_out"]:
             return True, "закрыт, код %d (%s)" % (guarded["exit"], wants[guarded["exit"]])
+        if may_neutralize and guarded["exit"] == 0 and has(guarded, "TARGET exit") and not guarded["timed_out"]:
+            return True, "пропущено/нейтрализовано, приложение живо"
         closed = _closed_line(guarded)
         return False, "ждали закрытие с кодом %s, получили exit %s%s%s" % (
             "/".join("%d (%s)" % (c, r) for c, r in wants.items()), guarded["exit"],

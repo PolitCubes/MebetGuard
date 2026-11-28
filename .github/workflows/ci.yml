@@ -183,8 +183,19 @@ jobs:
     uses: ./.github/workflows/e2e-windows.yml
     with:
       features: >-
-        ["process_dacl_open", "process_dacl_read", "inject_remote_thread", "inject_apc", "inject_exec_thread",
-         "foreign_handle_hold"]
+        ["process_dacl_open", "process_dacl_read", "inject_remote_thread", "inject_apc", "inject_apc_queue",
+         "inject_apc_queue_all", "inject_apc_special", "inject_apc_special_all", "inject_exec_thread",
+         "inject_thread_hijack", "inject_manual_map", "inject_manual_run", "foreign_handle_hold"]
+
+  # The OS's own extension points: the library is in the process before any of the game's code, so
+  # only the wrapper's mitigation policy can stop it. HKLM-wide, so administrator only.
+  e2e-win-extension:
+    needs: build-windows-binaries
+    name: "windows · точки расширения ОС"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["appcert_dll", "appinit_dll"]
 
   e2e-win-guard:
     needs: build-windows-binaries
@@ -388,8 +399,8 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [e2e-win-legit, e2e-win-start, e2e-win-modules, e2e-win-code, e2e-win-outside, e2e-win-guard,
-            e2e-win-paths, e2e-linux, e2e-macos]
+    needs: [e2e-win-legit, e2e-win-start, e2e-win-modules, e2e-win-code, e2e-win-outside, e2e-win-extension,
+            e2e-win-guard, e2e-win-paths, e2e-linux, e2e-macos]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

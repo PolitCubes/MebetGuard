@@ -131,8 +131,24 @@ std::wstring final_path(HANDLE file) {
 
 HANDLE open_read(const std::wstring& path) {
     watchdog::SlowWork slow;  // an open can wait on a slow or unreachable disk
-    return CreateFileW(win::exact_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const std::wstring exact = win::exact_path(path);
+    const HANDLE f = CreateFileW(exact.c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) return f;
+#if defined(_M_IX86) || defined(__i386__)
+    // Under WOW64 the system redirects System32 to SysWOW64, where a 64-bit-only file is not: the
+    // kernel names csrss.exe as C:\Windows\System32\csrss.exe, and that open says "not found" from a
+    // 32-bit process — the holder then looked unreadable and the game was closed (227) on the runner.
+    // `Sysnative` is the native System32, seen by WOW64 only.
+    if (win::path_under(path, win::windows_dir() + L"\\System32")) {
+        const std::wstring native = win::windows_dir() + L"\\Sysnative" + path.substr((win::windows_dir() + L"\\System32").size());
+        return CreateFileW(win::exact_path(native).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+#endif
+    return f;
 }
 
 }  // namespace mebet::trust

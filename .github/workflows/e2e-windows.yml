@@ -58,6 +58,11 @@ jobs:
           # A special user APC (NtQueueApcThreadEx) cannot be queued from a 32-bit process under
           # WOW64: the injector reaches no thread, without the guard as well, so nothing is proven.
           - { arch: x86, feature: inject_apc }
+          - { arch: x86, feature: inject_apc_special }
+          - { arch: x86, feature: inject_apc_special_all }
+          # The mapper runs in the injector and the section has to be placed in a WOW64 view: x64 only.
+          - { arch: x86, feature: inject_manual_map }
+          - { arch: x86, feature: inject_manual_run }
     env:
       JAVA_VERSION: ${{ matrix.arch == 'x86' && '21' || '25' }}
       JAVA_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || matrix.arch }}
@@ -92,6 +97,9 @@ jobs:
           New-Item -ItemType Directory -Force fixtures | Out-Null
           cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" $env:VC && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
           if (-not (Test-Path fixtures\mebet_fake_cheat.dll)) { throw "fixture not built" }
+          # The injector, its marker and the extension-point helper are built by the harness itself
+          # (tests/e2e/harness.py) for the game's own Java; only the unsigned native is handed in
+          # here, as before.
       - name: install pytest
         shell: pwsh
         run: python -m pip install -q pytest
