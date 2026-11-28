@@ -85,12 +85,34 @@ set(MEBET_GEN "${CMAKE_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${MEBET_GEN}")
 file(GLOB MEBET_CONFIG_INPUTS CONFIGURE_DEPENDS
      "${CMAKE_SOURCE_DIR}/config/*.json" "${CMAKE_SOURCE_DIR}/config/roots/*.pem" "${CMAKE_SOURCE_DIR}/config/hashes/*.txt")
+# GlitchTip DSNs come from the environment at configure time (CI: the GLITCHTIP_ERRORS_DSN /
+# GLITCHTIP_REPORTS_DSN repository secrets, release builds only), never from git: config/
+# reporting.json keeps them empty. They go through a file in the build tree, not the command line,
+# so no build log shows them; the file is rewritten only when a value changes. No variable = that
+# channel is silent in this build (forks, local builds).
+set(MEBET_DSN_FILE "${MEBET_GEN}/dsn_override.txt")
+set(_mebet_dsn "errors_dsn=$ENV{MEBET_ERRORS_DSN}\nreports_dsn=$ENV{MEBET_REPORTS_DSN}\n")
+set(_mebet_dsn_old "")
+if(EXISTS "${MEBET_DSN_FILE}")
+    file(READ "${MEBET_DSN_FILE}" _mebet_dsn_old)
+endif()
+if(NOT _mebet_dsn STREQUAL _mebet_dsn_old)
+    file(WRITE "${MEBET_DSN_FILE}" "${_mebet_dsn}")
+endif()
+if("$ENV{MEBET_ERRORS_DSN}$ENV{MEBET_REPORTS_DSN}" STREQUAL "")
+    message(STATUS "Mebet: no GlitchTip DSN in the environment, reporting channels silent")
+else()
+    message(STATUS "Mebet: GlitchTip DSN(s) from the environment")
+endif()
+unset(_mebet_dsn)
+unset(_mebet_dsn_old)
 add_custom_command(
     OUTPUT "${MEBET_GEN}/mebet_config.hpp" "${MEBET_GEN}/mebet_trust_data.hpp"
     COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/tools/gen_config.py"
             --config "${CMAKE_SOURCE_DIR}/config" --out "${MEBET_GEN}" --kind ${MEBET_BUILD_KIND}
             --os ${MEBET_OS} --arch ${MEBET_ARCH} --version ${PROJECT_VERSION} --commit "${MEBET_COMMIT}"
-    DEPENDS ${MEBET_CONFIG_INPUTS} "${CMAKE_SOURCE_DIR}/tools/gen_config.py"
+            --dsn-file "${MEBET_DSN_FILE}"
+    DEPENDS ${MEBET_CONFIG_INPUTS} "${CMAKE_SOURCE_DIR}/tools/gen_config.py" "${MEBET_DSN_FILE}"
     COMMENT "Generating guard tables from config/"
     VERBATIM)
 add_custom_target(mebet_config DEPENDS "${MEBET_GEN}/mebet_config.hpp" "${MEBET_GEN}/mebet_trust_data.hpp")
@@ -106,6 +128,10 @@ add_library(mebet_common STATIC
 target_include_directories(mebet_common PUBLIC src/common "${MEBET_GEN}")
 add_dependencies(mebet_common mebet_config)
 set_target_properties(mebet_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# GlitchTip delivery smoke (tests/native/report_smoke.cpp, .github/workflows/glitchtip.yml): the
+# guard's report code and transport in a small executable. Off by default, never shipped.
+option(MEBET_REPORT_SMOKE "Build mebet_report_smoke (GlitchTip delivery check)" OFF)
 
 if(WIN32)
     add_subdirectory(src/windows)

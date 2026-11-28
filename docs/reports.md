@@ -2,9 +2,45 @@
 
 Два канала в GlitchTip (формат Sentry envelope). Оба анонимные, оба включены по умолчанию
 и выключаются отдельно: `-Dmebet.errors=false` и `-Dmebet.reports=false` (лаунчер передаёт
-выбор игрока). DSN задаются в [`config/reporting.json`](../config/reporting.json); пустой
-DSN — канал в этой сборке молчит. Решения стража от каналов не зависят: неизвестное
-закрывается и окно причины показывается в любом случае.
+выбор игрока). DSN вшиваются в сборку (см. ниже); пустой DSN — канал в этой сборке молчит.
+Решения стража от каналов не зависят: неизвестное закрывается и окно причины показывается в
+любом случае.
+
+## Откуда берутся DSN
+
+В git DSN нет: в [`config/reporting.json`](../config/reporting.json) поля `errors_dsn` и
+`reports_dsn` пустые и такими остаются. Сборка берёт их из переменных окружения
+`MEBET_ERRORS_DSN` / `MEBET_REPORTS_DSN` на шаге `cmake` (configure): CMake кладёт их в
+`build/…/generated/dsn_override.txt`, `tools/gen_config.py --dsn-file` вшивает их в
+`mebet_config.hpp` вместо пустых. В командную строку и в логи сборки DSN не попадают.
+
+В CI переменные приходят из секретов репозитория (Settings → Secrets and variables → Actions):
+
+| секрет | что это | где взять в GlitchTip |
+|---|---|---|
+| `GLITCHTIP_ERRORS_DSN` | DSN проекта «Mebet — ошибки» | проект → Settings → Client Keys (DSN) → DSN |
+| `GLITCHTIP_REPORTS_DSN` | DSN проекта «Mebet — отчёты» | так же, второй проект |
+| `GLITCHTIP_TOKEN` | API-токен только для проверки доставки, в сборку не попадает | Profile → Auth Tokens, права `org:read`, `project:read`, `event:read` |
+
+Задать секрет можно в интерфейсе GitHub или из своего терминала: `gh secret set
+GLITCHTIP_ERRORS_DSN` спросит значение и не оставит его в истории команд.
+
+**Какие сборки получают DSN.** Только prod (`release`) в `ci.yml`: это то, что получают
+игроки, события уходят с `environment=release`. Dev-сборки (`devtest`) собираются без DSN и
+не отправляют ничего. Прогоны e2e и perf к тому же запускают страж с `-Dmebet.reports=false
+-Dmebet.errors=false`, так что атаки из CI до GlitchTip не доходят и с prod-сборкой.
+Локальная сборка и PR из форка (секретов там нет) собираются без DSN: оба канала молчат,
+сборка проходит.
+
+**Проверка доставки** — [`.github/workflows/glitchtip.yml`](../.github/workflows/glitchtip.yml):
+на каждый push в master, раз в неделю, вручную и на PR этого репозитория, трогающие код
+отчётов. Собирает `tests/native/report_smoke.cpp` — тот же `report.cpp` и тот же транспорт
+(WinHTTP на Windows, libcurl на Linux), — отправляет в каждый канал маленькое событие и событие
+около 60 КБ (рядом с лимитом 64 КБ) с меткой `smoke=gh-<run>-<попытка>-<ОС>` и
+`environment=test`, требует ответ 2xx и через API GlitchTip (`tools/ci/glitchtip_check.py`,
+токен из `GLITCHTIP_TOKEN`) убеждается, что оба события лежат в проекте своего DSN. Все
+прогоны складываются в две задачи «CI smoke …» на проект (один fingerprint), их можно
+держать решёнными.
 
 ## Что уходит
 
