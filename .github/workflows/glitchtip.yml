@@ -20,6 +20,8 @@ on:
       - src/common/json_writer.*
       - src/windows/agent/report/transport_winhttp.cpp
       - src/posix/agent/transport.cpp
+      - src/posix/CMakeLists.txt
+      - src/windows/CMakeLists.txt
       - tools/gen_config.py
       - tools/ci/glitchtip_check.py
       - config/reporting.json
@@ -71,7 +73,11 @@ jobs:
           fi
       - name: send marked events through it
         shell: bash
-        run: ${{ matrix.exe }} "gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}"
+        # The server's answer must not leak into the process's stdout (the game's console).
+        run: |
+          set -o pipefail
+          ${{ matrix.exe }} "gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}" | tee smoke.out
+          if grep -q '"id"' smoke.out; then echo "::error::the GlitchTip answer was printed to stdout"; exit 1; fi
       - name: the events arrived in their projects
         shell: bash
         env:

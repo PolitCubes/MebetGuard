@@ -38,6 +38,7 @@ constexpr int kOptHttpHeader = 10023;     // CURLOPT_HTTPHEADER
 constexpr int kOptTimeoutMs = 155;        // CURLOPT_TIMEOUT_MS
 constexpr int kOptNoSignal = 99;          // CURLOPT_NOSIGNAL
 constexpr int kOptUserAgent = 10018;      // CURLOPT_USERAGENT
+constexpr int kOptWriteFunction = 20011;  // CURLOPT_WRITEFUNCTION
 constexpr int kInfoResponseCode = 0x200002;  // CURLINFO_RESPONSE_CODE
 
 struct Curl {
@@ -76,6 +77,11 @@ const Curl& curl() {
     return c;
 }
 
+// GlitchTip answers {"id": "..."}; libcurl's default writer would print that into the game's
+// stdout. The body is not needed: the status code is the answer.
+std::size_t discard_body(char*, std::size_t size, std::size_t nmemb, void*) { return size * nmemb; }
+using WriteFn = std::size_t (*)(char*, std::size_t, std::size_t, void*);
+
 }  // namespace
 
 bool platform_post(const Dsn& dsn, const std::string& body, const std::string& auth_header, unsigned timeout_ms) {
@@ -96,6 +102,7 @@ bool platform_post(const Dsn& dsn, const std::string& body, const std::string& a
     c.setopt(h, kOptTimeoutMs, static_cast<long>(timeout_ms));
     c.setopt(h, kOptNoSignal, 1L);
     c.setopt(h, kOptUserAgent, agent.c_str());
+    c.setopt(h, kOptWriteFunction, static_cast<WriteFn>(discard_body));
     bool ok = false;
     if (c.perform(h) == 0) {
         long status = 0;
