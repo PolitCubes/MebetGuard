@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
+#
+# GlitchTip delivery: the guard's own report code (src/common/report.cpp + the WinHTTP / libcurl
+# transport, tests/native/report_smoke.cpp) sends marked events to both projects with the DSNs
+# from the repository secrets, and the GlitchTip API is asked whether they arrived. Red if a DSN
+# secret is missing, GlitchTip did not answer 2xx, or an event is not found in its project.
+# Events go out as environment "test" (a test-kind build), never mixed with the players' "release".
+name: GlitchTip
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"  # weekly: the instance still takes guard events
+  pull_request:
+    paths:
+      - src/common/report.*
+      - src/common/json_writer.*
+      - src/windows/agent/report/transport_winhttp.cpp
+      - src/posix/agent/transport.cpp
+      - src/posix/CMakeLists.txt
+      - src/windows/CMakeLists.txt
+      - tools/gen_config.py
+      - tools/ci/glitchtip_check.py
+      - config/reporting.json
+      - tests/native/report_smoke.cpp
+      - CMakeLists.txt
+      - .github/workflows/glitchtip.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: glitchtip ${{ matrix.os }}
+    # Fork PRs get no secrets: nothing to check there.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows, runner: windows-2022, exe: build/smoke/src/windows/Release/mebet_report_smoke.exe }
+          - { os: linux,   runner: ubuntu-24.04, exe: build/smoke/src/posix/mebet_report_smoke }
+    env:
+      MEBET_ERRORS_DSN: ${{ secrets.GLITCHTIP_ERRORS_DSN }}
+      MEBET_REPORTS_DSN: ${{ secrets.GLITCHTIP_REPORTS_DSN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4  # jni.h for the configure step
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Built before the secrets are checked: without them it still compiles (no DSN), so a broken
+      # smoke build shows up even where the secrets are missing.
+      - name: build the guard's report code with the DSNs
+        shell: bash
+        run: |
+          cmake -S . -B build/smoke -DMEBET_BUILD_KIND=test -DMEBET_REPORT_SMOKE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/smoke --config Release --target mebet_report_smoke --parallel
+      - name: both DSN secrets are set
+        shell: bash
+        run: |
+          if [ -z "$MEBET_ERRORS_DSN" ] || [ -z "$MEBET_REPORTS_DSN" ]; then
+            echo "::error::GLITCHTIP_ERRORS_DSN / GLITCHTIP_REPORTS_DSN repository secrets are not set (docs/reports.md)"
+            exit 1
+          fi
+      - name: send marked events through it
+        shell: bash
+        # The server's answer must not leak into the process's stdout (the game's console).
+        run: |
+          set -o pipefail
+          ${{ matrix.exe }} "gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}" | tee smoke.out
+          if grep -q '"id"' smoke.out; then echo "::error::the GlitchTip answer was printed to stdout"; exit 1; fi
+      - name: the events arrived in their projects
+        shell: bash
+        env:
+          GLITCHTIP_TOKEN: ${{ secrets.GLITCHTIP_TOKEN }}
+        run: python tools/ci/glitchtip_check.py --marker "gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}"

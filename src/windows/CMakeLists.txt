@@ -104,3 +104,11 @@ target_compile_options(mebet_exe PRIVATE ${MEBET_WIN_CFLAGS})
 # exe come from System32 only on Windows 10 1607+ (ТЗ §4 «PE, манифест, ресурсы»).
 target_link_options(mebet_exe PRIVATE ${MEBET_WIN_LFLAGS} /DELAYLOAD:user32.dll /DEPENDENTLOADFLAG:0x800)
 target_link_libraries(mebet_exe PRIVATE mebet_win_shared mebet_common delayimp user32)
+
+if(MEBET_REPORT_SMOKE)
+    add_executable(mebet_report_smoke "${CMAKE_SOURCE_DIR}/tests/native/report_smoke.cpp"
+                   agent/report/transport_winhttp.cpp)
+    target_include_directories(mebet_report_smoke PRIVATE agent)
+    target_compile_options(mebet_report_smoke PRIVATE ${MEBET_WIN_CFLAGS})
+    target_link_libraries(mebet_report_smoke PRIVATE mebet_win_shared mebet_common winhttp advapi32)
+endif()

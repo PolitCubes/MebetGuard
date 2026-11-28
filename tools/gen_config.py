@@ -10,6 +10,12 @@ always built together.
 Usage:
     gen_config.py --config <dir> --out <dir> --kind release|test --os windows|linux|macos
                   --arch x64|x86|arm64|universal --version <x.y.z> [--commit <sha>]
+                  [--dsn-file <file>]
+
+--dsn-file: "errors_dsn=<dsn>" / "reports_dsn=<dsn>" lines that override the empty DSNs of
+config/reporting.json. CMake writes it from the MEBET_ERRORS_DSN / MEBET_REPORTS_DSN environment
+variables (CI: the GLITCHTIP_*_DSN repository secrets), so a DSN never lives in git. An empty or
+missing value keeps the channel silent.
 
 Writes:
     <out>/mebet_config.hpp      — modules, options, exit reasons, reporting, build info
@@ -319,6 +325,22 @@ def gen_hashes(config_dir, target_os, arch):
     return ordered, profiles
 
 
+def read_dsn_file(path):
+    """Non-empty DSNs from the file CMake writes out of the build environment."""
+    out = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            key, sep, value = line.strip().partition("=")
+            if not sep or key not in ("errors_dsn", "reports_dsn"):
+                continue
+            value = value.strip()
+            if value:
+                out[key] = value
+    return out
+
+
 def write(path, text):
     old = None
     if os.path.exists(path):
@@ -338,6 +360,7 @@ def main():
     ap.add_argument("--arch", required=True, choices=("x64", "x86", "arm64", "universal"))
     ap.add_argument("--version", required=True)
     ap.add_argument("--commit", default="")
+    ap.add_argument("--dsn-file", default="")
     a = ap.parse_args()
 
     cfg_dir = a.config
@@ -349,10 +372,16 @@ def main():
     check_keys(limits, "reporting.json limits",
                ["events_per_session", "inventory_per_session", "event_bytes", "string_chars",
                 "list_items", "memory_bytes", "input_report_interval_s"])
+    dsn_from = {k: "reporting.json" for k in ("errors_dsn", "reports_dsn")}
+    if a.dsn_file:
+        for k, v in read_dsn_file(a.dsn_file).items():
+            rep[k] = v
+            dsn_from[k] = "the build environment"
     for dsn_key in ("errors_dsn", "reports_dsn"):
         dsn = rep[dsn_key]
+        # The DSN itself is never printed: it comes from a CI secret.
         if dsn and not re.fullmatch(r"https://[0-9a-f]+@[A-Za-z0-9.\-]+(:\d+)?/\d+", dsn):
-            fail("reporting.json %s: expected https://<key>@<host>/<project id>" % dsn_key)
+            fail("%s %s: expected https://<key>@<host>/<project id>" % (dsn_from[dsn_key], dsn_key))
     roots = gen_roots(load(os.path.join(cfg_dir, "roots.json")), cfg_dir)
     pubs, signers = gen_publishers(load(os.path.join(cfg_dir, "publishers.json")), roots)
     deny = gen_denylist(load(os.path.join(cfg_dir, "denylist.json")))
@@ -463,6 +492,9 @@ def main():
     if missing:
         print("gen_config: warning: no native hash list for profile(s) %s — their natives will be "
               "treated as unknown (ТЗ §6, run tools/snap_hashes.py)" % ", ".join(missing), file=sys.stderr)
+    print("gen_config: errors channel %s, reports channel %s"
+          % tuple(("on (DSN from %s)" % dsn_from[k]) if rep[k] else "off (no DSN)"
+                  for k in ("errors_dsn", "reports_dsn")), file=sys.stderr)
     print("gen_config: %d modules, %d reasons, %d roots, %d publishers (%d signers), %d denylist, %d hashes"
           % (len(modules), len(reasons), len(roots), len(pubs), len(signers), len(deny), len(hashes)),
           file=sys.stderr)

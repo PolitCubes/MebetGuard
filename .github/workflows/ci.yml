@@ -44,6 +44,12 @@ jobs:
           fetch-depth: 0
       - name: build
         shell: pwsh
+        env:
+          # GlitchTip DSNs from the repository secrets, prod (release) builds only: dev builds are
+          # never shipped and report nothing. Empty on fork PRs (no secrets): the build then has no
+          # DSN and both channels stay silent. docs/reports.md «Откуда берутся DSN».
+          MEBET_ERRORS_DSN: ${{ matrix.kind == 'release' && secrets.GLITCHTIP_ERRORS_DSN || '' }}
+          MEBET_REPORTS_DSN: ${{ matrix.kind == 'release' && secrets.GLITCHTIP_REPORTS_DSN || '' }}
         run: ./tools/ci/build-win.ps1 -Platform ${{ matrix.platform }} -Kind ${{ matrix.kind }} -Dir ${{ matrix.dir }}
       - name: wrapper imports only kernel32
         shell: pwsh
@@ -86,6 +92,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: build
+        env:  # GlitchTip DSNs, prod builds only (see the Windows build)
+          MEBET_ERRORS_DSN: ${{ matrix.kind == 'release' && secrets.GLITCHTIP_ERRORS_DSN || '' }}
+          MEBET_REPORTS_DSN: ${{ matrix.kind == 'release' && secrets.GLITCHTIP_REPORTS_DSN || '' }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DPython3_EXECUTABLE=/opt/python/cp312-cp312/bin/python
@@ -132,6 +141,9 @@ jobs:
           distribution: temurin
           java-version: "25"
       - name: build
+        env:  # GlitchTip DSNs, prod builds only (see the Windows build)
+          MEBET_ERRORS_DSN: ${{ matrix.kind == 'release' && secrets.GLITCHTIP_ERRORS_DSN || '' }}
+          MEBET_REPORTS_DSN: ${{ matrix.kind == 'release' && secrets.GLITCHTIP_REPORTS_DSN || '' }}
         run: bash tools/ci/build-posix.sh ${{ matrix.kind }} ${{ matrix.dir }} -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx }} -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
       - uses: actions/upload-artifact@v4
         with:
