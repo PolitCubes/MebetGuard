@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 PolitCubes
+#
+# One group of Windows e2e scenarios (called from ci.yml, one call per group of meaning): every
+# arch x feature of the group is its own job, each arch on its own hardware — x64 and x86 (a 32-bit
+# process under WOW64; GitHub has no 32-bit Windows) on windows-2022, arm64 on windows-11-arm. x86
+# runs 32-bit Java 21: no vendor ships a 32-bit Windows Java 25. --no-skip: a scenario that cannot
+# run fails the job.
+#
+# The per-arch settings are looked up by expression, not added by `include`: an include for an arch
+# a group does not run (the paths group runs x64 only) would be added as a job of its own.
+name: e2e windows (group)
+
+on:
+  workflow_call:
+    inputs:
+      features:
+        description: JSON array of scenario ids (pytest -k), or paths-<variant>-quick|long
+        type: string
+        required: true
+      archs:
+        description: JSON array of archs
+        type: string
+        default: '["x64", "x86", "arm64"]'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: ${{ matrix.arch }} ${{ matrix.feature }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
+    timeout-minutes: ${{ startsWith(matrix.feature, 'paths-') && 45 || 25 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.archs) }}
+        feature: ${{ fromJSON(inputs.features) }}
+        # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
+        # attacks cannot exist there. An exclude that matches nothing in a group is simply unused.
+        exclude:
+          - { arch: x86, feature: ffm_benign }
+          - { arch: x86, feature: native_load_churn }
+          - { arch: x86, feature: foreign_exec_alloc }
+          - { arch: x86, feature: foreign_exec_protect }
+          - { arch: x86, feature: resource_read_unsigned }
+          - { arch: x86, feature: ex_exec_alloc }
+          - { arch: x86, feature: ex_image_map }
+          - { arch: x86, feature: stale_unmap_exec }
+          - { arch: x86, feature: limited_handle_exec }
+          - { arch: x86, feature: image_page_protect }
+          - { arch: x86, feature: overwrite_cached_dll }
+          - { arch: x86, feature: whole_game_held }
+          - { arch: x86, feature: tamper_freeze_guard }
+          - { arch: x86, feature: tamper_kill_guard }
+          - { arch: x86, feature: tamper_unload_guard }
+          - { arch: x86, feature: tamper_jam_sweep }
+    env:
+      JAVA_VERSION: ${{ matrix.arch == 'x86' && '21' || '25' }}
+      JAVA_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || matrix.arch }}
+      VC: ${{ fromJSON('{"x64":"x64","x86":"x64_x86","arm64":"arm64"}')[matrix.arch] }}
+      DIR: ${{ fromJSON('{"x64":"x86-64-mustdie","x86":"x86-mustdie","arm64":"arm64-mustdie"}')[matrix.arch] }}
+      # The prod build must close on a dev-mode runner (203); everything else runs the devtest build.
+      VARIANT: ${{ matrix.feature == 'dev_mode' && 'prod' || 'dev' }}
+      # Awkward paths (tests/e2e/paths.py): every scenario again, with the guard, a copy of the JDK and
+      # the client folder in folders players have. Two jobs per variant, the long scenarios apart.
+      PATHS_QUICK: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held"
+      PATHS_LONG: "process_hold or native_load_churn or close_window_timeout or tamper"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Liberica (BellSoft): the guard trusts the game Java's publisher, so the JVM's own DLLs
+      # pass the load gate (Temurin's would be closed as untrusted modules, 210).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: ${{ env.JAVA_ARCH }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-windows-${{ matrix.arch }}-${{ env.VARIANT }}
+          path: guard
+      - name: e2e fixture (unsigned native, marker only)
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          New-Item -ItemType Directory -Force fixtures | Out-Null
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" $env:VC && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
+          if (-not (Test-Path fixtures\mebet_fake_cheat.dll)) { throw "fixture not built" }
+      - name: install pytest
+        shell: pwsh
+        run: python -m pip install -q pytest
+      # The "game as a standard user" variants run with a non-admin token: let it read the JDK
+      # and the workspace the elevated runner created (a player's game folder is theirs anyway).
+      - name: standard-user access to the JDK and the workspace
+        shell: pwsh
+        run: |
+          icacls "$env:JAVA_HOME" /grant "*S-1-5-11:(OI)(CI)RX" /T /C /Q | Out-Null
+          icacls "$pwd" /grant "*S-1-5-11:(OI)(CI)M" /T /C /Q | Out-Null
+      # A crash leaves a minidump, so a failed job shows where it crashed, not only an exit code.
+      - name: crash dumps on
+        shell: pwsh
+        run: |
+          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Path $k -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpFolder -Value "$env:RUNNER_TEMP\dumps" -PropertyType ExpandString -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpType -Value 1 -PropertyType DWord -Force | Out-Null
+      - name: "attack ${{ matrix.feature }} with the guard and without it"
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"   # the verdict lines are Russian: without it the log shows \uXXXX escapes
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          $select = $env:FEATURE
+          $extra = @()
+          if ($env:FEATURE -match '^paths-(\w+)-(quick|long)$') {
+            $extra = @('--paths', $Matches[1])
+            $select = if ($Matches[2] -eq 'quick') { $env:PATHS_QUICK } else { $env:PATHS_LONG }
+          }
+          if ($env:FEATURE -eq 'dev_mode') { $extra = @('--expect-dev-mode') }
+          python -m pytest tests/e2e -v -rP --no-header --no-skip -k $select `
+            --guard "$pwd\guard\$env:DIR\MebetGuard.exe" --java "$env:JAVA_HOME" `
+            --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll" @extra
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: crash report (faulting module, JVM hs_err, stack)
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error' } -MaxEvents 3 -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.TimeCreated; $_.Message; '-----' }
+          Get-ChildItem tests\e2e\_work -Recurse -Filter 'hs_err_pid*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -TotalCount 80 }
+          $harch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $cdb = Get-Item "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\$harch\cdb.exe" -ErrorAction SilentlyContinue
+          $dumps = @(Get-ChildItem "$env:RUNNER_TEMP\dumps" -Filter *.dmp -ErrorAction SilentlyContinue)
+          "dumps: $($dumps.Count); cdb: $(if ($cdb) { $cdb.FullName } else { 'not found' })"
+          if ($cdb -and $dumps.Count) {
+            $sym = "$pwd\guard\symbols;srv*$env:RUNNER_TEMP\sym*https://msdl.microsoft.com/download/symbols"
+            & $cdb.FullName -z $dumps[0].FullName -y $sym -c '.ecxr; kn 40; q' 2>&1 | Select-Object -Last 70
+          }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-windows-${{ matrix.arch }}-${{ matrix.feature }}
+          path: ${{ runner.temp }}/dumps
+          if-no-files-found: ignore
