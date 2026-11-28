@@ -183,7 +183,8 @@ jobs:
     uses: ./.github/workflows/e2e-windows.yml
     with:
       features: >-
-        ["process_dacl_open", "inject_remote_thread", "inject_apc", "inject_exec_thread", "foreign_handle_hold"]
+        ["process_dacl_open", "process_dacl_read", "inject_remote_thread", "inject_apc", "inject_exec_thread",
+         "foreign_handle_hold"]
 
   e2e-win-guard:
     needs: build-windows-binaries
@@ -215,7 +216,7 @@ jobs:
       matrix:
         arch: [x64, arm64]
         feature: [clean_launch, thread_churn, jit_hot, ffm_benign,
-                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath, preload_foreign]
         include:
           - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
           - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }

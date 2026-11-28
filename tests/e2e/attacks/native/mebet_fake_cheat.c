@@ -34,6 +34,11 @@ static void mark(const char *how) {
     fflush(stderr);
 }
 
+#if !defined(_WIN32)
+/* Runs on load, before any of the game's code: what LD_PRELOAD brings in (posix_preload). */
+__attribute__((constructor)) static void on_preload(void) { mark("preloaded"); }
+#endif
+
 /* jint JNI_OnLoad(JavaVM*, void*) without pulling in jni.h: the JVM only needs the symbol
  * and a JNI version return value. */
 EXPORT int JNICALL_ JNI_OnLoad(void *vm, void *reserved) {

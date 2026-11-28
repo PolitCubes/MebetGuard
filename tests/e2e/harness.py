@@ -184,6 +184,21 @@ def probe_open_process(pid, proc=None):
     return "PROBE open-process denied (error %d)" % ctypes.get_last_error()
 
 
+def probe_open_process_read(pid, proc=None):
+    """Another program asks only to read the game's memory (an external ESP): PROCESS_VM_READ alone, so a
+    denial proves the read itself is shut, not only writing and threads."""
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.OpenProcess(0x0010, 0, pid)  # PROCESS_VM_READ
+    if h:
+        k32.CloseHandle(h)
+        return "PROBE open-process-read granted (memory read)"
+    return "PROBE open-process-read denied (error %d)" % ctypes.get_last_error()
+
+
 HOLD_SECONDS = 35  # longer than every "guard thread is silent" limit of the watchdog
 
 
@@ -495,7 +510,8 @@ def probe_image_patch(pid, proc):
 
 PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code,
           "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving,
-          "hold_handle": probe_hold_handle, "image_patch": probe_image_patch}
+          "hold_handle": probe_hold_handle, "image_patch": probe_image_patch,
+          "open_process_read": probe_open_process_read}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
@@ -807,6 +823,12 @@ SCENARIOS = [
         guard="close:foreign_agent_arg", title="Чужой -agentpath (нативный JVMTI-агент)",
         marker="ATTACK native Agent_OnLoad",
         build=lambda ctx, native, jar: dict(jvm_args=["-agentpath:" + str(native)])),
+    # A library put into the process before any of the guard's code (LD_PRELOAD): its constructor runs
+    # whatever happens — that is the proof it got in — and the game must not start after it.
+    _sc(id="preload_foreign", kind="attack", module="posix_preload", os={"linux"}, needs_native=True,
+        guard="close:untrusted_module", marker="TARGET exit", proof=[r"ATTACK native preloaded"],
+        title="LD_PRELOAD посторонней библиотеки до старта игры",
+        build=lambda ctx, native, jar: dict(extra_env={"LD_PRELOAD": str(native)}, action="none")),
     # The locked dev-mode check: on a dev-mode / test-signing machine the prod build must close
     # before the JVM even starts. Only passes where the machine really is in dev mode (the CI
     # Windows runners); the e2e-windows job runs it against the prod (release) build. With any
@@ -923,6 +945,11 @@ SCENARIOS = [
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],
         privs="game_other", expect=_dacl_expect,
+        build=lambda ctx, native, jar: dict(action="none", iters=16)),
+    _sc(id="process_dacl_read", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
+        title="Чужая программа открывает процесс только на чтение памяти (внешний ESP)",
+        marker="PROBE open-process-read granted", probe="open_process_read",
+        proof=[r"PROBE open-process-read denied"], privs="game_other", expect=_dacl_expect,
         build=lambda ctx, native, jar: dict(action="none", iters=16)),
 
     # ---- attacks: on the guard itself ------------------------------------------------------------
