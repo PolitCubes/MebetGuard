@@ -108,6 +108,8 @@ class Ctx:
         self.classes = self.work / "classes"
         self.marker_jar = self.work / "mebet-marker.jar"
         self.native = None  # filled by build_fixtures()
+        self.inject_dll = None  # mebet_inject_marker.dll (Windows), filled by build_fixtures()
+        self.injector = None    # mebet_injector.exe (Windows), filled by build_fixtures()
         self.ffm = False    # Foreign Function & Memory API in the target (Java 22+)
         self.admin = bool(winpriv and winpriv.is_admin())
         self.no_skip = False
@@ -180,6 +182,21 @@ def probe_open_process(pid, proc=None):
         k32.CloseHandle(h)
         return "PROBE open-process granted (memory write + thread creation)"
     return "PROBE open-process denied (error %d)" % ctypes.get_last_error()
+
+
+def probe_open_process_read(pid, proc=None):
+    """Another program asks only to read the game's memory (an external ESP): PROCESS_VM_READ alone, so a
+    denial proves the read itself is shut, not only writing and threads."""
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.OpenProcess(0x0010, 0, pid)  # PROCESS_VM_READ
+    if h:
+        k32.CloseHandle(h)
+        return "PROBE open-process-read granted (memory read)"
+    return "PROBE open-process-read denied (error %d)" % ctypes.get_last_error()
 
 
 HOLD_SECONDS = 35  # longer than every "guard thread is silent" limit of the watchdog
@@ -352,8 +369,149 @@ def probe_remote_code_moving(pid, proc):
     return winpriv.as_other("admin", move)
 
 
+def probe_inject(technique, other=None):
+    """A program the harness starts brings the marker library into the game by `technique`
+    (mebet_injector), at the variant's level of "the other program". Its one line goes into the
+    game's output.
+
+    The injector is a process of its own, so the level must be its token: impersonating the standard
+    user on the harness's thread (winpriv.as_other) does not reach a child process — CreateProcess
+    takes the parent's primary token, the elevated admin with SeDebugPrivilege on, and the "user"
+    variant went past the DACL as an admin. "user" starts it with the standard-user token; "admin" /
+    "admin_nodebug" inherit the harness's token, SeDebugPrivilege switched by as_other around this."""
+    def run(pid, proc, ctx=None):
+        if not ctx or not ctx.injector or not ctx.inject_dll:
+            return "PROBE inject: no injector fixture (no toolchain for the game's architecture)"
+        if not _wait_line(proc, r"TARGET action: ", 60):
+            return "PROBE inject: the game never got to its action"
+        time.sleep(1.0)  # the game is in its heartbeat loop now
+        cmd = [ctx.injector, technique, str(pid), ctx.inject_dll]
+        if other == "user":
+            p = winpriv.UserProc(cmd, os.environ.copy(), str(ctx.work))
+            if not p.wait(60):
+                p.kill()
+            r = p.finish()
+            out = "".join(p.lines)
+        else:
+            r, out, _ = run_cmd(cmd, os.environ.copy(), 60)
+        line = (out.strip().splitlines() or ["(no output)"])[-1]
+        return "PROBE %s (exit %d)" % (line, r)
+    return run
+
+
+HOLD_SECONDS_HANDLE = 20
+# Run as a program of its own (a child of the harness, never the game's parent, which the guard lets
+# hold its handle): opens the game for reading its memory, as an external ESP does, and keeps it open.
+_HOLD_SCRIPT = r'''
+import ctypes, sys, time
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+k.OpenProcess.restype = ctypes.c_void_p
+k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+h = k.OpenProcess(0x0010 | 0x1000, 0, int(sys.argv[1]))  # PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION
+print("opened" if h else "denied (error %d)" % ctypes.get_last_error(), flush=True)
+if h:
+    time.sleep(float(sys.argv[2]))
+'''
+
+
+def probe_hold_handle(pid, proc):
+    """An administrator's program (SeDebugPrivilege: past any DACL) holds the game open for reading its
+    memory and does nothing else — no module, no code, no thread in the game: only its handle shows."""
+    import sys
+    if not _wait_line(proc, r"TARGET action: ", 60):
+        return "PROBE handle: the game never got to its action"
+
+    def hold():
+        p = subprocess.Popen([sys.executable, "-I", "-c", _HOLD_SCRIPT, str(pid), str(HOLD_SECONDS_HANDLE)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            out, _ = p.communicate(timeout=HOLD_SECONDS_HANDLE + 30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+        line = (out.strip().splitlines() or ["(no output)"])[0]
+        return "PROBE handle %s, held %d s" % (line, HOLD_SECONDS_HANDLE) if line == "opened" else "PROBE handle " + line
+    return winpriv.as_other("admin", hold)
+
+
+def probe_image_patch(pid, proc):
+    """An administrator's program writes 32 bytes into the code of jvm.dll in the running game — into the
+    padding after the end of a code section, so the game itself runs on — past every hook: the image stays
+    the trusted one, only its code in memory is no longer the file's."""
+    import ctypes
+    import struct
+    if not _wait_line(proc, r"TARGET action: ", 60):
+        return "PROBE image-patch: the game never got to its action"
+    k32 = _k32()
+    k32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                      ctypes.POINTER(ctypes.c_size_t)]
+    k32.VirtualProtectEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                                     ctypes.POINTER(ctypes.c_uint32)]
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    psapi.EnumProcessModulesEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32]
+    psapi.GetModuleBaseNameW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+
+    def read(h, addr, n):
+        buf = ctypes.create_string_buffer(n)
+        got = ctypes.c_size_t(0)
+        if not k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n, ctypes.byref(got)) or got.value != n:
+            return None
+        return buf.raw
+
+    def patch():
+        h = k32.OpenProcess(0x0400 | 0x0010 | 0x0020 | 0x0008, 0, pid)  # QUERY_INFORMATION|VM_READ|VM_WRITE|VM_OPERATION
+        if not h:
+            return "PROBE image-patch: open denied (error %d)" % ctypes.get_last_error()
+        try:
+            mods = (ctypes.c_void_p * 1024)()
+            needed = ctypes.c_uint32(0)
+            if not psapi.EnumProcessModulesEx(h, mods, ctypes.sizeof(mods), ctypes.byref(needed), 3):  # LIST_MODULES_ALL
+                return "PROBE image-patch: modules not listed (error %d)" % ctypes.get_last_error()
+            base = None
+            name = ctypes.create_unicode_buffer(260)
+            for m in mods[:min(1024, needed.value // ctypes.sizeof(ctypes.c_void_p))]:
+                if m and psapi.GetModuleBaseNameW(h, ctypes.c_void_p(m), name, 260) and name.value.lower() == "jvm.dll":
+                    base = m
+                    break
+            if base is None:
+                return "PROBE image-patch: jvm.dll not found in the game"
+            head = read(h, base, 0x1000)
+            if not head:
+                return "PROBE image-patch: headers unreadable"
+            nt = struct.unpack_from("<I", head, 0x3C)[0]
+            count, opt_size = struct.unpack_from("<H", head, nt + 6)[0], struct.unpack_from("<H", head, nt + 20)[0]
+            table = nt + 24 + opt_size
+            target = None
+            for i in range(count):
+                vsize, va = struct.unpack_from("<II", head, table + 40 * i + 8)
+                flags = struct.unpack_from("<I", head, table + 40 * i + 36)[0]
+                if not flags & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
+                    continue
+                cave = base + va + vsize
+                if ((cave + 0xFFF) & ~0xFFF) - cave >= 64:
+                    target = (cave + 15) & ~15
+                    break
+            if target is None:
+                return "PROBE image-patch: no padding after a code section of jvm.dll"
+            old = ctypes.c_uint32(0)
+            if not k32.VirtualProtectEx(h, ctypes.c_void_p(target), 32, 0x40, ctypes.byref(old)):  # PAGE_EXECUTE_READWRITE
+                return "PROBE image-patch: VirtualProtectEx failed (error %d)" % ctypes.get_last_error()
+            done = ctypes.c_size_t(0)
+            ok = k32.WriteProcessMemory(h, ctypes.c_void_p(target), b"\x90" * 32, 32, ctypes.byref(done))
+            k32.VirtualProtectEx(h, ctypes.c_void_p(target), 32, old.value, ctypes.byref(ctypes.c_uint32(0)))
+            if not ok:
+                return "PROBE image-patch: WriteProcessMemory failed (error %d)" % ctypes.get_last_error()
+            return "PROBE image-patch written at jvm.dll+0x%x" % (target - base)
+        finally:
+            k32.CloseHandle(h)
+    return winpriv.as_other("admin", patch)
+
+
 PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code,
-          "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving}
+          "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving,
+          "hold_handle": probe_hold_handle, "image_patch": probe_image_patch,
+          "open_process_read": probe_open_process_read}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
@@ -381,6 +539,9 @@ def build_fixtures(ctx):
         raise RuntimeError("jar (marker) failed:\n" + out)
 
     ctx.native = _build_native(ctx)
+    if ctx.os == "windows":
+        ctx.inject_dll = _build_win(ctx, "mebet_inject_marker.c", "mebet_inject_marker.dll", dll=True)
+        ctx.injector = _build_win(ctx, "mebet_injector.c", "mebet_injector.exe", dll=False)
     return ctx
 
 
@@ -388,6 +549,34 @@ def _javac(ctx, sources, out_dir):
     r, out, _ = run_cmd([ctx.tool("javac"), "-d", out_dir] + list(sources), os.environ.copy(), 180)
     if r != 0:
         raise RuntimeError("javac %s failed:\n%s" % (", ".join(s.name for s in sources), out))
+
+
+def _build_win(ctx, source, name, dll):
+    """A Windows test fixture for the injection scenarios, built for the game's Java (its PE machine
+    type checked, as for the unsigned native). None when no toolchain makes a fitting one."""
+    src = HERE / "attacks" / "native" / source
+    out_dir = ctx.work / "native"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / name
+    arch = java_arch(ctx.java_home)
+    targets = {"x86": "i686-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}
+    kind = ["-shared"] if dll else []
+    tries = []
+    if arch in targets:
+        tries.append(["clang", "--target=" + targets[arch]] + kind + ["-o", out, src])
+    tries.append(["gcc"] + (["-m32"] if arch == "x86" else []) + kind + (["-municode"] if not dll else []) +
+                 ["-o", out, src])
+    for cmd in tries:
+        if out.exists():
+            out.unlink()
+        if shutil.which(cmd[0]) and run_cmd(cmd, os.environ.copy(), 120)[0] == 0 and pe_arch(out) == arch:
+            return out
+    if shutil.which("cl"):
+        flags = ["/LD"] if dll else []
+        if run_cmd(["cl", "/nologo"] + flags + [src, "/Fe:" + str(out)], os.environ.copy(), 120,
+                   cwd=out_dir)[0] == 0 and pe_arch(out) == arch:
+            return out
+    return None
 
 
 def _build_native(ctx):
@@ -459,8 +648,15 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
                 if proc.wait(0.05):
                     break
         if pid:
-            fn = lambda: PROBES[probe](pid, proc)  # noqa: E731
-            proc.lines.append((winpriv.as_other(other, fn) if other else fn()) + "\n")
+            inject = probe.startswith("inject:")
+            if inject:  # the injection probes need the fixtures' paths, and start a process of their own
+                fn = lambda: probe_inject(probe.split(":", 1)[1], other)(pid, proc, ctx)  # noqa: E731
+            else:
+                fn = lambda: PROBES[probe](pid, proc)  # noqa: E731
+            # An injector as "user" gets that token as its own (probe_inject); impersonating on top of
+            # it would only take from the harness the right to start a process with that token.
+            wrap = other and not (inject and other == "user")
+            proc.lines.append((winpriv.as_other(other, fn) if wrap else fn()) + "\n")
     timed_out = not proc.wait(max(0.0, limit - (time.monotonic() - start)))
     if timed_out:
         proc.kill()
@@ -492,6 +688,18 @@ def run_scenario(ctx, sc, mode, variant=(None, None)):
 # expect(game, other) -> overrides of {guard, proof, baseline} for one variant; baseline
 #         "works" (default) or "denied" (Windows itself stops the attack even without the guard).
 # build(ctx, native, marker_jar) -> {jvm_args?, extra_env?, action?, iters?}.
+
+def _preload_path(native):
+    """LD_PRELOAD splits its value on spaces and colons and has no escape: from a folder with a space in
+    its name (the awkward-path runs) the library could not be preloaded at all, and the attack never
+    happened. A copy in the system temp folder, whose path has neither, is what gets preloaded."""
+    import tempfile
+    dst = Path(tempfile.gettempdir()) / ("mebet_preload_" + Path(native).name)
+    if any(c in str(dst) for c in " :"):
+        return str(native)
+    shutil.copyfile(native, dst)
+    return str(dst)
+
 
 def _agent(jar):
     return "-javaagent:" + str(jar)
@@ -540,6 +748,27 @@ def _dacl_expect(game, other):
     # The other program as the same user (or as an elevated admin without SeDebugPrivilege):
     # without the guard Windows lets it in, with the guard only the DACL can keep it out.
     return {}
+
+
+def _handle_expect(game, other):
+    """Windows 11 24H2 (build 26100) and later hide kernel object addresses from a caller without
+    SeDebugPrivilege: a standard-user game cannot tell which process an elevated program's handle is
+    on, nor duplicate it to find out. Admin games (SeDebugPrivilege on) and older Windows: closed."""
+    import sys
+    if game == "user" and sys.getwindowsversion().build >= 26100:
+        return dict(guard="known_limit", proof=[r"PROBE handle opened"])
+    return {}
+
+
+def _inject_expect(done, reason):
+    """Injection from another program: the guard's DACL keeps out a program of the same user (or an
+    elevated one without SeDebugPrivilege) — it cannot even open the game. An administrator with
+    SeDebugPrivilege gets past any DACL; then the layers inside the game must catch what it brings in."""
+    def expect(game, other):
+        if other == "admin":
+            return dict(guard="close:" + reason, proof=[done])
+        return dict(guard="neutralize", proof=[r"PROBE INJECTOR failed: OpenProcess"])
+    return expect
 
 
 SCENARIOS = [
@@ -606,6 +835,12 @@ SCENARIOS = [
         guard="close:foreign_agent_arg", title="Чужой -agentpath (нативный JVMTI-агент)",
         marker="ATTACK native Agent_OnLoad",
         build=lambda ctx, native, jar: dict(jvm_args=["-agentpath:" + str(native)])),
+    # A library put into the process before any of the guard's code (LD_PRELOAD): its constructor runs
+    # whatever happens — that is the proof it got in — and the game must not start after it.
+    _sc(id="preload_foreign", kind="attack", module="posix_preload", os={"linux"}, needs_native=True,
+        guard="close:untrusted_module", marker="TARGET exit", proof=[r"ATTACK native preloaded"],
+        title="LD_PRELOAD посторонней библиотеки до старта игры",
+        build=lambda ctx, native, jar: dict(extra_env={"LD_PRELOAD": _preload_path(native)}, action="none")),
     # The locked dev-mode check: on a dev-mode / test-signing machine the prod build must close
     # before the JVM even starts. Only passes where the machine really is in dev mode (the CI
     # Windows runners); the e2e-windows job runs it against the prod (release) build. With any
@@ -679,10 +914,54 @@ SCENARIOS = [
         proof=[r"PROBE remote-code moved [1-9]\d* times"],
         title="Чужая программа пишет исполняемую память в игру и двигает её — поймать за один обход",
         build=lambda ctx, native, jar: dict(action="none", iters=160)),
+    # Code changed inside a trusted image from outside (probe image_patch): the module, its file and its
+    # memory type all stay what was judged — only the bytes differ from the file (scan/image_integrity).
+    _sc(id="image_patch_outside", kind="attack", module="image_integrity", os=WIN, ingame=True, needs_admin=True,
+        guard="close:image_patched", probe="image_patch", timeout=60, marker="TARGET exit",
+        proof=[r"PROBE image-patch written at jvm\.dll\+0x[0-9a-f]+"],
+        title="Чужая программа администратора пишет свой код в jvm.dll игры (в хвост секции кода)",
+        build=lambda ctx, native, jar: dict(action="none", iters=40)),
+    # ---- injection from another program into the running game (mebet_injector) ----------------
+    _sc(id="inject_remote_thread", kind="attack", module="module_trust", os=WIN, ingame=True,
+        guard="close:untrusted_module", probe="inject:remote-thread", timeout=60, privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR remote-thread done", "untrusted_module|foreign_handle"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR remote-thread done"],
+        title="Внедрение DLL: путь в память игры + CreateRemoteThread(LoadLibraryW)",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    _sc(id="inject_apc", kind="attack", module="module_trust", os=WIN, ingame=True,
+        guard="close:untrusted_module", probe="inject:apc", timeout=60, privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR apc done", "untrusted_module|foreign_handle"),
+        marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc done"],
+        title="APC-внедрение: LoadLibraryExW в очередь APC потоков игры (special user APC)",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # No loader at all: code written from outside and a thread started on it. Through the guard the
+    # thread must not run one instruction of it (core/foreign_stop.hpp) — its return value never comes
+    # back. The thread's start is caught first (213); the sweep (215) or the injector's open handle
+    # (227) can win the race on a slow runner, and the code still never runs.
+    _sc(id="inject_exec_thread", kind="attack", module="foreign_threads", os=WIN, ingame=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:exec-thread", timeout=60,
+        privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR exec-thread done", "foreign_thread|foreign_code|foreign_handle"),
+        marker="PROBE INJECTOR exec-thread done: ran", proof=[r"PROBE INJECTOR exec-thread done"],
+        title="Код из другой программы: исполняемая страница + CreateRemoteThread на ней — ни одной инструкции",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # Only a handle: an administrator's program holds the game open for its memory and does nothing in
+    # it. Found by the handle table (scan/handles.cpp). Where Windows hides kernel addresses from a
+    # standard-user game (11 24H2+), an elevated holder cannot be tied to the game: a documented limit.
+    _sc(id="foreign_handle_hold", kind="attack", module="foreign_handles", os=WIN, ingame=True, needs_admin=True,
+        guard="close:foreign_handle", probe="hold_handle", timeout=90, marker="TARGET exit",
+        proof=[r"PROBE handle opened, held \d+ s"], expect=_handle_expect,
+        title="Чужая программа администратора держит игру открытой на чтение памяти (внешний ESP)",
+        build=lambda ctx, native, jar: dict(action="none", iters=40)),
     _sc(id="process_dacl_open", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],
         privs="game_other", expect=_dacl_expect,
+        build=lambda ctx, native, jar: dict(action="none", iters=16)),
+    _sc(id="process_dacl_read", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
+        title="Чужая программа открывает процесс только на чтение памяти (внешний ESP)",
+        marker="PROBE open-process-read granted", probe="open_process_read",
+        proof=[r"PROBE open-process-read denied"], privs="game_other", expect=_dacl_expect,
         build=lambda ctx, native, jar: dict(action="none", iters=16)),
 
     # ---- attacks: on the guard itself ------------------------------------------------------------
@@ -742,6 +1021,8 @@ def applies(sc, ctx, variant=(None, None)):
         return "не для %s" % ctx.os
     if sc["needs_dev_mode"] and not ctx.expect_dev_mode:
         return "только для prod-сборки на машине в dev-режиме (запускается с --expect-dev-mode)"
+    if str(sc.get("probe") or "").startswith("inject:") and not (ctx.injector and ctx.inject_dll):
+        return "нет компилятора для фикстур внедрения под архитектуру Java игры"
     if sc["needs_native"] and ctx.native is None:
         return "нет компилятора для неподписанного натива (передайте --untrusted-native)"
     if sc["needs_ffm"] and not ctx.ffm:

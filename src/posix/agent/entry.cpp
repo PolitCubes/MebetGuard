@@ -131,7 +131,7 @@ bool system_library(const std::string& path) {
     return path.empty() || path[0] != '/';
 }
 
-// Libraries outside system folders, the JRE and our own files: report only (ТЗ §11, §15).
+// Libraries outside system folders, the JRE and our own files, before the JVM starts: close (ТЗ §11, §15).
 void report_libraries() {
     if (!config::enabled(config::Module::posix_preload)) return;
     std::vector<std::string> foreign;
@@ -139,6 +139,11 @@ void report_libraries() {
         if (system_library(path)) return;
         if (!g_java_home.empty() && path.compare(0, g_java_home.size(), g_java_home) == 0) return;
         if (path == g_agent_path) return;
+        // The agent is loaded by /proc/self/fd/N on Linux, its own path is the resolved one.
+        char real[4096];
+        if (realpath(path.c_str(), real) && (g_agent_path == real ||
+                                             (!g_java_home.empty() && std::string(real).compare(0, g_java_home.size(), g_java_home) == 0)))
+            return;
         if (foreign.size() < config::kLimit_list_items) foreign.push_back(path);
     };
 #if defined(__linux__)
@@ -150,7 +155,8 @@ void report_libraries() {
         },
         &consider);
 #elif defined(__APPLE__)
-    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+    // Image 0 is the wrapper executable itself.
+    for (uint32_t i = 1; i < _dyld_image_count(); ++i) {
         const char* n = _dyld_get_image_name(i);
         if (n) consider(n);
     }
@@ -159,10 +165,23 @@ void report_libraries() {
     JsonWriter w;
     w.begin_object();
     bool any = !foreign.empty();
+    // A preload or audit library outside the system folders: a library put into the game before the
+    // guard, the way a Linux or macOS cheat gets in. One from a system folder (gamemode, MangoHud from
+    // the package manager) is reported only.
+    bool foreign_preload = false;
     for (const char* v : preload_vars) {
         if (const char* val = getenv(v)) {
             w.field(v, truncate_utf8(val, config::kLimit_string_chars));
             any = true;
+            std::string list(val);
+            std::size_t pos = 0;
+            while (pos <= list.size()) {
+                const std::size_t end = list.find_first_of(": ", pos);
+                const std::string item = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                if (!item.empty() && !system_library(item)) foreign_preload = true;
+                if (end == std::string::npos) break;
+                pos = end + 1;
+            }
         }
     }
     w.key("libraries").begin_array();
@@ -171,9 +190,21 @@ void report_libraries() {
     w.end_object();
     if (!any) return;
     report::Event ev;
+    if (foreign_preload || !foreign.empty()) {
+        // Before the JVM only the system, the JRE and the guard are in the process: anything else got
+        // in around it.
+        ev.type = "close.preload";
+        ev.level = report::Level::error;
+        ev.title = "Closed: preloaded or foreign library before the start";
+        ev.extra_json = w.take();
+        ev.fingerprint = {"close.preload", foreign.empty() ? std::string("preload_var") : foreign.front()};
+        signal(config::Module::posix_preload, config::Reason::untrusted_module,
+               foreign.empty() ? std::string("LD_PRELOAD") : foreign.front(), std::move(ev));
+        return;
+    }
     ev.type = "report.preload";
     ev.level = report::Level::warning;
-    ev.title = "Report: preloaded or foreign libraries";
+    ev.title = "Report: preloaded system libraries";
     ev.extra_json = w.take();
     ev.fingerprint = {"report.preload"};
     ev.dedupe_key = "report.preload";

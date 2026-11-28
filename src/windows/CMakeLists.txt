@@ -33,6 +33,7 @@ add_library(mebet_agent SHARED
     agent/core/private_heap.cpp
     agent/core/module_table.cpp
     agent/core/exec_table.cpp
+    agent/core/foreign_stop.cpp
     agent/core/timing.cpp
     agent/core/win_util.cpp
     agent/core/guard.cpp
@@ -45,6 +46,8 @@ add_library(mebet_agent SHARED
     agent/hooks/exec_guard.cpp
     agent/hooks/hook_check.cpp
     agent/scan/scans.cpp
+    agent/scan/handles.cpp
+    agent/scan/image_integrity.cpp
     agent/process/dacl.cpp
     agent/system/environment.cpp
     agent/launch/launch.cpp

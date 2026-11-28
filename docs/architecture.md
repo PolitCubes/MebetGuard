@@ -30,12 +30,14 @@
 | `module_trust` | `hooks/load_gate.cpp` (решение в потоке загрузки), `trust/*` (правила) |
 | `foreign_threads` | `scan/scans.cpp` (`on_thread_attach`, `thread_sweep`) |
 | `hidden_images` | `scan/scans.cpp` (`memory_sweep`) |
-| `foreign_exec_memory` | `hooks/exec_guard.cpp` (учёт), `scan/scans.cpp` (обход) |
+| `foreign_exec_memory` | `hooks/exec_guard.cpp` (учёт), `scan/scans.cpp` (обход и быстрый взгляд раз в секунду), `core/foreign_stop.cpp` (остановка найденного кода) |
+| `image_integrity` | `scan/image_integrity.cpp` |
 | `jvm_agents`, `jvm_classes` | `src/common/jvm_guard.cpp`, `hooks/load_gate.cpp` (`instrument`/`jdwp`/`attach`) |
 | `hook_self_check` | `hooks/hook_check.cpp` (канарейка + байты входа) |
 | `virtual_machine`, `dev_mode`, `kernel_state`, `driver_names`, `wine`, `debugger`, `time_check`, `extension_points` | `system/environment.cpp` |
 | `input_source`, `window_identity` | `window/game_window.cpp` |
 | `process_dacl` | `process/dacl.cpp` |
+| `foreign_handles` | `scan/handles.cpp` |
 | `splash` | `window/splash.cpp` |
 | `linux_wsl`, `posix_preload` | `src/posix/agent/entry.cpp` |
 

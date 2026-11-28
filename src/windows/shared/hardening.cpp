@@ -123,4 +123,82 @@ bool extension_points_disabled() {
     return (p.Flags & 1) != 0;
 }
 
+
+// ---- The DACL, as early as the process can have it -------------------------------------------
+// The agent sets the process and thread DACL at step 6 — after the hooks, the start-up scan and
+// jli.dll: hundreds of milliseconds in which a program of the player's own user that waits for the
+// game could open it for its memory, and keep that handle for good (a DACL takes back no handle).
+// The same rights here, first thing in the wrapper, through ntdll only (the wrapper imports nothing
+// but kernel32). The agent sets them again later; this only closes the window before.
+namespace {
+
+using NtOpenProcessTokenFn = NTSTATUS(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
+using NtQueryInformationTokenFn = NTSTATUS(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+using RtlLengthSidFn = ULONG(NTAPI*)(PSID);
+using RtlCreateAclFn = NTSTATUS(NTAPI*)(PACL, ULONG, ULONG);
+using RtlAddAccessAllowedAceFn = NTSTATUS(NTAPI*)(PACL, ULONG, ACCESS_MASK, PSID);
+using RtlCreateSecurityDescriptorFn = NTSTATUS(NTAPI*)(PSECURITY_DESCRIPTOR, ULONG);
+using RtlSetDaclSecurityDescriptorFn = NTSTATUS(NTAPI*)(PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN);
+using RtlSetControlSecurityDescriptorFn = NTSTATUS(NTAPI*)(PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
+                                                           SECURITY_DESCRIPTOR_CONTROL);
+using NtSetSecurityObjectFn2 = NTSTATUS(NTAPI*)(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
+using NtCloseFn = NTSTATUS(NTAPI*)(HANDLE);
+
+template <typename T>
+T ntdll_proc(const char* name) {
+    return reinterpret_cast<T>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), name)));
+}
+
+bool set_dacl(HANDLE object, PSID user, ACCESS_MASK user_rights) {
+    const auto length_sid = ntdll_proc<RtlLengthSidFn>("RtlLengthSid");
+    const auto create_acl = ntdll_proc<RtlCreateAclFn>("RtlCreateAcl");
+    const auto add_ace = ntdll_proc<RtlAddAccessAllowedAceFn>("RtlAddAccessAllowedAce");
+    const auto create_sd = ntdll_proc<RtlCreateSecurityDescriptorFn>("RtlCreateSecurityDescriptor");
+    const auto set_sd_dacl = ntdll_proc<RtlSetDaclSecurityDescriptorFn>("RtlSetDaclSecurityDescriptor");
+    const auto set_control = ntdll_proc<RtlSetControlSecurityDescriptorFn>("RtlSetControlSecurityDescriptor");
+    const auto set_security = ntdll_proc<NtSetSecurityObjectFn2>("NtSetSecurityObject");
+    if (!length_sid || !create_acl || !add_ace || !create_sd || !set_sd_dacl || !set_control || !set_security)
+        return false;
+    // OWNER RIGHTS (S-1-3-4): the owner keeps only READ_CONTROL, not the implicit WRITE_DAC.
+    struct {
+        BYTE revision = 1, count = 1;
+        BYTE authority[6] = {0, 0, 0, 0, 0, 3};
+        DWORD sub = 4;
+    } owner_rights;
+    PSID owner = &owner_rights;
+    alignas(8) unsigned char acl_buf[512];
+    const ULONG size = sizeof(ACL) + 2 * sizeof(ACCESS_ALLOWED_ACE) + length_sid(user) + length_sid(owner);
+    if (size > sizeof(acl_buf)) return false;
+    auto* acl = reinterpret_cast<PACL>(acl_buf);
+    SECURITY_DESCRIPTOR sd{};
+    return nt::ok(create_acl(acl, size, ACL_REVISION)) && nt::ok(add_ace(acl, ACL_REVISION, user_rights, user)) &&
+           nt::ok(add_ace(acl, ACL_REVISION, READ_CONTROL, owner)) &&
+           nt::ok(create_sd(&sd, SECURITY_DESCRIPTOR_REVISION)) && nt::ok(set_sd_dacl(&sd, TRUE, acl, FALSE)) &&
+           nt::ok(set_control(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) &&
+           nt::ok(set_security(object, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, &sd));
+}
+
+}  // namespace
+
+void protect_process_early() {
+    if (!config::enabled(config::Module::process_dacl)) return;
+    const auto open_token = ntdll_proc<NtOpenProcessTokenFn>("NtOpenProcessToken");
+    const auto query_token = ntdll_proc<NtQueryInformationTokenFn>("NtQueryInformationToken");
+    const auto close = ntdll_proc<NtCloseFn>("NtClose");
+    if (!open_token || !query_token || !close) return;
+    HANDLE token = nullptr;
+    if (!nt::ok(open_token(nt::current_process(), TOKEN_QUERY, &token))) return;
+    alignas(8) unsigned char buf[256];
+    ULONG got = 0;
+    const bool have = nt::ok(query_token(token, 1 /* TokenUser */, buf, sizeof(buf), &got));
+    close(token);
+    if (!have) return;
+    PSID user = reinterpret_cast<TOKEN_USER*>(buf)->User.Sid;
+    // As the agent's (process/dacl.cpp): OBS opens the game with QUERY_INFORMATION | SYNCHRONIZE, Task
+    // Manager needs TERMINATE. No memory rights, no thread rights. Not the main thread here: its DACL
+    // would take WRITE_DAC from the agent too, which sets every thread's DACL itself at step 6.
+    set_dacl(nt::current_process(), user,
+             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE);
+}
+
 }  // namespace mebet::win

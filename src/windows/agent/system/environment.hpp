@@ -19,7 +19,7 @@ std::string vm_class();  // tag for every event
 // Tags only (ТЗ §12 «Метки»): Secure Boot and HVCI are reported, never required.
 void tag_kernel_state();
 
-void report_wine();               // ТЗ §7: report only
+void report_wine();               // ТЗ §7: Wine/Proton — closes (level of the wine module)
 void report_extension_points();   // ТЗ §7: IFEO, AppInit_DLLs, AppCertDlls — report only
 void report_drivers();            // ТЗ §12: once per session, non-Microsoft drivers
 

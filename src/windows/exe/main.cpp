@@ -125,6 +125,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     boot.exe_module = instance;
     boot.start_ms = GetTickCount64();
 
+    // Step 0 — no program of the player may open the game for its memory, from the very start.
+    mebet::win::protect_process_early();
+
     // Step 1 — before anything else.
     mebet::win::harden_process(boot);
 

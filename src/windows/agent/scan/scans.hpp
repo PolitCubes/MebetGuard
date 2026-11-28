@@ -16,6 +16,9 @@ void startup_check();
 // the loader list, threads that start outside allowed code.
 void memory_sweep();
 void thread_sweep();
+// Periodic, every second: a quick look that starts memory_sweep() at once when it sees executable
+// memory or an image that nothing has recorded.
+void quick_memory_look();
 
 // Called from DLL_THREAD_ATTACH of the agent: check the start of the new thread and
 // restrict its access rights (ТЗ §7 «Права в DACL»).

@@ -5,9 +5,10 @@
 #    build-macos-binaries). Every arch x variant is its own job and uploads its own artifact
 #    bin-<os>-<arch>-<variant>. prod = release (every module on); dev = devtest (VM, WSL and
 #    dev-mode modules off, so it runs on a VM / dev-mode CI runner). Both unsigned here.
-# 2. e2e — one matrix per OS, after that OS's build matrix passed; one job per arch x feature,
-#    each on that arch's own hardware, runs the attack with the guard and without it.
-# 3. ci-ok — needs only the three e2e matrices and fails if any of them failed, was cancelled
+# 2. e2e — after the build of the same OS; one job per arch x feature. Windows in groups of
+#    meaning (e2e-win-*, each a call of e2e-windows.yml), Linux and macOS one matrix each;
+#    each job on that arch's own hardware runs the attack with the guard and without it.
+# 3. ci-ok — needs only the e2e jobs and fails if any of them failed, was cancelled
 #    or skipped (an e2e is skipped when its build failed), so a failed build fails it too.
 # 4. sign — release tags only (skipped on pull requests).
 name: CI
@@ -151,177 +152,71 @@ jobs:
           path: dist/${{ matrix.kind }}/
 
   # ========= 2. e2e — every arch of every OS, after the build of the same OS ==========
-  # One job per arch x feature, each arch on its own hardware: Windows x64 and x86 (a 32-bit
-  # process under WOW64; GitHub has no 32-bit Windows) on windows-2022, arm64 on windows-11-arm /
-  # ubuntu-24.04-arm / macos-15, Intel Mac on macos-15-intel. x86 runs 32-bit Java 21: no vendor
-  # ships a 32-bit Windows Java 25. --no-skip: a scenario that cannot run fails the job.
-  e2e-windows:
+  # Windows: one call of e2e-windows.yml per group of meaning, so the run's graph reads as
+  # "what is being proven" (each group a block; inside it one job per arch x scenario). Linux and
+  # macOS: one matrix each, arm64 on ubuntu-24.04-arm / macos-15, Intel Mac on macos-15-intel.
+  e2e-win-legit:
     needs: build-windows-binaries
-    name: windows ${{ matrix.arch }} ${{ matrix.feature }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 25 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, x86, arm64]
-        feature:
-          # legit: the game's own behaviour must pass the guard untouched
-          - clean_launch
-          - thread_churn
-          - jit_hot
-          - trusted_native_load
-          - ffm_benign
-          - process_hold
-          - native_load_churn
-          - resource_read_unsigned
-          - module_file_unreadable
-          # attacks on the JVM start
-          - env_hardening_jto
-          - env_hardening_jdk
-          - jvm_agents_javaagent
-          - jvm_agents_agentpath
-          - dev_mode
-          # attacks inside the running game
-          - module_trust_load
-          - jvm_agent_module
-          - foreign_exec_alloc
-          - foreign_exec_protect
-          - ex_exec_alloc
-          - ex_image_map
-          - stale_unmap_exec
-          - limited_handle_exec
-          - image_page_protect
-          - overwrite_cached_dll
-          - foreign_exec_moving
-          - process_dacl_open
-          - close_window_timeout
-          # attacks on the guard itself
-          - tamper_freeze_guard
-          - tamper_kill_guard
-          - tamper_unload_guard
-          - tamper_jam_sweep
-          - whole_game_held
-        include:
-          - { arch: x64,   runner: windows-2022,   java: "25", java_arch: x64,     vc: x64,     dir: x86-64-mustdie }
-          - { arch: x86,   runner: windows-2022,   java: "21", java_arch: x86,     vc: x64_x86, dir: x86-mustdie }
-          - { arch: arm64, runner: windows-11-arm, java: "25", java_arch: aarch64, vc: arm64,   dir: arm64-mustdie }
-          # the prod build must close on a dev-mode runner (203)
-          - { feature: dev_mode, variant: prod, extra: "--expect-dev-mode" }
-          # Awkward paths (tests/e2e/paths.py): every scenario again, with the guard, a copy of the JDK
-          # and the client folder in folders players have — Cyrillic, Ukrainian, German and Spanish
-          # letters, shell specials, and characters beyond the ANSI code page. Two jobs per variant
-          # (the long scenarios apart), each with the usual --no-skip. test_paths.py adds the folders
-          # plain java itself cannot use on the runner's code page (1252).
-          - { arch: x64, feature: paths-cyrillic-quick, extra: "--paths cyrillic", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-cyrillic-long, extra: "--paths cyrillic", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-ukrainian-quick, extra: "--paths ukrainian", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-ukrainian-long, extra: "--paths ukrainian", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-latin-quick, extra: "--paths latin", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-latin-long, extra: "--paths latin", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-specials-quick, extra: "--paths specials", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-specials-long, extra: "--paths specials", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-beyond-quick, extra: "--paths beyond", select: "not process_hold and not native_load_churn and not close_window_timeout and not tamper and not module_file_unreadable and not image_page_protect and not overwrite_cached_dll and not foreign_exec_moving and not whole_game_held", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-          - { arch: x64, feature: paths-beyond-long, extra: "--paths beyond", select: "process_hold or native_load_churn or close_window_timeout or tamper", timeout: 45,
-              runner: windows-2022, java: "25", java_arch: x64, vc: x64, dir: x86-64-mustdie }
-        # 32-bit Windows Java has no Foreign Function linker (and no Java 22+ at all): the FFM
-        # attacks cannot exist there.
-        exclude:
-          - { arch: x86, feature: ffm_benign }
-          - { arch: x86, feature: native_load_churn }
-          - { arch: x86, feature: foreign_exec_alloc }
-          - { arch: x86, feature: foreign_exec_protect }
-          - { arch: x86, feature: resource_read_unsigned }
-          - { arch: x86, feature: ex_exec_alloc }
-          - { arch: x86, feature: ex_image_map }
-          - { arch: x86, feature: stale_unmap_exec }
-          - { arch: x86, feature: limited_handle_exec }
-          - { arch: x86, feature: image_page_protect }
-          - { arch: x86, feature: overwrite_cached_dll }
-          - { arch: x86, feature: whole_game_held }
-          - { arch: x86, feature: tamper_freeze_guard }
-          - { arch: x86, feature: tamper_kill_guard }
-          - { arch: x86, feature: tamper_unload_guard }
-          - { arch: x86, feature: tamper_jam_sweep }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # Liberica (BellSoft): the guard trusts the game Java's publisher, so the JVM's own DLLs
-      # pass the load gate (Temurin's would be closed as untrusted modules, 210).
-      - uses: actions/setup-java@v4
-        with:
-          distribution: liberica
-          java-version: ${{ matrix.java }}
-          architecture: ${{ matrix.java_arch }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin-windows-${{ matrix.arch }}-${{ matrix.variant || 'dev' }}
-          path: guard
-      - name: e2e fixture (unsigned native, marker only)
-        shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          New-Item -ItemType Directory -Force fixtures | Out-Null
-          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vc }} && cl /nologo /LD tests\e2e\attacks\native\mebet_fake_cheat.c /Fo:fixtures\ /Fe:fixtures\mebet_fake_cheat.dll"
-          if (-not (Test-Path fixtures\mebet_fake_cheat.dll)) { throw "fixture not built" }
-      - name: install pytest
-        shell: pwsh
-        run: python -m pip install -q pytest
-      # The "game as a standard user" variants run with a non-admin token: let it read the JDK
-      # and the workspace the elevated runner created (a player's game folder is theirs anyway).
-      - name: standard-user access to the JDK and the workspace
-        shell: pwsh
-        run: |
-          icacls "$env:JAVA_HOME" /grant "*S-1-5-11:(OI)(CI)RX" /T /C /Q | Out-Null
-          icacls "$pwd" /grant "*S-1-5-11:(OI)(CI)M" /T /C /Q | Out-Null
-      # A crash leaves a minidump, so a failed job shows where it crashed, not only an exit code.
-      - name: crash dumps on
-        shell: pwsh
-        run: |
-          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
-          New-Item -Path $k -Force | Out-Null
-          New-ItemProperty -Path $k -Name DumpFolder -Value "$env:RUNNER_TEMP\dumps" -PropertyType ExpandString -Force | Out-Null
-          New-ItemProperty -Path $k -Name DumpType -Value 1 -PropertyType DWord -Force | Out-Null
-      - name: "attack ${{ matrix.feature }} with the guard and without it"
-        shell: pwsh
-        env:
-          PYTHONUTF8: "1"   # the verdict lines are Russian: without it the log shows \uXXXX escapes
-        run: |
-          python -m pytest tests/e2e -v -rP --no-header --no-skip -k '${{ matrix.select || matrix.feature }}' `
-            --guard "$pwd\guard\${{ matrix.dir }}\MebetGuard.exe" --java "$env:JAVA_HOME" `
-            --untrusted-native "$pwd\fixtures\mebet_fake_cheat.dll" ${{ matrix.extra }}
-      - name: crash report (faulting module, JVM hs_err, stack)
-        if: failure()
-        shell: pwsh
-        run: |
-          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error' } -MaxEvents 3 -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.TimeCreated; $_.Message; '-----' }
-          Get-ChildItem tests\e2e\_work -Recurse -Filter 'hs_err_pid*.log' -ErrorAction SilentlyContinue |
-            ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -TotalCount 80 }
-          $harch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
-          $cdb = Get-Item "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\$harch\cdb.exe" -ErrorAction SilentlyContinue
-          $dumps = @(Get-ChildItem "$env:RUNNER_TEMP\dumps" -Filter *.dmp -ErrorAction SilentlyContinue)
-          "dumps: $($dumps.Count); cdb: $(if ($cdb) { $cdb.FullName } else { 'not found' })"
-          if ($cdb -and $dumps.Count) {
-            $sym = "$pwd\guard\symbols;srv*$env:RUNNER_TEMP\sym*https://msdl.microsoft.com/download/symbols"
-            & $cdb.FullName -z $dumps[0].FullName -y $sym -c '.ecxr; kn 40; q' 2>&1 | Select-Object -Last 70
-          }
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: crash-windows-${{ matrix.arch }}-${{ matrix.feature }}
-          path: ${{ runner.temp }}/dumps
-          if-no-files-found: ignore
+    name: "windows · игра работает (легит)"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["clean_launch", "thread_churn", "jit_hot", "trusted_native_load", "ffm_benign", "process_hold",
+         "native_load_churn", "resource_read_unsigned", "module_file_unreadable"]
+
+  e2e-win-start:
+    needs: build-windows-binaries
+    name: "windows · атаки на запуск JVM"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["env_hardening_jto", "env_hardening_jdk", "jvm_agents_javaagent", "jvm_agents_agentpath", "dev_mode"]
+
+  e2e-win-modules:
+    needs: build-windows-binaries
+    name: "windows · чужие модули"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["module_trust_load", "jvm_agent_module", "ex_image_map", "overwrite_cached_dll"]
+
+  e2e-win-code:
+    needs: build-windows-binaries
+    name: "windows · чужой код в памяти"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["foreign_exec_alloc", "foreign_exec_protect", "ex_exec_alloc", "stale_unmap_exec", "limited_handle_exec",
+         "image_page_protect", "foreign_exec_moving", "image_patch_outside"]
+
+  e2e-win-outside:
+    needs: build-windows-binaries
+    name: "windows · внедрение из другой программы"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["process_dacl_open", "process_dacl_read", "inject_remote_thread", "inject_apc", "inject_exec_thread",
+         "foreign_handle_hold"]
+
+  e2e-win-guard:
+    needs: build-windows-binaries
+    name: "windows · атаки на сам страж"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      features: >-
+        ["close_window_timeout", "tamper_freeze_guard", "tamper_kill_guard", "tamper_unload_guard",
+         "tamper_jam_sweep", "whole_game_held"]
+
+  e2e-win-paths:
+    needs: build-windows-binaries
+    name: "windows · неудобные пути"
+    uses: ./.github/workflows/e2e-windows.yml
+    with:
+      archs: '["x64"]'
+      features: >-
+        ["paths-cyrillic-quick", "paths-cyrillic-long", "paths-ukrainian-quick", "paths-ukrainian-long",
+         "paths-latin-quick", "paths-latin-long", "paths-specials-quick", "paths-specials-long",
+         "paths-beyond-quick", "paths-beyond-long"]
 
   e2e-linux:
     needs: build-linux-binaries
@@ -333,7 +228,7 @@ jobs:
       matrix:
         arch: [x64, arm64]
         feature: [clean_launch, thread_churn, jit_hot, ffm_benign,
-                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath]
+                  env_hardening_jto, env_hardening_jdk, jvm_agents_javaagent, jvm_agents_agentpath, preload_foreign]
         include:
           - { arch: x64,   runner: ubuntu-24.04,     dir: x86-64-linux }
           - { arch: arm64, runner: ubuntu-24.04-arm, dir: arm64-linux }
@@ -505,7 +400,8 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [e2e-windows, e2e-linux, e2e-macos]
+    needs: [e2e-win-legit, e2e-win-start, e2e-win-modules, e2e-win-code, e2e-win-outside, e2e-win-guard,
+            e2e-win-paths, e2e-linux, e2e-macos]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

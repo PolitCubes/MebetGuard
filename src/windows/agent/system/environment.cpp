@@ -358,14 +358,15 @@ void tag_kernel_state() {
 void report_wine() {
     const auto& a = nt::api();
     if (!a.wine_get_version || !config::enabled(config::Module::wine)) return;
+    // Under Wine/Proton none of the Windows checks means what it says (no kernel, no real loader, no
+    // signatures checked by Windows): the client closes. Linux players have the native Linux client.
     const char* v = a.wine_get_version();
-    report::Event ev = make_event("report.wine", "Report: Wine/Proton", report::Level::warning);
+    report::Event ev = make_event("close.wine", "Closed: Wine/Proton", report::Level::error);
     JsonWriter w;
     w.begin_object().field("wine_version", truncate_utf8(v ? v : "", 64)).end_object();
     ev.extra_json = w.take();
-    ev.fingerprint = {"report.wine", v ? v : ""};
-    ev.dedupe_key = "report.wine";
-    report::Reporter::instance().submit(std::move(ev));
+    ev.fingerprint = {"close.wine", v ? v : ""};
+    guard::signal(config::Module::wine, config::Reason::wine, win::wide(v ? v : ""), std::move(ev));
 }
 
 void report_extension_points() {

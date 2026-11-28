@@ -38,4 +38,8 @@ struct EntryCheck {
 void check_entries(EntryCheck out[kHookCount]);
 std::string entry_bytes_hex(int index, bool expected);
 
+// [begin, end) lies inside the bytes the guard itself wrote over an ntdll entry (image integrity
+// lets these be).
+bool in_own_patch(std::uintptr_t begin, std::uintptr_t end);
+
 }  // namespace mebet::hooks
