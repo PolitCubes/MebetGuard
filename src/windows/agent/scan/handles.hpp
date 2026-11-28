@@ -13,7 +13,8 @@
 // Let off: the launcher that started the game (the parent, proven by its creation time), session 0
 // (services: antivirus, the system's own), the kernel, and every program whose executable the trust
 // engine allows (Microsoft, trusted publishers — csrss, conhost, Task Manager, an overlay's helper).
-// A program in the player's session that cannot even be opened to tell what it is counts as foreign:
+// A program in the player's session whose executable cannot be told (neither through a handle nor
+// from the kernel by its id) counts as foreign:
 // that is what an elevated program that set its own DACL looks like.
 //
 // Where the system hides kernel object addresses from the game (Windows 11 24H2+ without

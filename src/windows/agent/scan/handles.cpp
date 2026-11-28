@@ -97,6 +97,32 @@ std::map<ULONG_PTR, ProcessFacts> process_list() {
     return out;
 }
 
+// The executable of a process, from the kernel by its id (SystemProcessIdInformation) — no handle on the
+// process is needed. A standard-user game may not open csrss.exe even to ask its name, and csrss holds
+// a full handle on every process of its session: judged by this path, it is the Microsoft file it is.
+std::wstring image_path_by_pid(ULONG_PTR pid) {
+    const auto f = nt::api().NtQuerySystemInformation;
+    if (!f) return std::wstring();
+    struct {
+        HANDLE process_id;
+        UNICODE_STRING image_name;
+    } info{};
+    std::vector<wchar_t> buf(1024);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        info.process_id = reinterpret_cast<HANDLE>(pid);
+        info.image_name.Length = 0;
+        info.image_name.MaximumLength = static_cast<USHORT>(buf.size() * sizeof(wchar_t));
+        info.image_name.Buffer = buf.data();
+        const NTSTATUS s = f(88 /* SystemProcessIdInformation */, &info, sizeof(info), nullptr);
+        if (nt::ok(s)) return win::nt_to_dos(std::wstring(buf.data(), info.image_name.Length / sizeof(wchar_t)));
+        if (s != nt::kStatusInfoLengthMismatch || info.image_name.MaximumLength <= buf.size() * sizeof(wchar_t) ||
+            info.image_name.MaximumLength > 0x7FFE)
+            return std::wstring();
+        buf.resize(info.image_name.MaximumLength / sizeof(wchar_t) + 1);
+    }
+    return std::wstring();
+}
+
 // A handle of our own on this process, to find this process's object in the table.
 HANDLE self_handle() {
     static HANDLE h = [] {
@@ -141,28 +167,24 @@ Judged judge_holder(ULONG_PTR pid, const std::map<ULONG_PTR, ProcessFacts>& proc
         j.holder = Holder::allowed;
         return j;
     }
-    const HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
-    if (!h) {
+    // Its executable: through a handle when the game may open it, else from the kernel by its id.
+    if (const HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid))) {
+        wchar_t path[MAX_PATH * 4];
+        DWORD n = MAX_PATH * 4;
+        if (QueryFullProcessImageNameW(h, 0, path, &n)) j.path.assign(path, n);
+        CloseHandle(h);
+    }
+    if (j.path.empty()) j.path = image_path_by_pid(pid);
+    if (j.path.empty()) {
         if (f.session == 0) {  // a service the game may not look at: cannot be told, let be
             j.holder = Holder::allowed;
             return j;
         }
-        // In the player's session and closed even to a query of its name: an elevated program that
-        // keeps itself from being looked at.
+        // In the player's session and not even its executable can be told: foreign.
         j.holder = Holder::foreign;
         j.path = f.name;
         return j;
     }
-    wchar_t path[MAX_PATH * 4];
-    DWORD n = MAX_PATH * 4;
-    const bool named = QueryFullProcessImageNameW(h, 0, path, &n) != 0;
-    CloseHandle(h);
-    if (!named) {
-        j.holder = Holder::foreign;
-        j.path = f.name;
-        return j;
-    }
-    j.path.assign(path, n);
     {
         watchdog::SlowWork slow;  // a signature check of an unseen executable can take a while
         j.decision = trust::decide_path(j.path);
