@@ -354,17 +354,31 @@ def probe_remote_code_moving(pid, proc):
     return winpriv.as_other("admin", move)
 
 
-def probe_inject(technique):
+def probe_inject(technique, other=None):
     """A program the harness starts brings the marker library into the game by `technique`
-    (mebet_injector). It runs at the test's own level — the same user as the game — so what decides
-    is the guard, not Windows. Its one line goes into the game's output."""
+    (mebet_injector), at the variant's level of "the other program". Its one line goes into the
+    game's output.
+
+    The injector is a process of its own, so the level must be its token: impersonating the standard
+    user on the harness's thread (winpriv.as_other) does not reach a child process — CreateProcess
+    takes the parent's primary token, the elevated admin with SeDebugPrivilege on, and the "user"
+    variant went past the DACL as an admin. "user" starts it with the standard-user token; "admin" /
+    "admin_nodebug" inherit the harness's token, SeDebugPrivilege switched by as_other around this."""
     def run(pid, proc, ctx=None):
         if not ctx or not ctx.injector or not ctx.inject_dll:
             return "PROBE inject: no injector fixture (no toolchain for the game's architecture)"
         if not _wait_line(proc, r"TARGET action: ", 60):
             return "PROBE inject: the game never got to its action"
         time.sleep(1.0)  # the game is in its heartbeat loop now
-        r, out, _ = run_cmd([ctx.injector, technique, str(pid), ctx.inject_dll], os.environ.copy(), 60)
+        cmd = [ctx.injector, technique, str(pid), ctx.inject_dll]
+        if other == "user":
+            p = winpriv.UserProc(cmd, os.environ.copy(), str(ctx.work))
+            if not p.wait(60):
+                p.kill()
+            r = p.finish()
+            out = "".join(p.lines)
+        else:
+            r, out, _ = run_cmd(cmd, os.environ.copy(), 60)
         line = (out.strip().splitlines() or ["(no output)"])[-1]
         return "PROBE %s (exit %d)" % (line, r)
     return run
@@ -508,11 +522,15 @@ def launch(ctx, mode, jvm_args=(), extra_env=None, action=None, iters=8, timeout
                 if proc.wait(0.05):
                     break
         if pid:
-            if probe.startswith("inject:"):  # the injection probes need the fixtures' paths
-                fn = lambda: probe_inject(probe.split(":", 1)[1])(pid, proc, ctx)  # noqa: E731
+            inject = probe.startswith("inject:")
+            if inject:  # the injection probes need the fixtures' paths, and start a process of their own
+                fn = lambda: probe_inject(probe.split(":", 1)[1], other)(pid, proc, ctx)  # noqa: E731
             else:
                 fn = lambda: PROBES[probe](pid, proc)  # noqa: E731
-            proc.lines.append((winpriv.as_other(other, fn) if other else fn()) + "\n")
+            # An injector as "user" gets that token as its own (probe_inject); impersonating on top of
+            # it would only take from the harness the right to start a process with that token.
+            wrap = other and not (inject and other == "user")
+            proc.lines.append((winpriv.as_other(other, fn) if wrap else fn()) + "\n")
     timed_out = not proc.wait(max(0.0, limit - (time.monotonic() - start)))
     if timed_out:
         proc.kill()

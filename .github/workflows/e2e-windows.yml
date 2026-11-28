@@ -55,6 +55,9 @@ jobs:
           - { arch: x86, feature: tamper_kill_guard }
           - { arch: x86, feature: tamper_unload_guard }
           - { arch: x86, feature: tamper_jam_sweep }
+          # A special user APC (NtQueueApcThreadEx) cannot be queued from a 32-bit process under
+          # WOW64: the injector reaches no thread, without the guard as well, so nothing is proven.
+          - { arch: x86, feature: inject_apc }
     env:
       JAVA_VERSION: ${{ matrix.arch == 'x86' && '21' || '25' }}
       JAVA_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || matrix.arch }}
