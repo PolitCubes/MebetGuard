@@ -7,7 +7,8 @@
 
 Environment (CI: repository secrets): MEBET_ERRORS_DSN, MEBET_REPORTS_DSN — the project id and
 the host come from them, so no project slug is configured anywhere; GLITCHTIP_TOKEN — a GlitchTip
-API token with event:read / project:read / org:read. Neither the DSNs nor the token are printed.
+API token with event:read / project:read / org:read, optional: without it the check is skipped
+with a warning (the send step has already required 2xx). Neither the DSNs nor the token are printed.
 
 For each channel, both events (smoke.small and smoke.large) with the tag smoke=<marker> must be in
 the project of that channel's DSN. GlitchTip stores events asynchronously, so it is asked again
@@ -72,8 +73,10 @@ def main():
 
     token = os.environ.get("GLITCHTIP_TOKEN", "").strip()
     if not token:
-        print("::error::GLITCHTIP_TOKEN repository secret is not set: arrival cannot be checked (docs/reports.md)")
-        return 1
+        # Optional: without a token the 2xx answers of the send step are the whole check.
+        print("::warning::GLITCHTIP_TOKEN repository secret is not set: GlitchTip answered 2xx, "
+              "but arrival in the projects is not checked (docs/reports.md)")
+        return 0
     channels = []
     for name, var in (("errors", "MEBET_ERRORS_DSN"), ("reports", "MEBET_REPORTS_DSN")):
         m = DSN_RX.fullmatch(os.environ.get(var, "").strip())

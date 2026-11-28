@@ -20,7 +20,7 @@
 |---|---|---|
 | `GLITCHTIP_ERRORS_DSN` | DSN проекта «Mebet — ошибки» | проект → Settings → Client Keys (DSN) → DSN |
 | `GLITCHTIP_REPORTS_DSN` | DSN проекта «Mebet — отчёты» | так же, второй проект |
-| `GLITCHTIP_TOKEN` | API-токен только для проверки доставки, в сборку не попадает | Profile → Auth Tokens, права `org:read`, `project:read`, `event:read` |
+| `GLITCHTIP_TOKEN` | необязательный API-токен только для проверки доставки, в сборку не попадает | Profile → Auth Tokens, права `org:read`, `project:read`, `event:read` |
 
 Задать секрет можно в интерфейсе GitHub или из своего терминала: `gh secret set
 GLITCHTIP_ERRORS_DSN` спросит значение и не оставит его в истории команд.
@@ -38,7 +38,8 @@ GLITCHTIP_ERRORS_DSN` спросит значение и не оставит е�
 (WinHTTP на Windows, libcurl на Linux), — отправляет в каждый канал маленькое событие и событие
 около 60 КБ (рядом с лимитом 64 КБ) с меткой `smoke=gh-<run>-<попытка>-<ОС>` и
 `environment=test`, требует ответ 2xx и через API GlitchTip (`tools/ci/glitchtip_check.py`,
-токен из `GLITCHTIP_TOKEN`) убеждается, что оба события лежат в проекте своего DSN. Все
+токен из `GLITCHTIP_TOKEN`) убеждается, что оба события лежат в проекте своего DSN. Без
+токена этот шаг пропускается с предупреждением, проверка — только ответ 2xx. Все
 прогоны складываются в две задачи «CI smoke …» на проект (один fingerprint), их можно
 держать решёнными.
 
