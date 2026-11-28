@@ -55,6 +55,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Built before the secrets are checked: without them it still compiles (no DSN), so a broken
+      # smoke build shows up even where the secrets are missing.
+      - name: build the guard's report code with the DSNs
+        shell: bash
+        run: |
+          cmake -S . -B build/smoke -DMEBET_BUILD_KIND=test -DMEBET_REPORT_SMOKE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/smoke --config Release --target mebet_report_smoke --parallel
       - name: both DSN secrets are set
         shell: bash
         run: |
@@ -62,11 +69,6 @@ jobs:
             echo "::error::GLITCHTIP_ERRORS_DSN / GLITCHTIP_REPORTS_DSN repository secrets are not set (docs/reports.md)"
             exit 1
           fi
-      - name: build the guard's report code with the DSNs
-        shell: bash
-        run: |
-          cmake -S . -B build/smoke -DMEBET_BUILD_KIND=test -DMEBET_REPORT_SMOKE=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/smoke --config Release --target mebet_report_smoke --parallel
       - name: send marked events through it
         shell: bash
         run: ${{ matrix.exe }} "gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}"
