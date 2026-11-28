@@ -1171,9 +1171,10 @@ SCENARIOS = [
     # ---- the OS's own extension points (before any of the game's code) ----------------------------
     # Both land the library before the guard's hooks exist in the process, so only the wrapper's
     # process-extension-point policy can keep them out. Administrator only: both are HKLM-wide.
-    # AppCertDlls is not honoured on every Windows: 11 build 26200 (a developer machine here) loads
-    # the value into no new process at all, while AppInit below does. When it does load, the guard's
-    # policy keeps it out — so the test runs, and is xfail when the OS itself never brought it in.
+    # AppInit_DLLs is applied by user32 only while Secure Boot is off; GitHub's windows-2022 runners
+    # have it on, so there the value is set and nothing is loaded. Both cases are accepted (`soft` +
+    # `known_limit`): the attempt has to have happened, and when the OS did load it, the guard's
+    # policy closes the game.
     _sc(id="appcert_dll", kind="attack", module="extension_point_disable", os=WIN, needs_admin=True,
         guard="allow", probe="extension:appcert", timeout=150, soft=True,
         marker="ATTACK injected library loaded (an extension point)",
@@ -1182,8 +1183,10 @@ SCENARIOS = [
         title="AppCertDlls: библиотеку грузит система в каждый новый процесс (до кода игры)",
         build=lambda ctx, native, jar: dict(action="none")),
     _sc(id="appinit_dll", kind="attack", module="extension_point_disable", os=WIN, needs_admin=True,
-        guard="allow", probe="extension:appinit", timeout=150, marker="ATTACK injected library loaded (an extension point)",
+        guard="allow", probe="extension:appinit", timeout=150, soft=True,
+        marker="ATTACK injected library loaded (an extension point)",
         proof=[r"PROBE extension appinit \(game pid [1-9]\d*"],
+        expect=lambda game, other: dict(guard="known_limit", proof=[r"PROBE extension appinit \(game pid [1-9]\d*"]),
         title="AppInit_DLLs: библиотеку грузит user32 игры (на раннере CI Secure Boot выключен)",
         build=lambda ctx, native, jar: dict(action="none")),
     # Only a handle: an administrator's program holds the game open for its memory and does nothing in

@@ -16,8 +16,9 @@
 #include <stdio.h>
 
 /* The same file is linked as an exe (the helper) and as the DLL the system loads. In the exe nothing
- * calls DllMain, so the linker drops it and its line with it; the DLL it is the entry and must stay. */
-#pragma comment(linker, "/include:DllMain")
+ * calls DllMain, so a release link drops it and its line with it; holding it in a pointer keeps it. */
+BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID);
+static BOOL(WINAPI *const g_keep_dllmain)(HINSTANCE, DWORD, LPVOID) = DllMain;
 
 static void say(const char *how) {
     char line[512];
