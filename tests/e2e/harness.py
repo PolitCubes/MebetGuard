@@ -689,6 +689,18 @@ def run_scenario(ctx, sc, mode, variant=(None, None)):
 #         "works" (default) or "denied" (Windows itself stops the attack even without the guard).
 # build(ctx, native, marker_jar) -> {jvm_args?, extra_env?, action?, iters?}.
 
+def _preload_path(native):
+    """LD_PRELOAD splits its value on spaces and colons and has no escape: from a folder with a space in
+    its name (the awkward-path runs) the library could not be preloaded at all, and the attack never
+    happened. A copy in the system temp folder, whose path has neither, is what gets preloaded."""
+    import tempfile
+    dst = Path(tempfile.gettempdir()) / ("mebet_preload_" + Path(native).name)
+    if any(c in str(dst) for c in " :"):
+        return str(native)
+    shutil.copyfile(native, dst)
+    return str(dst)
+
+
 def _agent(jar):
     return "-javaagent:" + str(jar)
 
@@ -828,7 +840,7 @@ SCENARIOS = [
     _sc(id="preload_foreign", kind="attack", module="posix_preload", os={"linux"}, needs_native=True,
         guard="close:untrusted_module", marker="TARGET exit", proof=[r"ATTACK native preloaded"],
         title="LD_PRELOAD посторонней библиотеки до старта игры",
-        build=lambda ctx, native, jar: dict(extra_env={"LD_PRELOAD": str(native)}, action="none")),
+        build=lambda ctx, native, jar: dict(extra_env={"LD_PRELOAD": _preload_path(native)}, action="none")),
     # The locked dev-mode check: on a dev-mode / test-signing machine the prod build must close
     # before the JVM even starts. Only passes where the machine really is in dev mode (the CI
     # Windows runners); the e2e-windows job runs it against the prod (release) build. With any
