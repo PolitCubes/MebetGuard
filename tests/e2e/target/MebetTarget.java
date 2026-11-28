@@ -34,7 +34,10 @@ import java.nio.file.Paths;
 public class MebetTarget {
     public static void main(String[] args) throws Exception {
         long pid = ProcessHandle.current().pid();
-        System.out.println("TARGET up pid=" + pid);
+        // The tid too: a thread hijack moves a *sleeping* thread, and a thread waiting forever never
+        // comes back to user mode to take a changed context. The main thread sleeps 250 ms per beat.
+        System.out.println("TARGET up pid=" + pid + " tid=" + Thread.currentThread().threadId());
+        System.out.flush();
         for (String name : new String[] {"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS"}) {
             System.out.println("TARGET env " + name + (System.getenv(name) != null ? " set" : " unset"));
         }
@@ -77,6 +80,21 @@ public class MebetTarget {
         try {
             if (action.equals("none")) {
                 System.out.println("TARGET did none");
+            } else if (action.startsWith("busy ")) {
+                // A thread that stays in user code — no system call inside the loop (a native call, even
+                // nanoTime, drops the thread into the kernel, where a hijack's context is thrown away).
+                final long rounds = Long.parseLong(action.substring(5).trim());
+                Thread t = new Thread(() -> {
+                    long x = 1;
+                    for (long r = 0; r < rounds; r++) {
+                        for (int i = 0; i < 200_000; i++) x = x * 31 + i;
+                    }
+                    System.out.println("TARGET busy done " + x);
+                    System.out.flush();
+                }, "mebet-busy");
+                t.setDaemon(true);  // a live busy thread must not keep the game from ending
+                t.start();
+                System.out.println("TARGET did busy");
             } else if (action.startsWith("load-native ")) {
                 String path = action.substring("load-native ".length()).trim();
                 System.load(path);                       // a native library into the game by path
