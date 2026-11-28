@@ -23,6 +23,8 @@ namespace mebet::stop {
 
 // The vectored handler. Installed with the hooks, before anything is judged.
 void install();
+// Puts the handler first again once the JVM has added its own (VMInit).
+void move_first();
 
 // Code at `address` is foreign and the client is being closed for it: makes the allocation that
 // holds it, and every executable non-image region the exec table does not know, non-executable.

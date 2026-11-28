@@ -77,9 +77,24 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* e) {
 
 }  // namespace
 
+namespace {
+std::atomic<void*> g_handler{nullptr};
+}  // namespace
+
 void install() {
     static std::atomic<bool> done{false};
-    if (!done.exchange(true)) AddVectoredExceptionHandler(1, &on_exception);
+    if (!done.exchange(true)) g_handler.store(AddVectoredExceptionHandler(1, &on_exception));
+}
+
+void move_first() {
+    // Added first in the chain, then the JVM added its own first while it started (os::init_2): a
+    // Java thread led into stopped memory met HotSpot's handler before ours, and the JVM went down
+    // with a crash report instead of the thread being parked. Removed and added again, ours is first.
+    void* old = g_handler.exchange(nullptr);
+    if (!old) return;
+    void* fresh = AddVectoredExceptionHandler(1, &on_exception);
+    RemoveVectoredExceptionHandler(old);
+    g_handler.store(fresh ? fresh : nullptr);
 }
 
 bool stopped(std::uintptr_t address) {

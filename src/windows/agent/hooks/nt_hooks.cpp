@@ -592,3 +592,15 @@ std::string entry_bytes_hex(int index, bool expected) {
 }
 
 }  // namespace mebet::hooks
+
+namespace mebet::hooks {
+
+bool in_own_patch(std::uintptr_t begin, std::uintptr_t end) {
+    for (int i = 0; i < kHookCount; ++i) {
+        const auto e = reinterpret_cast<std::uintptr_t>(g_targets[i].entry);
+        if (e && begin >= e && end <= e + sizeof(g_targets[i].expected)) return true;
+    }
+    return false;
+}
+
+}  // namespace mebet::hooks

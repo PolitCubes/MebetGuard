@@ -32,6 +32,8 @@
 #include "process/dacl.hpp"
 #include "report/cards.hpp"
 #include "report/session_tags.hpp"
+#include "scan/handles.hpp"
+#include "scan/image_integrity.hpp"
 #include "scan/scans.hpp"
 #include "strings.hpp"
 #include "system/environment.hpp"
@@ -125,6 +127,7 @@ void check_jvm_library(const wchar_t* name, const std::wstring& expected_dir) {
 
 void jvm_vm_init() {
     gate::set_jvm_started();
+    stop::move_first();
     const std::wstring& home = trust::java_home();
     check_jvm_library(L"jvm.dll", home + L"\\bin");
     check_jvm_library(L"java.dll", home + L"\\bin");
@@ -242,6 +245,10 @@ MEBET_EXPORT int MEBET_CALL MebetGuardMain(const BootInfo* boot) {
     const unsigned sweep = config::opt::sweep_interval_ms;
     guard::add_periodic("memory", sweep, &scan::memory_sweep, config::Module::foreign_exec_memory);
     guard::add_periodic("threads", sweep, &scan::thread_sweep, config::Module::foreign_threads);
+    // Between the sweeps: a one-second look that starts the memory sweep at once on a new find.
+    guard::add_periodic("memory-quick", 1000, &scan::quick_memory_look, config::Module::foreign_exec_memory);
+    guard::add_periodic("handles", sweep, &handles::sweep, config::Module::foreign_handles);
+    guard::add_periodic("integrity", sweep, &integrity::sweep, config::Module::image_integrity);
     guard::add_periodic("debugger", sweep, &env::check_debugger, config::Module::debugger);
     guard::add_periodic("hooks", sweep, &hooks::self_check, config::Module::hook_self_check);
     guard::add_periodic("time", 30000, &env::check_time, config::Module::time_check);

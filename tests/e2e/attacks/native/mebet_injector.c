@@ -7,6 +7,7 @@
  *
  *   mebet_injector remote-thread <pid> <dll>
  *   mebet_injector apc <pid> <dll>
+ *   mebet_injector exec-thread <pid> <unused>
  *   mebet_injector manual-map <pid> <dll>
  *
  * Prints one "INJECTOR ..." line and exits 0 when the technique was carried out. */
@@ -118,6 +119,45 @@ static DWORD export_rva(HANDLE proc, BYTE *base, const char *want) {
     return 0;
 }
 
+/* A few bytes of code written into the target and a thread started on them — no library, no loader:
+ * what is left of any injection once the loader is out of the picture. The code only returns a known
+ * value, read back as the thread's exit code: it ran, or it was stopped before its first instruction. */
+#define EXEC_THREAD_VALUE 0x4D42u
+static int exec_thread(DWORD pid) {
+#if defined(_M_X64) || defined(__x86_64__)
+    static const unsigned char stub[] = {0xB8, 0x42, 0x4D, 0x00, 0x00, 0xC3}; /* mov eax, 0x4d42; ret */
+#elif defined(_M_IX86) || defined(__i386__)
+    static const unsigned char stub[] = {0xB8, 0x42, 0x4D, 0x00, 0x00, 0xC2, 0x04, 0x00}; /* ...; ret 4 */
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    static const unsigned char stub[] = {0x40, 0xA8, 0x89, 0x52, 0xC0, 0x03, 0x5F, 0xD6}; /* movz w0, #0x4d42; ret */
+#else
+#error "unknown architecture"
+#endif
+    HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION |
+                                  PROCESS_VM_WRITE,
+                              FALSE, pid);
+    if (!proc) return fail("OpenProcess");
+    void *code = VirtualAllocEx(proc, NULL, sizeof(stub), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!code) return fail("VirtualAllocEx");
+    if (!WriteProcessMemory(proc, code, stub, sizeof(stub), NULL)) return fail("WriteProcessMemory");
+    DWORD old = 0;
+    if (!VirtualProtectEx(proc, code, sizeof(stub), PAGE_EXECUTE_READ, &old)) return fail("VirtualProtectEx");
+    FlushInstructionCache(proc, code, sizeof(stub));
+    HANDLE t = CreateRemoteThread(proc, NULL, 0, (LPTHREAD_START_ROUTINE)code, NULL, 0, NULL);
+    if (!t) return fail("CreateRemoteThread");
+    const DWORD waited = WaitForSingleObject(t, 10000);
+    DWORD rc = 0;
+    GetExitCodeThread(t, &rc);
+    if (waited == WAIT_OBJECT_0 && rc == EXEC_THREAD_VALUE)
+        printf("INJECTOR exec-thread done: ran\n");
+    else
+        printf("INJECTOR exec-thread done: stopped (%s, exit code 0x%lx)\n",
+               waited == WAIT_OBJECT_0 ? "ended" : "still parked", (unsigned long)rc);
+    CloseHandle(t);
+    CloseHandle(proc);
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 4) {
@@ -127,6 +167,7 @@ int wmain(int argc, wchar_t **argv) {
     const DWORD pid = (DWORD)wcstoul(argv[2], NULL, 10);
     if (wcscmp(argv[1], L"remote-thread") == 0) return remote_thread(pid, argv[3]);
     if (wcscmp(argv[1], L"apc") == 0) return apc(pid, argv[3]);
+    if (wcscmp(argv[1], L"exec-thread") == 0) return exec_thread(pid);
     printf("INJECTOR unknown technique\n");
     return 2;
 }

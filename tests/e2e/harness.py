@@ -384,8 +384,118 @@ def probe_inject(technique, other=None):
     return run
 
 
+HOLD_SECONDS_HANDLE = 20
+# Run as a program of its own (a child of the harness, never the game's parent, which the guard lets
+# hold its handle): opens the game for reading its memory, as an external ESP does, and keeps it open.
+_HOLD_SCRIPT = r'''
+import ctypes, sys, time
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+k.OpenProcess.restype = ctypes.c_void_p
+k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+h = k.OpenProcess(0x0010 | 0x1000, 0, int(sys.argv[1]))  # PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION
+print("opened" if h else "denied (error %d)" % ctypes.get_last_error(), flush=True)
+if h:
+    time.sleep(float(sys.argv[2]))
+'''
+
+
+def probe_hold_handle(pid, proc):
+    """An administrator's program (SeDebugPrivilege: past any DACL) holds the game open for reading its
+    memory and does nothing else — no module, no code, no thread in the game: only its handle shows."""
+    import sys
+    if not _wait_line(proc, r"TARGET action: ", 60):
+        return "PROBE handle: the game never got to its action"
+
+    def hold():
+        p = subprocess.Popen([sys.executable, "-I", "-c", _HOLD_SCRIPT, str(pid), str(HOLD_SECONDS_HANDLE)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            out, _ = p.communicate(timeout=HOLD_SECONDS_HANDLE + 30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+        line = (out.strip().splitlines() or ["(no output)"])[0]
+        return "PROBE handle %s, held %d s" % (line, HOLD_SECONDS_HANDLE) if line == "opened" else "PROBE handle " + line
+    return winpriv.as_other("admin", hold)
+
+
+def probe_image_patch(pid, proc):
+    """An administrator's program writes 32 bytes into the code of jvm.dll in the running game — into the
+    padding after the end of a code section, so the game itself runs on — past every hook: the image stays
+    the trusted one, only its code in memory is no longer the file's."""
+    import ctypes
+    import struct
+    if not _wait_line(proc, r"TARGET action: ", 60):
+        return "PROBE image-patch: the game never got to its action"
+    k32 = _k32()
+    k32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                      ctypes.POINTER(ctypes.c_size_t)]
+    k32.VirtualProtectEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                                     ctypes.POINTER(ctypes.c_uint32)]
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    psapi.EnumProcessModulesEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32]
+    psapi.GetModuleBaseNameW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+
+    def read(h, addr, n):
+        buf = ctypes.create_string_buffer(n)
+        got = ctypes.c_size_t(0)
+        if not k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n, ctypes.byref(got)) or got.value != n:
+            return None
+        return buf.raw
+
+    def patch():
+        h = k32.OpenProcess(0x0400 | 0x0010 | 0x0020 | 0x0008, 0, pid)  # QUERY_INFORMATION|VM_READ|VM_WRITE|VM_OPERATION
+        if not h:
+            return "PROBE image-patch: open denied (error %d)" % ctypes.get_last_error()
+        try:
+            mods = (ctypes.c_void_p * 1024)()
+            needed = ctypes.c_uint32(0)
+            if not psapi.EnumProcessModulesEx(h, mods, ctypes.sizeof(mods), ctypes.byref(needed), 3):  # LIST_MODULES_ALL
+                return "PROBE image-patch: modules not listed (error %d)" % ctypes.get_last_error()
+            base = None
+            name = ctypes.create_unicode_buffer(260)
+            for m in mods[:min(1024, needed.value // ctypes.sizeof(ctypes.c_void_p))]:
+                if m and psapi.GetModuleBaseNameW(h, ctypes.c_void_p(m), name, 260) and name.value.lower() == "jvm.dll":
+                    base = m
+                    break
+            if base is None:
+                return "PROBE image-patch: jvm.dll not found in the game"
+            head = read(h, base, 0x1000)
+            if not head:
+                return "PROBE image-patch: headers unreadable"
+            nt = struct.unpack_from("<I", head, 0x3C)[0]
+            count, opt_size = struct.unpack_from("<H", head, nt + 6)[0], struct.unpack_from("<H", head, nt + 20)[0]
+            table = nt + 24 + opt_size
+            target = None
+            for i in range(count):
+                vsize, va = struct.unpack_from("<II", head, table + 40 * i + 8)
+                flags = struct.unpack_from("<I", head, table + 40 * i + 36)[0]
+                if not flags & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
+                    continue
+                cave = base + va + vsize
+                if ((cave + 0xFFF) & ~0xFFF) - cave >= 64:
+                    target = (cave + 15) & ~15
+                    break
+            if target is None:
+                return "PROBE image-patch: no padding after a code section of jvm.dll"
+            old = ctypes.c_uint32(0)
+            if not k32.VirtualProtectEx(h, ctypes.c_void_p(target), 32, 0x40, ctypes.byref(old)):  # PAGE_EXECUTE_READWRITE
+                return "PROBE image-patch: VirtualProtectEx failed (error %d)" % ctypes.get_last_error()
+            done = ctypes.c_size_t(0)
+            ok = k32.WriteProcessMemory(h, ctypes.c_void_p(target), b"\x90" * 32, 32, ctypes.byref(done))
+            k32.VirtualProtectEx(h, ctypes.c_void_p(target), 32, old.value, ctypes.byref(ctypes.c_uint32(0)))
+            if not ok:
+                return "PROBE image-patch: WriteProcessMemory failed (error %d)" % ctypes.get_last_error()
+            return "PROBE image-patch written at jvm.dll+0x%x" % (target - base)
+        finally:
+            k32.CloseHandle(h)
+    return winpriv.as_other("admin", patch)
+
+
 PROBES = {"open_process": probe_open_process, "hold_process": probe_hold_process, "remote_code": probe_remote_code,
-          "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving}
+          "hold_all_but_spinner": probe_hold_all_but_spinner, "remote_code_moving": probe_remote_code_moving,
+          "hold_handle": probe_hold_handle, "image_patch": probe_image_patch}
 
 
 # --- fixtures ------------------------------------------------------------------------------------
@@ -612,6 +722,16 @@ def _dacl_expect(game, other):
     return {}
 
 
+def _handle_expect(game, other):
+    """Windows 11 24H2 (build 26100) and later hide kernel object addresses from a caller without
+    SeDebugPrivilege: a standard-user game cannot tell which process an elevated program's handle is
+    on, nor duplicate it to find out. Admin games (SeDebugPrivilege on) and older Windows: closed."""
+    import sys
+    if game == "user" and sys.getwindowsversion().build >= 26100:
+        return dict(guard="known_limit", proof=[r"PROBE handle opened"])
+    return {}
+
+
 def _inject_expect(done, reason):
     """Injection from another program: the guard's DACL keeps out a program of the same user (or an
     elevated one without SeDebugPrivilege) — it cannot even open the game. An administrator with
@@ -760,19 +880,45 @@ SCENARIOS = [
         proof=[r"PROBE remote-code moved [1-9]\d* times"],
         title="Чужая программа пишет исполняемую память в игру и двигает её — поймать за один обход",
         build=lambda ctx, native, jar: dict(action="none", iters=160)),
+    # Code changed inside a trusted image from outside (probe image_patch): the module, its file and its
+    # memory type all stay what was judged — only the bytes differ from the file (scan/image_integrity).
+    _sc(id="image_patch_outside", kind="attack", module="image_integrity", os=WIN, ingame=True, needs_admin=True,
+        guard="close:image_patched", probe="image_patch", timeout=60, marker="TARGET exit",
+        proof=[r"PROBE image-patch written at jvm\.dll\+0x[0-9a-f]+"],
+        title="Чужая программа администратора пишет свой код в jvm.dll игры (в хвост секции кода)",
+        build=lambda ctx, native, jar: dict(action="none", iters=40)),
     # ---- injection from another program into the running game (mebet_injector) ----------------
     _sc(id="inject_remote_thread", kind="attack", module="module_trust", os=WIN, ingame=True,
         guard="close:untrusted_module", probe="inject:remote-thread", timeout=60, privs="game_other",
-        expect=_inject_expect(r"PROBE INJECTOR remote-thread done", "untrusted_module"),
+        expect=_inject_expect(r"PROBE INJECTOR remote-thread done", "untrusted_module|foreign_handle"),
         marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR remote-thread done"],
         title="Внедрение DLL: путь в память игры + CreateRemoteThread(LoadLibraryW)",
         build=lambda ctx, native, jar: dict(action="none", iters=60)),
     _sc(id="inject_apc", kind="attack", module="module_trust", os=WIN, ingame=True,
         guard="close:untrusted_module", probe="inject:apc", timeout=60, privs="game_other",
-        expect=_inject_expect(r"PROBE INJECTOR apc done", "untrusted_module"),
+        expect=_inject_expect(r"PROBE INJECTOR apc done", "untrusted_module|foreign_handle"),
         marker="ATTACK injected library loaded", proof=[r"PROBE INJECTOR apc done"],
         title="APC-внедрение: LoadLibraryExW в очередь APC потоков игры (special user APC)",
         build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # No loader at all: code written from outside and a thread started on it. Through the guard the
+    # thread must not run one instruction of it (core/foreign_stop.hpp) — its return value never comes
+    # back. The thread's start is caught first (213); the sweep (215) or the injector's open handle
+    # (227) can win the race on a slow runner, and the code still never runs.
+    _sc(id="inject_exec_thread", kind="attack", module="foreign_threads", os=WIN, ingame=True,
+        guard="close:foreign_thread|foreign_code|foreign_handle", probe="inject:exec-thread", timeout=60,
+        privs="game_other",
+        expect=_inject_expect(r"PROBE INJECTOR exec-thread done", "foreign_thread|foreign_code|foreign_handle"),
+        marker="PROBE INJECTOR exec-thread done: ran", proof=[r"PROBE INJECTOR exec-thread done"],
+        title="Код из другой программы: исполняемая страница + CreateRemoteThread на ней — ни одной инструкции",
+        build=lambda ctx, native, jar: dict(action="none", iters=60)),
+    # Only a handle: an administrator's program holds the game open for its memory and does nothing in
+    # it. Found by the handle table (scan/handles.cpp). Where Windows hides kernel addresses from a
+    # standard-user game (11 24H2+), an elevated holder cannot be tied to the game: a documented limit.
+    _sc(id="foreign_handle_hold", kind="attack", module="foreign_handles", os=WIN, ingame=True, needs_admin=True,
+        guard="close:foreign_handle", probe="hold_handle", timeout=90, marker="TARGET exit",
+        proof=[r"PROBE handle opened, held \d+ s"], expect=_handle_expect,
+        title="Чужая программа администратора держит игру открытой на чтение памяти (внешний ESP)",
+        build=lambda ctx, native, jar: dict(action="none", iters=40)),
     _sc(id="process_dacl_open", kind="attack", module="process_dacl", os=WIN, guard="neutralize",
         title="Чужая программа открывает процесс на запись памяти и потоки",
         marker="PROBE open-process granted", probe="open_process", proof=[r"PROBE open-process denied"],

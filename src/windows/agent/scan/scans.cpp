@@ -672,6 +672,41 @@ void startup_check() {
 }
 
 void memory_sweep() { sweep_memory(SweepMode::periodic); }
+
+void quick_memory_look() {
+    // Every second, a look with no waiting and no judging: is there executable memory the table does
+    // not know, or an image nothing has recorded? Then the full sweep runs now rather than in up to
+    // five seconds — code that came without a new thread (a thread hijacked, an APC, a thread started
+    // with SKIP_THREAD_ATTACH) had all that time to do its work and go.
+    if (!config::enabled(config::Module::foreign_exec_memory) && !config::enabled(config::Module::hidden_images)) return;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    auto addr = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+    const auto max = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
+    if (addr < 0x10000) addr = 0x10000;
+    std::uintptr_t last_image = 0;
+    bool suspicious = false;
+    while (addr < max && !guard::closing() && !suspicious) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(reinterpret_cast<void*>(addr), &m, sizeof(m))) break;
+        const auto base = reinterpret_cast<std::uintptr_t>(m.BaseAddress);
+        const std::uintptr_t next = base + m.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+        if (m.State != MEM_COMMIT || !(m.Protect & 0xF0) || (m.Protect & PAGE_GUARD)) continue;
+        if (m.Type == MEM_IMAGE) {
+            const auto alloc = reinterpret_cast<std::uintptr_t>(m.AllocationBase);
+            if (alloc == last_image) continue;
+            last_image = alloc;
+            suspicious = config::enabled(config::Module::hidden_images) && !modules::find(alloc) &&
+                         !modules::pending_within(alloc, pending_max_ms());
+        } else {
+            suspicious = config::enabled(config::Module::foreign_exec_memory) && !exec::covers(base, next) &&
+                         !stop::stopped(base);
+        }
+    }
+    if (suspicious) sweep_memory(SweepMode::periodic);
+}
 void thread_sweep() { sweep_threads(SweepMode::periodic); }
 
 void on_thread_attach() {

@@ -46,6 +46,8 @@ add_library(mebet_agent SHARED
     agent/hooks/exec_guard.cpp
     agent/hooks/hook_check.cpp
     agent/scan/scans.cpp
+    agent/scan/handles.cpp
+    agent/scan/image_integrity.cpp
     agent/process/dacl.cpp
     agent/system/environment.cpp
     agent/launch/launch.cpp

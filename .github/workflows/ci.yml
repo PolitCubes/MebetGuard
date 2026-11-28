@@ -175,7 +175,7 @@ jobs:
     with:
       features: >-
         ["foreign_exec_alloc", "foreign_exec_protect", "ex_exec_alloc", "stale_unmap_exec", "limited_handle_exec",
-         "image_page_protect", "foreign_exec_moving"]
+         "image_page_protect", "foreign_exec_moving", "image_patch_outside"]
 
   e2e-win-outside:
     needs: build-windows-binaries
@@ -183,7 +183,7 @@ jobs:
     uses: ./.github/workflows/e2e-windows.yml
     with:
       features: >-
-        ["process_dacl_open", "inject_remote_thread", "inject_apc"]
+        ["process_dacl_open", "inject_remote_thread", "inject_apc", "inject_exec_thread", "foreign_handle_hold"]
 
   e2e-win-guard:
     needs: build-windows-binaries

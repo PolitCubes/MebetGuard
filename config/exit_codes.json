@@ -81,6 +81,12 @@
       "en": "A foreign program froze or stopped a guard thread." },
     { "id": "unsupported_path",    "code": 226, "title_ru": "Путь к игре не подходит для Java", "title_en": "Java cannot use the game path",
       "ru": "В пути к файлам игры есть символы, которые Java на этом компьютере принять не может: {file}. Переместите игру в папку без таких символов (например, C:\\Games) и запустите её снова.",
-      "en": "The path to the game files contains characters that Java cannot accept on this computer: {file}. Move the game to a folder without such characters (for example C:\\Games) and start it again." }
+      "en": "The path to the game files contains characters that Java cannot accept on this computer: {file}. Move the game to a folder without such characters (for example C:\\Games) and start it again." },
+    { "id": "foreign_handle",      "code": 227, "title_ru": "Чужая программа читает память игры", "title_en": "Another program reads the game memory",
+      "ru": "Посторонняя программа открыла процесс игры с правом читать или менять его память: {file}. Закройте её и запустите игру снова.",
+      "en": "Another program opened the game process with the right to read or change its memory: {file}. Close it and start the game again." },
+    { "id": "image_patched",       "code": 228, "title_ru": "Изменён код программы в игре", "title_en": "Program code in the game was changed",
+      "ru": "Код одной из библиотек игры изменён в памяти: {file}. Закройте посторонние программы и запустите игру снова.",
+      "en": "The code of one of the game libraries was changed in memory: {file}. Close other programs and start the game again." }
   ]
 }
